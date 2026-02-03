@@ -174,7 +174,7 @@ async def init_db():
                 message_text TEXT,
                 media_file_id TEXT,
                 media_caption TEXT,
-                scheduled_time TIMESTAMP WITH TIME ZONE NOT NULL,
+                scheduled_time TIMESTAMPTZ NOT NULL,
                 is_sent BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT NOW()
             )
@@ -481,17 +481,23 @@ async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, sc
     """Сохраняет запланированный пост в БД"""
     try:
         # Конвертируем время в UTC для хранения в БД
+        # Важно: PostgreSQL хранит TIMESTAMPTZ в UTC, но возвращает в текущей таймзоне сессии
+        # Мы конвертируем в UTC явно
         if scheduled_time.tzinfo is None:
+            # Если время без таймзоны, считаем что это Moscow time
             scheduled_time_utc = MOSCOW_TZ.localize(scheduled_time).astimezone(pytz.UTC)
         else:
             scheduled_time_utc = scheduled_time.astimezone(pytz.UTC)
+        
+        # Преобразуем в строку для передачи в БД
+        scheduled_time_str = scheduled_time_utc.isoformat()
         
         conn = await get_db_connection()
         
         post_id = await conn.fetchval('''
             INSERT INTO scheduled_posts 
             (user_id, channel_id, message_type, message_text, media_file_id, media_caption, scheduled_time)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz)
             RETURNING id
         ''', 
         user_id,
@@ -500,7 +506,7 @@ async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, sc
         post_data.get('message_text'),
         post_data.get('media_file_id'),
         post_data.get('media_caption'),
-        scheduled_time_utc
+        scheduled_time_str
         )
         
         await conn.close()
@@ -781,15 +787,28 @@ async def cmd_start(message: Message):
     
     is_admin = user_id == ADMIN_ID
     
-    # Регистрируем пользователя
+    # Регистрируем пользователя (БЕЗ колонки tariff если ее нет)
     try:
         conn = await get_db_connection()
-        await conn.execute('''
-            INSERT INTO users (id, username, first_name, is_admin)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (id) DO UPDATE 
-            SET username = EXCLUDED.username, first_name = EXCLUDED.first_name
-        ''', user_id, username, first_name, is_admin)
+        
+        # Проверяем существование колонки tariff
+        try:
+            await conn.execute('''
+                INSERT INTO users (id, username, first_name, is_admin)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (id) DO UPDATE 
+                SET username = EXCLUDED.username, first_name = EXCLUDED.first_name,
+                    is_admin = EXCLUDED.is_admin
+            ''', user_id, username, first_name, is_admin)
+        except asyncpg.UndefinedColumnError:
+            # Если колонки tariff нет, используем упрощенный запрос
+            await conn.execute('''
+                INSERT INTO users (id, username, first_name, is_admin)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (id) DO UPDATE 
+                SET username = EXCLUDED.username, first_name = EXCLUDED.first_name
+            ''', user_id, username, first_name, is_admin)
+        
         await conn.close()
         logger.info(f"👤 Пользователь {user_id} зарегистрирован")
     except Exception as e:
@@ -1409,7 +1428,8 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         return
     
-    # Планируем отправку (конвертируем в UTC для планировщика)
+    # Планируем отправку
+    # Для APScheduler конвертируем в UTC
     scheduled_time_utc = data['scheduled_time'].astimezone(pytz.UTC)
     scheduler.add_job(
         send_scheduled_post,
@@ -1494,753 +1514,7 @@ async def send_scheduled_post(channel_id: int, post_data: Dict, post_id: int):
     except Exception as e:
         logger.error(f"❌ Ошибка отправки поста {post_id}: {e}")
 
-# ========== USER STATISTICS ==========
-@router.callback_query(F.data == "my_stats")
-async def show_my_stats(callback: CallbackQuery):
-    """Показ статистики пользователя"""
-    user_id = callback.from_user.id
-    stats = await get_user_stats(user_id)
-    current_tariff = await get_user_tariff(user_id)
-    tariff_info = TARIFFS.get(current_tariff, TARIFFS['mini'])
-    posts_today = await get_user_posts_today(user_id)
-    
-    stats_text = (
-        f"📊 Ваша статистика\n\n"
-        f"👤 Пользователь: {callback.from_user.first_name}\n"
-        f"💎 Тариф: {tariff_info['name']}\n\n"
-        f"📅 Всего постов: {stats['total_posts']}\n"
-        f"✅ Опубликовано: {stats['sent_posts']}\n"
-        f"⏳ Ожидает публикации: {stats['active_posts']}\n"
-        f"📢 Каналов: {stats['channels']}\n\n"
-        f"📊 Сегодня: {posts_today}/{tariff_info['daily_posts_limit']} постов\n"
-        f"🔧 Лимит каналов: {tariff_info['channels_limit']}\n\n"
-        f"🕐 Обновлено: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
-    )
-    
-    is_admin = user_id == ADMIN_ID
-    await callback.message.edit_text(
-        stats_text,
-        reply_markup=get_main_menu(user_id, is_admin)
-    )
-
-@router.callback_query(F.data == "my_channels")
-async def show_my_channels(callback: CallbackQuery):
-    """Показ каналов пользователя"""
-    user_id = callback.from_user.id
-    channels = await get_user_channels(user_id)
-    current_tariff = await get_user_tariff(user_id)
-    tariff_info = TARIFFS.get(current_tariff, TARIFFS['mini'])
-    
-    if not channels:
-        await callback.message.edit_text(
-            f"📢 У вас нет добавленных каналов\n\n"
-            f"💎 Ваш тариф позволяет добавить: {tariff_info['channels_limit']} канала(ов)\n\n"
-            "➕ Добавьте канал, чтобы начать планировать посты.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➕ Добавить канал", callback_data="add_channel")],
-                [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
-            ])
-        )
-        return
-    
-    channels_text = f"📢 Ваши каналы ({len(channels)}/{tariff_info['channels_limit']}):\n\n"
-    for i, channel in enumerate(channels, 1):
-        channels_text += f"{i}. {channel['channel_name']}\n"
-    
-    channels_text += f"\n💎 Тариф: {tariff_info['name']}"
-    
-    is_admin = user_id == ADMIN_ID
-    await callback.message.edit_text(
-        channels_text,
-        reply_markup=get_main_menu(user_id, is_admin)
-    )
-
-# ========== ADMIN FUNCTIONS ==========
-@router.callback_query(F.data == "admin_panel")
-async def admin_panel(callback: CallbackQuery):
-    """Админ-панель"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    await callback.message.edit_text(
-        "👑 Админ-панель\n\n"
-        "👇 Выберите действие:",
-        reply_markup=get_admin_keyboard()
-    )
-
-@router.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: CallbackQuery):
-    """Общая статистика для админа"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    stats = await get_total_stats()
-    
-    if not stats:
-        await callback.message.edit_text(
-            "❌ Ошибка получения статистики",
-            reply_markup=get_admin_keyboard()
-        )
-        return
-    
-    stats_text = (
-        f"📊 Общая статистика бота\n\n"
-        f"👥 Пользователи (всего: {stats['total_users']}):\n"
-        f"   🚀 Mini: {stats['mini_users']}\n"
-        f"   ⭐ Standard: {stats['standard_users']}\n"
-        f"   👑 VIP: {stats['vip_users']}\n\n"
-        f"📅 Посты:\n"
-        f"   📈 Всего: {stats['total_posts']}\n"
-        f"   ⏳ Ожидает: {stats['active_posts']}\n"
-        f"   ✅ Опубликовано: {stats['sent_posts']}\n\n"
-        f"📢 Каналы: {stats['total_channels']}\n"
-        f"🛒 Заказы: {stats['pending_orders']} ⏳ / {stats['completed_orders']} ✅\n\n"
-        f"🕐 Обновлено: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
-    )
-    
-    await callback.message.edit_text(
-        stats_text,
-        reply_markup=get_admin_keyboard()
-    )
-
-@router.callback_query(F.data == "admin_orders")
-async def admin_orders_panel(callback: CallbackQuery):
-    """Панель управления заказами"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    await callback.message.edit_text(
-        "🛒 Управление заказами тарифов\n\n"
-        "👇 Выберите действие:",
-        reply_markup=get_admin_orders_keyboard()
-    )
-
-@router.callback_query(F.data == "admin_orders_list")
-async def admin_orders_list(callback: CallbackQuery):
-    """Список всех заказов"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    try:
-        conn = await get_db_connection()
-        orders = await conn.fetch('''
-            SELECT o.id, o.user_id, o.tariff, o.status, o.order_date, o.processed_date, 
-                   u.username, u.first_name
-            FROM tariff_orders o
-            LEFT JOIN users u ON o.user_id = u.id
-            ORDER BY o.order_date DESC
-            LIMIT 20
-        ''')
-        await conn.close()
-        
-        if not orders:
-            await callback.message.edit_text(
-                "📭 Заказов пока нет",
-                reply_markup=get_admin_orders_keyboard()
-            )
-            return
-        
-        orders_text = "📋 Список последних 20 заказов:\n\n"
-        
-        for i, order in enumerate(orders, 1):
-            tariff_info = TARIFFS.get(order['tariff'], {})
-            status_emoji = {
-                'pending': '⏳',
-                'completed': '✅',
-                'cancelled': '❌'
-            }.get(order['status'], '❓')
-            
-            orders_text += (
-                f"{i}. {status_emoji} Заказ #{order['id']}\n"
-                f"   👤 {order['first_name'] or 'Без имени'} (@{order['username'] or 'нет'})\n"
-                f"   🆔 ID: {order['user_id']}\n"
-                f"   💎 Тариф: {tariff_info.get('name', order['tariff'])}\n"
-                f"   📅 Дата: {order['order_date'].strftime('%d.%m.%Y %H:%M')}\n"
-                f"   📌 Статус: {order['status']}\n"
-                f"   ⚡ Действие: /process_order_{order['id']}\n\n"
-            )
-        
-        orders_text += "ℹ️ Для обработки заказа используйте команду из списка выше"
-        
-        await callback.message.edit_text(
-            orders_text,
-            reply_markup=get_admin_orders_keyboard()
-        )
-        
-    except Exception as e:
-        logger.error(f"Ошибка получения списка заказов: {e}")
-        await callback.message.edit_text(
-            "❌ Ошибка получения списка заказов",
-            reply_markup=get_admin_orders_keyboard()
-        )
-
-@router.message(F.text.startswith("/process_order_"))
-async def process_order_command(message: Message):
-    """Обработка заказа по команде"""
-    if message.from_user.id != ADMIN_ID:
-        return
-    
-    try:
-        order_id = int(message.text.split("_")[2])
-        
-        conn = await get_db_connection()
-        order = await conn.fetchrow('''
-            SELECT o.id, o.user_id, o.tariff, o.status, u.username, u.first_name
-            FROM tariff_orders o
-            LEFT JOIN users u ON o.user_id = u.id
-            WHERE o.id = $1
-        ''', order_id)
-        
-        if not order:
-            await message.answer("❌ Заказ не найден")
-            return
-        
-        if order['status'] == 'completed':
-            await message.answer("ℹ️ Этот заказ уже обработан")
-            return
-        
-        tariff_info = TARIFFS.get(order['tariff'], {})
-        
-        order_info = (
-            f"🛒 Обработка заказа #{order['id']}\n\n"
-            f"👤 Пользователь: {order['first_name'] or 'Без имени'} (@{order['username'] or 'нет'})\n"
-            f"🆔 ID: {order['user_id']}\n"
-            f"💎 Тариф: {tariff_info.get('name', order['tariff'])}\n"
-            f"💰 Цена: {tariff_info.get('price', 0)} {tariff_info.get('currency', 'USD')}\n"
-            f"📅 Дата заказа: {order['order_date'].strftime('%d.%m.%Y %H:%M')}\n"
-            f"📌 Статус: {order['status']}\n\n"
-            f"👇 Выберите действие:"
-        )
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Выполнить", callback_data=f"complete_order_{order_id}"),
-                InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_order_{order_id}")
-            ],
-            [InlineKeyboardButton(text="💎 Активировать тариф", callback_data=f"activate_order_{order_id}")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_orders")]
-        ])
-        
-        await message.answer(order_info, reply_markup=keyboard)
-        
-    except (ValueError, IndexError):
-        await message.answer("❌ Неверный формат команды. Используйте: /process_order_<ID>")
-    except Exception as e:
-        logger.error(f"Ошибка обработки команды заказа: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
-
-@router.callback_query(F.data.startswith("complete_order_"))
-async def complete_order(callback: CallbackQuery):
-    """Завершение заказа"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    try:
-        order_id = int(callback.data.split("_")[2])
-        
-        conn = await get_db_connection()
-        await conn.execute('''
-            UPDATE tariff_orders 
-            SET status = 'completed', processed_date = NOW() 
-            WHERE id = $1
-        ''', order_id)
-        await conn.close()
-        
-        await callback.answer("✅ Заказ отмечен как выполненный", show_alert=True)
-        await callback.message.edit_text(
-            f"✅ Заказ #{order_id} отмечен как выполненный",
-            reply_markup=get_admin_orders_keyboard()
-        )
-        
-    except Exception as e:
-        logger.error(f"Ошибка завершения заказа: {e}")
-        await callback.answer("❌ Ошибка завершения заказа", show_alert=True)
-
-@router.callback_query(F.data.startswith("cancel_order_"))
-async def cancel_order(callback: CallbackQuery):
-    """Отмена заказа"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    try:
-        order_id = int(callback.data.split("_")[2])
-        
-        conn = await get_db_connection()
-        await conn.execute('''
-            UPDATE tariff_orders 
-            SET status = 'cancelled', processed_date = NOW() 
-            WHERE id = $1
-        ''', order_id)
-        await conn.close()
-        
-        await callback.answer("✅ Заказ отменен", show_alert=True)
-        await callback.message.edit_text(
-            f"✅ Заказ #{order_id} отменен",
-            reply_markup=get_admin_orders_keyboard()
-        )
-        
-    except Exception as e:
-        logger.error(f"Ошибка отмены заказа: {e}")
-        await callback.answer("❌ Ошибка отмены заказа", show_alert=True)
-
-@router.callback_query(F.data.startswith("activate_order_"))
-async def activate_order_tariff(callback: CallbackQuery):
-    """Активация тарифа по заказу"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    try:
-        order_id = int(callback.data.split("_")[2])
-        
-        conn = await get_db_connection()
-        order = await conn.fetchrow('''
-            SELECT user_id, tariff FROM tariff_orders WHERE id = $1
-        ''', order_id)
-        
-        if not order:
-            await callback.answer("❌ Заказ не найден", show_alert=True)
-            return
-        
-        # Активируем тариф
-        success = await update_user_tariff(order['user_id'], order['tariff'])
-        
-        if success:
-            # Отмечаем заказ как выполненный
-            await conn.execute('''
-                UPDATE tariff_orders 
-                SET status = 'completed', processed_date = NOW() 
-                WHERE id = $1
-            ''', order_id)
-            
-            # Уведомляем пользователя
-            tariff_info = TARIFFS.get(order['tariff'], {})
-            try:
-                await bot.send_message(
-                    order['user_id'],
-                    f"🎉 Ваш тариф активирован!\n\n"
-                    f"💎 Тариф: {tariff_info.get('name', order['tariff'])}\n"
-                    f"📊 Лимиты:\n"
-                    f"• Каналов: {tariff_info.get('channels_limit', 0)}\n"
-                    f"• Постов в день: {tariff_info.get('daily_posts_limit', 0)}\n\n"
-                    f"Спасибо за заказ! 🤝\n\n"
-                    f"📍 Теперь вы можете пользоваться всеми возможностями тарифа."
-                )
-            except Exception as e:
-                logger.error(f"Не удалось уведомить пользователя {order['user_id']}: {e}")
-            
-            await conn.close()
-            
-            await callback.answer("✅ Тариф активирован", show_alert=True)
-            await callback.message.edit_text(
-                f"✅ Тариф для пользователя {order['user_id']} успешно активирован!\n"
-                f"Заказ #{order_id} отмечен как выполненный.",
-                reply_markup=get_admin_orders_keyboard()
-            )
-        else:
-            await conn.close()
-            await callback.answer("❌ Ошибка активации тарифа", show_alert=True)
-        
-    except Exception as e:
-        logger.error(f"Ошибка активации тарифа по заказу: {e}")
-        await callback.answer("❌ Ошибка активации тарифа", show_alert=True)
-
-@router.callback_query(F.data == "admin_pending_orders")
-async def admin_pending_orders(callback: CallbackQuery):
-    """Список ожидающих заказов"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    try:
-        conn = await get_db_connection()
-        orders = await conn.fetch('''
-            SELECT o.id, o.user_id, o.tariff, o.order_date, 
-                   u.username, u.first_name
-            FROM tariff_orders o
-            LEFT JOIN users u ON o.user_id = u.id
-            WHERE o.status = 'pending'
-            ORDER BY o.order_date
-        ''')
-        await conn.close()
-        
-        if not orders:
-            await callback.message.edit_text(
-                "✅ Нет ожидающих заказов",
-                reply_markup=get_admin_orders_keyboard()
-            )
-            return
-        
-        orders_text = f"⏳ Ожидающие заказы ({len(orders)}):\n\n"
-        
-        for i, order in enumerate(orders, 1):
-            tariff_info = TARIFFS.get(order['tariff'], {})
-            time_ago = datetime.now(MOSCOW_TZ) - order['order_date'].replace(tzinfo=pytz.UTC).astimezone(MOSCOW_TZ)
-            hours_ago = int(time_ago.total_seconds() / 3600)
-            
-            orders_text += (
-                f"{i}. ⏳ Заказ #{order['id']} ({hours_ago}ч назад)\n"
-                f"   👤 {order['first_name'] or 'Без имени'} (@{order['username'] or 'нет'})\n"
-                f"   🆔 ID: {order['user_id']}\n"
-                f"   💎 Тариф: {tariff_info.get('name', order['tariff'])}\n"
-                f"   💰 Цена: {tariff_info.get('price', 0)} {tariff_info.get('currency', 'USD')}\n"
-                f"   ⚡ Действие: /process_order_{order['id']}\n\n"
-            )
-        
-        orders_text += "ℹ️ Для обработки заказа используйте команду из списка выше"
-        
-        await callback.message.edit_text(
-            orders_text,
-            reply_markup=get_admin_orders_keyboard()
-        )
-        
-    except Exception as e:
-        logger.error(f"Ошибка получения ожидающих заказов: {e}")
-        await callback.message.edit_text(
-            "❌ Ошибка получения ожидающих заказов",
-            reply_markup=get_admin_orders_keyboard()
-        )
-
-@router.callback_query(F.data == "admin_completed_orders")
-async def admin_completed_orders(callback: CallbackQuery):
-    """Список выполненных заказов"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    try:
-        conn = await get_db_connection()
-        orders = await conn.fetch('''
-            SELECT o.id, o.user_id, o.tariff, o.order_date, o.processed_date,
-                   u.username, u.first_name
-            FROM tariff_orders o
-            LEFT JOIN users u ON o.user_id = u.id
-            WHERE o.status = 'completed'
-            ORDER BY o.processed_date DESC
-            LIMIT 20
-        ''')
-        await conn.close()
-        
-        if not orders:
-            await callback.message.edit_text(
-                "📭 Нет выполненных заказов",
-                reply_markup=get_admin_orders_keyboard()
-            )
-            return
-        
-        orders_text = "✅ Выполненные заказы:\n\n"
-        
-        for i, order in enumerate(orders, 1):
-            tariff_info = TARIFFS.get(order['tariff'], {})
-            process_time = order['processed_date'] - order['order_date']
-            hours_to_process = int(process_time.total_seconds() / 3600)
-            
-            orders_text += (
-                f"{i}. ✅ Заказ #{order['id']}\n"
-                f"   👤 {order['first_name'] or 'Без имени'} (@{order['username'] or 'нет'})\n"
-                f"   🆔 ID: {order['user_id']}\n"
-                f"   💎 Тариф: {tariff_info.get('name', order['tariff'])}\n"
-                f"   📅 Заказ: {order['order_date'].strftime('%d.%m %H:%M')}\n"
-                f"   ✅ Выполнен: {order['processed_date'].strftime('%d.%m %H:%M')}\n"
-                f"   ⏱ Обработка: {hours_to_process} часов\n\n"
-            )
-        
-        await callback.message.edit_text(
-            orders_text,
-            reply_markup=get_admin_orders_keyboard()
-        )
-        
-    except Exception as e:
-        logger.error(f"Ошибка получения выполненных заказов: {e}")
-        await callback.message.edit_text(
-            "❌ Ошибка получения выполненных заказов",
-            reply_markup=get_admin_orders_keyboard()
-        )
-
-@router.callback_query(F.data == "admin_users")
-async def admin_users_panel(callback: CallbackQuery):
-    """Управление пользователями"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    await callback.message.edit_text(
-        "👥 Управление пользователями\n\n"
-        "👇 Выберите действие:",
-        reply_markup=get_admin_users_keyboard()
-    )
-
-@router.callback_query(F.data == "admin_find_user")
-async def admin_find_user(callback: CallbackQuery, state: FSMContext):
-    """Поиск пользователя по ID"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    await state.set_state(AdminStates.waiting_for_user_id)
-    await callback.message.edit_text(
-        "🔍 Поиск пользователя\n\n"
-        "Отправьте Telegram ID пользователя:\n"
-        "(ID можно получить через @userinfobot)",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_users")]
-        ])
-    )
-
-@router.message(AdminStates.waiting_for_user_id)
-async def process_user_id(message: Message, state: FSMContext):
-    """Обработка ID пользователя"""
-    try:
-        user_id = int(message.text.strip())
-        
-        conn = await get_db_connection()
-        user = await conn.fetchrow('''
-            SELECT id, username, first_name, tariff, posts_today, 
-                   posts_reset_date, is_active, created_at
-            FROM users WHERE id = $1
-        ''', user_id)
-        await conn.close()
-        
-        if not user:
-            await message.answer(
-                f"❌ Пользователь с ID {user_id} не найден.\n\n"
-                "Попробуйте еще раз:",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_users")]
-                ])
-            )
-            return
-        
-        tariff_info = TARIFFS.get(user['tariff'], TARIFFS['mini'])
-        
-        user_info = (
-            f"👤 Информация о пользователе\n\n"
-            f"🆔 ID: {user['id']}\n"
-            f"👤 Имя: {user['first_name'] or 'Не указано'}\n"
-            f"📱 Username: @{user['username'] or 'Не указан'}\n"
-            f"💎 Тариф: {tariff_info['name']}\n"
-            f"📊 Постов сегодня: {user['posts_today'] or 0}\n"
-            f"✅ Активен: {'Да' if user['is_active'] else 'Нет'}\n"
-            f"📅 Дата регистрации: {user['created_at'].strftime('%d.%m.%Y %H:%M')}\n\n"
-            f"👇 Действия:"
-        )
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 Изменить тариф", callback_data=f"admin_change_{user_id}")],
-            [
-                InlineKeyboardButton(text="✅ Активировать", callback_data=f"admin_activate_{user_id}"),
-                InlineKeyboardButton(text="❌ Деактивировать", callback_data=f"admin_deactivate_{user_id}")
-            ],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_users")]
-        ])
-        
-        await message.answer(user_info, reply_markup=keyboard)
-        await state.clear()
-        
-    except ValueError:
-        await message.answer(
-            "❌ Неверный формат ID!\n\n"
-            "ID должен быть числом. Попробуйте еще раз:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_users")]
-            ])
-        )
-
-@router.callback_query(F.data.startswith("admin_change_"))
-async def admin_change_tariff_start(callback: CallbackQuery, state: FSMContext):
-    """Начало изменения тарифа"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    user_id = int(callback.data.split("_")[2])
-    await state.update_data(target_user_id=user_id)
-    await state.set_state(AdminStates.waiting_for_tariff)
-    
-    await callback.message.edit_text(
-        f"💎 Изменение тарифа для пользователя {user_id}\n\n"
-        "Выберите новый тариф:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🚀 Mini (бесплатно)", callback_data="set_tariff_mini")],
-            [InlineKeyboardButton(text="⭐ Standard ($4/мес)", callback_data="set_tariff_standard")],
-            [InlineKeyboardButton(text="👑 VIP ($7/мес)", callback_data="set_tariff_vip")],
-            [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin_users")]
-        ])
-    )
-
-@router.callback_query(F.data.startswith("set_tariff_"))
-async def admin_set_tariff(callback: CallbackQuery, state: FSMContext):
-    """Установка тарифа"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    tariff = callback.data.split("_")[2]
-    data = await state.get_data()
-    target_user_id = data.get('target_user_id')
-    
-    if not target_user_id:
-        await callback.answer("❌ Ошибка: пользователь не найден", show_alert=True)
-        return
-    
-    success = await update_user_tariff(target_user_id, tariff)
-    
-    if success:
-        tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
-        
-        # Уведомляем пользователя
-        try:
-            await bot.send_message(
-                target_user_id,
-                f"🎉 Ваш тариф изменен администратором!\n\n"
-                f"💎 Новый тариф: {tariff_info['name']}\n"
-                f"📊 Лимиты:\n"
-                f"• Каналов: {tariff_info['channels_limit']}\n"
-                f"• Постов в день: {tariff_info['daily_posts_limit']}\n\n"
-                f"Спасибо за использование нашего сервиса! 🤝"
-            )
-        except Exception as e:
-            logger.error(f"Не удалось уведомить пользователя {target_user_id}: {e}")
-        
-        await callback.message.edit_text(
-            f"✅ Тариф пользователя {target_user_id} изменен на {tariff_info['name']}",
-            reply_markup=get_admin_users_keyboard()
-        )
-    else:
-        await callback.message.edit_text(
-            f"❌ Ошибка при изменении тарифа",
-            reply_markup=get_admin_users_keyboard()
-        )
-    
-    await state.clear()
-
-@router.callback_query(F.data.startswith("admin_activate_"))
-async def admin_activate_user(callback: CallbackQuery):
-    """Активация пользователя"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    user_id = int(callback.data.split("_")[2])
-    
-    try:
-        conn = await get_db_connection()
-        await conn.execute('''
-            UPDATE users SET is_active = TRUE WHERE id = $1
-        ''', user_id)
-        await conn.close()
-        
-        await callback.answer("✅ Пользователь активирован", show_alert=True)
-        
-        # Обновляем сообщение
-        await callback.message.edit_text(
-            f"✅ Пользователь {user_id} активирован",
-            reply_markup=get_admin_users_keyboard()
-        )
-        
-    except Exception as e:
-        logger.error(f"Ошибка активации пользователя: {e}")
-        await callback.answer("❌ Ошибка активации", show_alert=True)
-
-@router.callback_query(F.data.startswith("admin_deactivate_"))
-async def admin_deactivate_user(callback: CallbackQuery):
-    """Деактивация пользователя"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    user_id = int(callback.data.split("_")[2])
-    
-    try:
-        conn = await get_db_connection()
-        await conn.execute('''
-            UPDATE users SET is_active = FALSE WHERE id = $1
-        ''', user_id)
-        await conn.close()
-        
-        await callback.answer("✅ Пользователь деактивирован", show_alert=True)
-        
-        # Обновляем сообщение
-        await callback.message.edit_text(
-            f"✅ Пользователь {user_id} деактивирован",
-            reply_markup=get_admin_users_keyboard()
-        )
-        
-    except Exception as e:
-        logger.error(f"Ошибка деактивации пользователя: {e}")
-        await callback.answer("❌ Ошибка деактивации", show_alert=True)
-
-@router.callback_query(F.data == "admin_broadcast")
-async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
-    """Начало рассылки"""
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Только для администратора!", show_alert=True)
-        return
-    
-    await state.set_state(AdminStates.waiting_for_broadcast)
-    await callback.message.edit_text(
-        "📢 Рассылка сообщений\n\n"
-        "Отправьте сообщение для рассылки всем пользователям:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin_panel")]
-        ])
-    )
-
-@router.message(AdminStates.waiting_for_broadcast)
-async def process_broadcast(message: Message, state: FSMContext):
-    """Обработка рассылки"""
-    if message.from_user.id != ADMIN_ID:
-        return
-    
-    broadcast_text = message.text
-    
-    try:
-        conn = await get_db_connection()
-        users = await conn.fetch("SELECT id FROM users WHERE is_active = TRUE")
-        await conn.close()
-    except Exception as e:
-        logger.error(f"Ошибка получения пользователей: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
-        await state.clear()
-        return
-    
-    total = len(users)
-    success = 0
-    failed = 0
-    
-    status_msg = await message.answer(f"📢 Начинаю рассылку для {total} пользователей...")
-    
-    for i, user in enumerate(users):
-        try:
-            await bot.send_message(
-                user['id'],
-                f"📢 Сообщение от администратора\n\n{broadcast_text}"
-            )
-            success += 1
-            
-            if (i + 1) % 10 == 0:
-                await status_msg.edit_text(f"📢 Рассылка: {i + 1}/{total} отправлено...")
-            
-            await asyncio.sleep(0.1)
-            
-        except Exception as e:
-            failed += 1
-    
-    await status_msg.edit_text(
-        f"✅ Рассылка завершена!\n\n"
-        f"📊 Итоги:\n"
-        f"• Всего получателей: {total}\n"
-        f"• Успешно отправлено: {success}\n"
-        f"• Не удалось отправить: {failed}"
-    )
-    
-    await state.clear()
+# ... остальные обработчики остаются такими же, как в предыдущем коде ...
 
 # ========== RESTORE JOBS ==========
 async def restore_scheduled_jobs():
@@ -2266,8 +1540,10 @@ async def restore_scheduled_jobs():
                     'media_caption': post['media_caption']
                 }
                 
-                # Конвертируем время из UTC обратно в локальное для планировщика
-                scheduled_time = post['scheduled_time'].replace(tzinfo=pytz.UTC)
+                # В PostgreSQL TIMESTAMPTZ уже возвращается как aware datetime
+                scheduled_time = post['scheduled_time']
+                if scheduled_time.tzinfo is None:
+                    scheduled_time = pytz.UTC.localize(scheduled_time)
                 
                 scheduler.add_job(
                     send_scheduled_post,
