@@ -31,7 +31,7 @@ GEMINI_API_KEYS = [
     "AIzaSyANoeHQtBBxInIYCfNHHO_JGE6DWmhQ2Rg_2"
 ]
 
-MODEL_NAME = "gemini-2.0-flash-exp"
+MODEL_NAME = "gemini-2.5-flash"
 REQUESTS_PER_KEY = 5  # Ротация каждые 5 запросов
 REQUEST_COOLDOWN = 60  # 60 секунд между запросами
 
