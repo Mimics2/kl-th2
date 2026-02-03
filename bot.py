@@ -19,35 +19,29 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 
 # ========== CONFIG ==========
-# Проверяем обязательные переменные окружения
 API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
     print("❌ ОШИБКА: Не указан BOT_TOKEN в переменных окружения")
-    print("ℹ️ На Railway добавьте переменную BOT_TOKEN в настройках")
     sys.exit(1)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     print("❌ ОШИБКА: Не указан DATABASE_URL в переменных окружения")
-    print("ℹ️ На Railway эта переменная обычно создается автоматически при добавлении PostgreSQL")
     sys.exit(1)
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-
-# Контакты поддержки
 SUPPORT_BOT_USERNAME = os.getenv("SUPPORT_BOT_USERNAME", "support_bot")
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
 
-# Настройки
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 POST_CHARACTER_LIMIT = 4000
 
 # ========== TARIFF SYSTEM ==========
 class Tariff(Enum):
-    MINI = "mini"      # Бесплатный
-    STANDARD = "standard"  # Платный
-    VIP = "vip"        # Платный
-    ADMIN = "admin"    # Безлимитный для админа
+    MINI = "mini"
+    STANDARD = "standard"
+    VIP = "vip"
+    ADMIN = "admin"
 
 TARIFFS = {
     Tariff.MINI.value: {
@@ -88,45 +82,33 @@ TARIFFS = {
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация бота и диспетчера
-try:
-    bot = Bot(token=API_TOKEN)
-    storage = MemoryStorage()
-    dp = Dispatcher(storage=storage)
-    router = Router()
-    dp.include_router(router)
-    scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
-    logger.info("✅ Бот и диспетчер инициализированы")
-except Exception as e:
-    logger.error(f"❌ Ошибка инициализации бота: {e}")
-    sys.exit(1)
+bot = Bot(token=API_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+router = Router()
+dp.include_router(router)
+scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
 
 # ========== DATABASE FUNCTIONS ==========
 async def get_db_connection():
     """Создает соединение с базой данных"""
     try:
-        if DATABASE_URL:
-            # Исправляем строку подключения для Railway
-            if DATABASE_URL.startswith("postgres://"):
-                # Конвертируем старый формат в новый
-                conn_string = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        if DATABASE_URL.startswith("postgres://"):
+            conn_string = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        else:
+            conn_string = DATABASE_URL
+        
+        if "sslmode" not in conn_string:
+            if "?" in conn_string:
+                conn_string += "&sslmode=require"
             else:
-                conn_string = DATABASE_URL
-            
-            # Добавляем sslmode если не указан
-            if "sslmode" not in conn_string:
-                if "?" in conn_string:
-                    conn_string += "&sslmode=require"
-                else:
-                    conn_string += "?sslmode=require"
-            
-            return await asyncpg.connect(conn_string, timeout=30)
+                conn_string += "?sslmode=require"
+        
+        return await asyncpg.connect(conn_string, timeout=30)
     except Exception as e:
         logger.error(f"Ошибка подключения к БД: {e}")
         raise
@@ -135,7 +117,6 @@ async def init_db():
     """Инициализация таблиц в PostgreSQL"""
     try:
         conn = await get_db_connection()
-        logger.info("✅ Подключение к БД установлено")
         
         # Таблица пользователей
         await conn.execute('''
@@ -195,21 +176,15 @@ async def init_db():
         
         await conn.close()
         logger.info("✅ Таблицы БД созданы/проверены")
-        
-    except asyncpg.PostgresError as e:
-        logger.error(f"❌ Ошибка PostgreSQL при инициализации БД: {e}")
-        raise
     except Exception as e:
-        logger.error(f"❌ Общая ошибка инициализации БД: {e}")
+        logger.error(f"❌ Ошибка инициализации БД: {e}")
         raise
 
 async def migrate_db():
-    """Миграция существующей базы данных - добавление недостающих колонок"""
+    """Миграция существующей базы данных"""
     try:
         conn = await get_db_connection()
-        logger.info("🔧 Проверка и выполнение миграций БД...")
         
-        # Список миграций: (table_name, column_name, column_definition)
         migrations = [
             ('users', 'tariff', 'TEXT DEFAULT \'mini\''),
             ('users', 'is_admin', 'BOOLEAN DEFAULT FALSE'),
@@ -219,7 +194,6 @@ async def migrate_db():
         
         for table, column, definition in migrations:
             try:
-                # Проверяем существует ли колонка
                 exists = await conn.fetchval(f'''
                     SELECT EXISTS (
                         SELECT FROM information_schema.columns 
@@ -228,30 +202,20 @@ async def migrate_db():
                 ''', table, column)
                 
                 if not exists:
-                    logger.info(f"🔧 Добавляем колонку {column} в таблицу {table}...")
                     await conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
-                    logger.info(f"✅ Колонка {column} добавлена в таблицу {table}")
-                else:
-                    logger.info(f"✅ Колонка {column} в таблице {table} уже существует")
-                    
             except Exception as e:
-                logger.error(f"❌ Ошибка при проверке/добавлении колонки {column} в {table}: {e}")
+                logger.error(f"Ошибка при добавлении колонки {column}: {e}")
         
-        # Обновляем админа если нужно
+        # Обновляем админа
         if ADMIN_ID > 0:
-            try:
-                await conn.execute('''
-                    UPDATE users 
-                    SET is_admin = TRUE, tariff = 'admin' 
-                    WHERE id = $1
-                ''', ADMIN_ID)
-                logger.info(f"✅ Пользователь {ADMIN_ID} назначен администратором")
-            except Exception as e:
-                logger.warning(f"⚠️ Не удалось обновить администратора: {e}")
+            await conn.execute('''
+                UPDATE users 
+                SET is_admin = TRUE, tariff = 'admin' 
+                WHERE id = $1
+            ''', ADMIN_ID)
         
         await conn.close()
-        logger.info("✅ Все миграции БД завершены")
-        
+        logger.info("✅ Миграции БД завершены")
     except Exception as e:
         logger.error(f"❌ Ошибка миграции БД: {e}")
 
@@ -266,7 +230,6 @@ async def get_user_tariff(user_id: int) -> str:
         await conn.close()
         
         if not user:
-            # Создаем нового пользователя с тарифом mini
             conn = await get_db_connection()
             await conn.execute('''
                 INSERT INTO users (id, tariff) VALUES ($1, 'mini')
@@ -274,7 +237,6 @@ async def get_user_tariff(user_id: int) -> str:
             await conn.close()
             return 'mini'
         
-        # Админ всегда имеет тариф admin
         if user.get('is_admin'):
             return 'admin'
             
@@ -306,7 +268,7 @@ async def create_tariff_order(user_id: int, tariff_id: str) -> bool:
         ''', user_id, tariff_id)
         await conn.close()
         
-        # Уведомляем админа о новом заказе
+        # Уведомляем админа
         if ADMIN_ID:
             tariff_info = TARIFFS.get(tariff_id, {})
             try:
@@ -316,20 +278,18 @@ async def create_tariff_order(user_id: int, tariff_id: str) -> bool:
                     f"👤 Пользователь: {user_id}\n"
                     f"💎 Тариф: {tariff_info.get('name', tariff_id)}\n"
                     f"💰 Стоимость: {tariff_info.get('price', 0)} {tariff_info.get('currency', 'USD')}\n"
-                    f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}\n\n"
-                    f"📋 Для обработки заказа используйте команду /admin"
+                    f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
                 )
-            except Exception as e:
-                logger.error(f"Не удалось уведомить админа о заказе: {e}")
+            except Exception:
+                pass
         
-        logger.info(f"📝 Создан заказ тарифа {tariff_id} для пользователя {user_id}")
         return True
     except Exception as e:
         logger.error(f"Ошибка создания заказа тарифа: {e}")
         return False
 
 async def get_tariff_limits(user_id: int) -> Tuple[int, int]:
-    """Получает лимиты пользователя по тарифу"""
+    """Получает лимиты пользователя"""
     tariff = await get_user_tariff(user_id)
     tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
     return tariff_info['channels_limit'], tariff_info['daily_posts_limit']
@@ -349,7 +309,7 @@ async def get_user_channels_count(user_id: int) -> int:
         return 0
 
 async def reset_daily_posts():
-    """Сбрасывает счетчик постов за день (вызывается ежедневно)"""
+    """Сбрасывает счетчик постов за день"""
     try:
         conn = await get_db_connection()
         await conn.execute('''
@@ -358,30 +318,26 @@ async def reset_daily_posts():
             WHERE posts_reset_date < CURRENT_DATE
         ''')
         await conn.close()
-        logger.info("✅ Счетчики постов сброшены")
     except Exception as e:
         logger.error(f"Ошибка сброса счетчиков: {e}")
 
 async def increment_user_posts(user_id: int) -> bool:
-    """Увеличивает счетчик постов пользователя за сегодня"""
+    """Увеличивает счетчик постов пользователя"""
     try:
         conn = await get_db_connection()
         
-        # Проверяем дату сброса
         user = await conn.fetchrow(
             "SELECT posts_reset_date FROM users WHERE id = $1",
             user_id
         )
         
         if user and user['posts_reset_date'] < datetime.now(MOSCOW_TZ).date():
-            # Сбрасываем счетчик если дата устарела
             await conn.execute('''
                 UPDATE users 
                 SET posts_today = 1, posts_reset_date = CURRENT_DATE 
                 WHERE id = $1
             ''', user_id)
         else:
-            # Увеличиваем счетчик
             await conn.execute('''
                 UPDATE users 
                 SET posts_today = posts_today + 1 
@@ -398,19 +354,15 @@ async def get_user_posts_today(user_id: int) -> int:
     """Получает количество постов пользователя за сегодня"""
     try:
         conn = await get_db_connection()
-        
-        # Проверяем дату сброса
         user = await conn.fetchrow(
             "SELECT posts_today, posts_reset_date FROM users WHERE id = $1",
             user_id
         )
-        
         await conn.close()
         
         if not user:
             return 0
             
-        # Если дата устарела, возвращаем 0
         if user['posts_reset_date'] < datetime.now(MOSCOW_TZ).date():
             return 0
             
@@ -418,30 +370,6 @@ async def get_user_posts_today(user_id: int) -> int:
     except Exception as e:
         logger.error(f"Ошибка получения счетчика постов: {e}")
         return 0
-
-async def check_user_access(user_id: int) -> bool:
-    """Проверяет доступ пользователя к боту"""
-    try:
-        conn = await get_db_connection()
-        user = await conn.fetchrow(
-            "SELECT is_active FROM users WHERE id = $1", 
-            user_id
-        )
-        await conn.close()
-        
-        if not user:
-            # Создаем нового пользователя
-            conn = await get_db_connection()
-            await conn.execute('''
-                INSERT INTO users (id, is_active) VALUES ($1, TRUE)
-            ''', user_id)
-            await conn.close()
-            return True
-            
-        return user['is_active']
-    except Exception as e:
-        logger.error(f"Ошибка проверки доступа: {e}")
-        return False
 
 async def get_user_channels(user_id: int) -> List[Dict]:
     """Получает каналы пользователя"""
@@ -461,7 +389,6 @@ async def add_user_channel(user_id: int, channel_id: int, channel_name: str) -> 
     """Добавляет канал пользователя"""
     try:
         conn = await get_db_connection()
-        
         await conn.execute('''
             INSERT INTO channels (user_id, channel_id, channel_name, is_active)
             VALUES ($1, $2, $3, TRUE)
@@ -470,7 +397,6 @@ async def add_user_channel(user_id: int, channel_id: int, channel_name: str) -> 
             channel_name = EXCLUDED.channel_name,
             is_active = TRUE
         ''', user_id, channel_id, channel_name)
-        
         await conn.close()
         return True
     except Exception as e:
@@ -480,24 +406,17 @@ async def add_user_channel(user_id: int, channel_id: int, channel_name: str) -> 
 async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, scheduled_time: datetime) -> Optional[int]:
     """Сохраняет запланированный пост в БД"""
     try:
-        # Конвертируем время в UTC для хранения в БД
-        # Важно: PostgreSQL хранит TIMESTAMPTZ в UTC, но возвращает в текущей таймзоне сессии
-        # Мы конвертируем в UTC явно
+        # Конвертируем время в UTC
         if scheduled_time.tzinfo is None:
-            # Если время без таймзоны, считаем что это Moscow time
-            scheduled_time_utc = MOSCOW_TZ.localize(scheduled_time).astimezone(pytz.UTC)
-        else:
-            scheduled_time_utc = scheduled_time.astimezone(pytz.UTC)
-        
-        # Преобразуем в строку для передачи в БД
-        scheduled_time_str = scheduled_time_utc.isoformat()
+            scheduled_time = MOSCOW_TZ.localize(scheduled_time)
+        scheduled_time_utc = scheduled_time.astimezone(pytz.UTC)
         
         conn = await get_db_connection()
         
         post_id = await conn.fetchval('''
             INSERT INTO scheduled_posts 
             (user_id, channel_id, message_type, message_text, media_file_id, media_caption, scheduled_time)
-            VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id
         ''', 
         user_id,
@@ -506,7 +425,7 @@ async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, sc
         post_data.get('message_text'),
         post_data.get('media_file_id'),
         post_data.get('media_caption'),
-        scheduled_time_str
+        scheduled_time_utc  # Передаем datetime объект, а не строку!
         )
         
         await conn.close()
@@ -552,44 +471,6 @@ async def get_user_stats(user_id: int) -> Dict:
         logger.error(f"Ошибка получения статистики: {e}")
         return {'total_posts': 0, 'active_posts': 0, 'sent_posts': 0, 'channels': 0}
 
-async def get_total_stats() -> Dict:
-    """Получает общую статистику для админа"""
-    try:
-        conn = await get_db_connection()
-        
-        total_users = await conn.fetchval("SELECT COUNT(*) FROM users") or 0
-        mini_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE tariff = 'mini'") or 0
-        standard_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE tariff = 'standard'") or 0
-        vip_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE tariff = 'vip'") or 0
-        
-        total_posts = await conn.fetchval("SELECT COUNT(*) FROM scheduled_posts") or 0
-        active_posts = await conn.fetchval("SELECT COUNT(*) FROM scheduled_posts WHERE is_sent = FALSE") or 0
-        sent_posts = await conn.fetchval("SELECT COUNT(*) FROM scheduled_posts WHERE is_sent = TRUE") or 0
-        
-        total_channels = await conn.fetchval("SELECT COUNT(*) FROM channels WHERE is_active = TRUE") or 0
-        
-        # Статистика заказов
-        pending_orders = await conn.fetchval("SELECT COUNT(*) FROM tariff_orders WHERE status = 'pending'") or 0
-        completed_orders = await conn.fetchval("SELECT COUNT(*) FROM tariff_orders WHERE status = 'completed'") or 0
-        
-        await conn.close()
-        
-        return {
-            'total_users': total_users,
-            'mini_users': mini_users,
-            'standard_users': standard_users,
-            'vip_users': vip_users,
-            'total_posts': total_posts,
-            'active_posts': active_posts,
-            'sent_posts': sent_posts,
-            'total_channels': total_channels,
-            'pending_orders': pending_orders,
-            'completed_orders': completed_orders
-        }
-    except Exception as e:
-        logger.error(f"Ошибка получения общей статистики: {e}")
-        return {}
-
 def format_datetime(dt: datetime) -> str:
     """Форматирует дату-время в читаемый вид"""
     moscow_time = dt.astimezone(MOSCOW_TZ)
@@ -630,12 +511,7 @@ def parse_datetime(date_str: str, time_str: str) -> Optional[datetime]:
             return None
         
         # Комбинируем
-        combined = datetime.combine(
-            date_obj.date(), 
-            time_obj.time()
-        )
-        
-        # Добавляем московскую таймзону
+        combined = datetime.combine(date_obj.date(), time_obj.time())
         return MOSCOW_TZ.localize(combined)
     except Exception:
         return None
@@ -693,12 +569,11 @@ def get_tariffs_keyboard(user_tariff: str = 'mini') -> InlineKeyboardMarkup:
     buttons = []
     
     for tariff_id, tariff_info in TARIFFS.items():
-        if tariff_id == 'admin':  # Пропускаем админский тариф
+        if tariff_id == 'admin':
             continue
             
         name = tariff_info['name']
         price = tariff_info['price']
-        currency = tariff_info['currency']
         
         if tariff_id == user_tariff:
             button_text = f"✅ {name} (текущий)"
@@ -706,7 +581,7 @@ def get_tariffs_keyboard(user_tariff: str = 'mini') -> InlineKeyboardMarkup:
             if price == 0:
                 button_text = f"{name} - Бесплатно"
             else:
-                button_text = f"{name} - {price} {currency}/месяц"
+                button_text = f"{name} - {price} USD/месяц"
         
         buttons.append([InlineKeyboardButton(
             text=button_text,
@@ -746,23 +621,6 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
     ])
 
-def get_admin_users_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура управления пользователями"""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔍 Найти пользователя по ID", callback_data="admin_find_user")],
-        [InlineKeyboardButton(text="💎 Изменить тариф пользователя", callback_data="admin_change_tariff")],
-        [InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin_panel")]
-    ])
-
-def get_admin_orders_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура управления заказами"""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Список заказов", callback_data="admin_orders_list")],
-        [InlineKeyboardButton(text="⏳ Ожидающие заказы", callback_data="admin_pending_orders")],
-        [InlineKeyboardButton(text="✅ Выполненные заказы", callback_data="admin_completed_orders")],
-        [InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin_panel")]
-    ])
-
 # ========== STATES ==========
 class PostStates(StatesGroup):
     waiting_for_channel = State()
@@ -777,44 +635,29 @@ class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
     waiting_for_order_action = State()
 
-# ========== HANDLERS ==========
+# ========== BASIC HANDLERS ==========
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     """Обработчик команды /start"""
     user_id = message.from_user.id
     username = message.from_user.username or ""
     first_name = message.from_user.first_name or "Пользователь"
-    
     is_admin = user_id == ADMIN_ID
     
-    # Регистрируем пользователя (БЕЗ колонки tariff если ее нет)
+    # Регистрируем пользователя
     try:
         conn = await get_db_connection()
-        
-        # Проверяем существование колонки tariff
-        try:
-            await conn.execute('''
-                INSERT INTO users (id, username, first_name, is_admin)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (id) DO UPDATE 
-                SET username = EXCLUDED.username, first_name = EXCLUDED.first_name,
-                    is_admin = EXCLUDED.is_admin
-            ''', user_id, username, first_name, is_admin)
-        except asyncpg.UndefinedColumnError:
-            # Если колонки tariff нет, используем упрощенный запрос
-            await conn.execute('''
-                INSERT INTO users (id, username, first_name, is_admin)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (id) DO UPDATE 
-                SET username = EXCLUDED.username, first_name = EXCLUDED.first_name
-            ''', user_id, username, first_name, is_admin)
-        
+        await conn.execute('''
+            INSERT INTO users (id, username, first_name, is_admin, tariff)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (id) DO UPDATE 
+            SET username = EXCLUDED.username, first_name = EXCLUDED.first_name,
+                is_admin = EXCLUDED.is_admin
+        ''', user_id, username, first_name, is_admin, 'mini' if not is_admin else 'admin')
         await conn.close()
-        logger.info(f"👤 Пользователь {user_id} зарегистрирован")
     except Exception as e:
         logger.error(f"Ошибка регистрации пользователя {user_id}: {e}")
     
-    # Получаем текущий тариф
     current_tariff = await get_user_tariff(user_id)
     tariff_info = TARIFFS.get(current_tariff, TARIFFS['mini'])
     
@@ -831,10 +674,7 @@ async def cmd_start(message: Message):
         f"👇 Выберите действие:"
     )
     
-    await message.answer(
-        welcome_text,
-        reply_markup=get_main_menu(user_id, is_admin)
-    )
+    await message.answer(welcome_text, reply_markup=get_main_menu(user_id, is_admin))
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
@@ -859,13 +699,36 @@ async def cmd_help(message: Message):
         "• Standard ($4/месяц) - 2 канала, 6 постов в день\n"
         "• VIP ($7/месяц) - 3 канала, 12 постов в день\n\n"
         
-        "🕐 Проверьте текущее время Москвы в разделе 'Тарифы' -> 'Проверить время'\n\n"
-        
         f"🆘 Поддержка: @{SUPPORT_BOT_USERNAME}\n"
         f"💬 Вопросы по оплате: @{ADMIN_CONTACT.replace('@', '')}"
     )
     
     await message.answer(help_text)
+
+# ========== NAVIGATION HANDLERS ==========
+@router.callback_query(F.data == "back_to_main")
+async def back_to_main(callback: CallbackQuery, state: FSMContext):
+    """Возврат в главное меню"""
+    await state.clear()
+    user_id = callback.from_user.id
+    is_admin = user_id == ADMIN_ID
+    
+    await callback.message.edit_text(
+        "🤖 Главное меню\n\n👇 Выберите действие:",
+        reply_markup=get_main_menu(user_id, is_admin)
+    )
+
+@router.callback_query(F.data == "cancel")
+async def cancel_action(callback: CallbackQuery, state: FSMContext):
+    """Отмена текущего действия"""
+    await state.clear()
+    user_id = callback.from_user.id
+    is_admin = user_id == ADMIN_ID
+    
+    await callback.message.edit_text(
+        "❌ Действие отменено.\n\n👇 Выберите действие:",
+        reply_markup=get_main_menu(user_id, is_admin)
+    )
 
 @router.callback_query(F.data == "check_time")
 async def check_time(callback: CallbackQuery):
@@ -883,31 +746,141 @@ async def check_time(callback: CallbackQuery):
         reply_markup=get_tariffs_keyboard()
     )
 
-@router.callback_query(F.data == "back_to_main")
-async def back_to_main(callback: CallbackQuery, state: FSMContext):
-    """Возврат в главное меню"""
-    await state.clear()
-    is_admin = callback.from_user.id == ADMIN_ID
+# ========== STATISTICS HANDLERS ==========
+@router.callback_query(F.data == "my_stats")
+async def show_my_stats(callback: CallbackQuery):
+    """Показать статистику пользователя"""
+    user_id = callback.from_user.id
+    stats = await get_user_stats(user_id)
+    current_tariff = await get_user_tariff(user_id)
+    tariff_info = TARIFFS.get(current_tariff, TARIFFS['mini'])
+    posts_today = await get_user_posts_today(user_id)
+    
+    stats_text = (
+        f"📊 Ваша статистика:\n\n"
+        f"💎 Текущий тариф: {tariff_info['name']}\n"
+        f"📈 Всего запланировано постов: {stats['total_posts']}\n"
+        f"⏳ Активных постов: {stats['active_posts']}\n"
+        f"✅ Отправлено постов: {stats['sent_posts']}\n"
+        f"📢 Подключено каналов: {stats['channels']}/{tariff_info['channels_limit']}\n"
+        f"📅 Постов сегодня: {posts_today}/{tariff_info['daily_posts_limit']}\n\n"
+        f"📍 Время по Москве: {datetime.now(MOSCOW_TZ).strftime('%H:%M')}"
+    )
     
     await callback.message.edit_text(
-        "🤖 Главное меню\n\n"
-        "👇 Выберите действие:",
-        reply_markup=get_main_menu(callback.from_user.id, is_admin)
+        stats_text,
+        reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
     )
 
-@router.callback_query(F.data == "cancel")
-async def cancel_action(callback: CallbackQuery, state: FSMContext):
-    """Отмена текущего действия"""
-    await state.clear()
-    is_admin = callback.from_user.id == ADMIN_ID
+# ========== CHANNELS HANDLERS ==========
+@router.callback_query(F.data == "my_channels")
+async def show_my_channels(callback: CallbackQuery):
+    """Показать каналы пользователя"""
+    user_id = callback.from_user.id
+    channels = await get_user_channels(user_id)
+    
+    if not channels:
+        await callback.message.edit_text(
+            "📢 У вас еще нет подключенных каналов.\n\n"
+            "👇 Нажмите кнопку ниже, чтобы добавить канал:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Добавить канал", callback_data="add_channel")],
+                [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
+            ])
+        )
+        return
+    
+    channels_text = "📢 Ваши каналы:\n\n"
+    for i, channel in enumerate(channels, 1):
+        channels_text += f"{i}. {channel['channel_name']}\n"
+    
+    channels_text += f"\n📊 Всего: {len(channels)} каналов"
     
     await callback.message.edit_text(
-        "❌ Действие отменено.\n\n"
-        "👇 Выберите действие:",
-        reply_markup=get_main_menu(callback.from_user.id, is_admin)
+        channels_text,
+        reply_markup=get_channels_keyboard(channels)
     )
 
-# ========== TARIFFS ==========
+@router.callback_query(F.data == "add_channel")
+async def add_channel_start(callback: CallbackQuery, state: FSMContext):
+    """Начало добавления канала"""
+    user_id = callback.from_user.id
+    
+    # Проверяем лимит каналов
+    channels_count = await get_user_channels_count(user_id)
+    channels_limit, _ = await get_tariff_limits(user_id)
+    
+    if channels_count >= channels_limit:
+        await callback.message.edit_text(
+            f"❌ Достигнут лимит каналов!\n\n"
+            f"У вас подключено: {channels_count} каналов\n"
+            f"Ваш лимит: {channels_limit} каналов\n\n"
+            "💎 Чтобы увеличить лимит, выберите другой тариф.",
+            reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
+        )
+        return
+    
+    await state.set_state(PostStates.waiting_for_channel)
+    await callback.message.edit_text(
+        "📢 Добавление канала\n\n"
+        "Чтобы я мог публиковать посты в вашем канале:\n\n"
+        "1. Добавьте меня в канал как администратора\n"
+        "2. Дайте права на отправку сообщений\n"
+        "3. Пришлите мне ID канала в формате -1001234567890\n"
+        "4. Или просто перешлите любое сообщение из канала\n\n"
+        "👇 Отправьте ID или перешлите сообщение:",
+        reply_markup=get_cancel_keyboard()
+    )
+
+@router.message(PostStates.waiting_for_channel)
+async def process_channel_input(message: Message, state: FSMContext):
+    """Обработка ввода канала"""
+    user_id = message.from_user.id
+    
+    channel_id = None
+    channel_name = "Неизвестный канал"
+    
+    if message.forward_from_chat:
+        channel_id = message.forward_from_chat.id
+        channel_name = message.forward_from_chat.title
+    elif message.text and message.text.startswith('-100'):
+        try:
+            channel_id = int(message.text.strip())
+            channel_name = f"Канал {channel_id}"
+        except ValueError:
+            await message.answer(
+                "❌ Неверный формат ID!\n\n"
+                "ID канала должен начинаться с -100 и содержать только цифры.\n"
+                "Пример: -1001234567890\n\n"
+                "Попробуйте еще раз:",
+                reply_markup=get_cancel_keyboard()
+            )
+            return
+    else:
+        await message.answer(
+            "❌ Пожалуйста, отправьте ID канала или перешлите сообщение из канала.",
+            reply_markup=get_cancel_keyboard()
+        )
+        return
+    
+    # Сохраняем канал
+    success = await add_user_channel(user_id, channel_id, channel_name)
+    
+    if not success:
+        await message.answer(
+            "❌ Ошибка при добавлении канала. Попробуйте позже.",
+            reply_markup=get_cancel_keyboard()
+        )
+        return
+    
+    await state.clear()
+    await message.answer(
+        f"✅ Канал успешно добавлен: {channel_name}\n\n"
+        "Теперь вы можете запланировать пост в этом канале.",
+        reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
+    )
+
+# ========== TARIFFS HANDLERS ==========
 @router.callback_query(F.data == "tariffs")
 async def show_tariffs(callback: CallbackQuery):
     """Показ тарифов"""
@@ -972,14 +945,8 @@ async def tariff_info(callback: CallbackQuery):
         info_text += "✅ Это ваш текущий тариф"
     else:
         info_text += (
-            "💳 Для заказа тарифа:\n"
-            "1. Нажмите кнопку 'Заказать тариф'\n"
-            "2. Напишите менеджеру: @ваш_менеджер\n"
-            "3. Оплатите через CryptoBot\n"
-            "4. Пришлите скриншот оплаты и ваш ID\n\n"
-            f"📋 Ваш ID для заказа: {user_id}\n\n"
-            "⏳ Тарифы активируются в течение 24 часов после оплаты.\n"
-            "🙏 Отнеситесь с пониманием к времени обработки заказа."
+            f"💳 Для заказа тарифа нажмите кнопку ниже\n\n"
+            f"📋 Ваш ID для заказа: {user_id}"
         )
     
     await callback.message.edit_text(
@@ -997,7 +964,6 @@ async def activate_free_tariff(callback: CallbackQuery):
         await callback.answer("❌ Этот тариф не бесплатный!", show_alert=True)
         return
     
-    # Активируем тариф
     success = await update_user_tariff(user_id, tariff_id)
     
     if success:
@@ -1005,15 +971,11 @@ async def activate_free_tariff(callback: CallbackQuery):
             "🎉 Бесплатный тариф Mini успешно активирован!\n\n"
             "Теперь вы можете:\n"
             "• Добавить 1 канал\n"
-            "• Публиковать до 2 постов в день\n\n"
-            "Чтобы увеличить лимиты, закажите платный тариф.",
+            "• Публиковать до 2 постов в день",
             reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
         )
     else:
-        await callback.message.edit_text(
-            "❌ Ошибка при активации тарифа. Попробуйте позже.",
-            reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
-        )
+        await callback.answer("❌ Ошибка при активации тарифа", show_alert=True)
 
 @router.callback_query(F.data.startswith("order_"))
 async def order_tariff(callback: CallbackQuery):
@@ -1026,7 +988,6 @@ async def order_tariff(callback: CallbackQuery):
         await callback.answer("❌ Неверный тариф!", show_alert=True)
         return
     
-    # Создаем заказ
     success = await create_tariff_order(user_id, tariff_id)
     
     if success:
@@ -1039,10 +1000,7 @@ async def order_tariff(callback: CallbackQuery):
             f"2. Укажите ваш Telegram ID: {user_id}\n"
             f"3. Оплатите через CryptoBot (чек)\n"
             f"4. Пришлите скриншот оплаты\n\n"
-            f"💳 Оплата производится через чек CryptoPay\n"
-            f"📞 По всем вопросам обращайтесь к менеджеру\n\n"
-            f"⏳ Тариф будет активирован в течение 24 часов после оплаты.\n"
-            f"🙏 Отнеситесь с пониманием к времени обработки заказа."
+            f"⏳ Тариф будет активирован в течение 24 часов после оплаты."
         )
         
         await callback.message.edit_text(
@@ -1055,15 +1013,11 @@ async def order_tariff(callback: CallbackQuery):
     else:
         await callback.answer("❌ Ошибка при создании заказа", show_alert=True)
 
-# ========== POST SCHEDULING ==========
+# ========== POST SCHEDULING HANDLERS ==========
 @router.callback_query(F.data == "schedule_post")
 async def start_scheduling(callback: CallbackQuery, state: FSMContext):
     """Начало планирования поста"""
     user_id = callback.from_user.id
-    
-    if not await check_user_access(user_id):
-        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
-        return
     
     # Проверяем лимит постов за сегодня
     posts_today = await get_user_posts_today(user_id)
@@ -1085,8 +1039,7 @@ async def start_scheduling(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(
             "📢 Сначала нужно добавить канал!\n\n"
             "Чтобы запланировать пост, добавьте меня в канал как администратора "
-            "и перешлите любое сообщение из канала.\n\n"
-            "👇 Нажмите кнопку ниже, чтобы добавить канал:",
+            "и перешлите любое сообщение из канала.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➕ Добавить канал", callback_data="add_channel")],
                 [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
@@ -1096,8 +1049,7 @@ async def start_scheduling(callback: CallbackQuery, state: FSMContext):
     
     await state.set_state(PostStates.waiting_for_channel)
     await callback.message.edit_text(
-        "📢 Выберите канал для поста:\n\n"
-        "👇 Выберите из списка ваших каналов:",
+        "📢 Выберите канал для поста:\n\n👇 Выберите из списка:",
         reply_markup=get_channels_keyboard(channels)
     )
 
@@ -1119,95 +1071,7 @@ async def select_channel(callback: CallbackQuery, state: FSMContext):
         "• Текст сообщения\n"
         "• Фотографию с подписью\n"
         "• Видео с подписью\n"
-        "• Документ с подписью\n\n"
-        "❓ Если хотите добавить фото с текстом, просто отправьте фото и в подписи напишите текст.",
-        reply_markup=get_cancel_keyboard()
-    )
-
-@router.callback_query(F.data == "add_channel")
-async def add_channel_start(callback: CallbackQuery, state: FSMContext):
-    """Добавление нового канала"""
-    user_id = callback.from_user.id
-    
-    # Проверяем лимит каналов
-    channels_count = await get_user_channels_count(user_id)
-    channels_limit, _ = await get_tariff_limits(user_id)
-    
-    if channels_count >= channels_limit:
-        await callback.message.edit_text(
-            f"❌ Достигнут лимит каналов!\n\n"
-            f"У вас подключено: {channels_count} каналов\n"
-            f"Ваш лимит: {channels_limit} каналов\n\n"
-            "💎 Чтобы увеличить лимит, выберите другой тариф.",
-            reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
-        )
-        return
-    
-    await state.set_state(PostStates.waiting_for_channel)
-    await callback.message.edit_text(
-        "📢 Добавление канала\n\n"
-        "Чтобы я мог публиковать посты в вашем канале:\n\n"
-        "1. Добавьте меня в канал как администратора\n"
-        "2. Дайте права на отправку сообщений\n"
-        "3. Пришлите мне ID канала в формате -1001234567890\n"
-        "4. Или просто перешлите любое сообщение из канала\n\n"
-        "🔧 ID канала можно получить через бота @username_to_id_bot\n\n"
-        "👇 Отправьте ID или перешлите сообщение:",
-        reply_markup=get_cancel_keyboard()
-    )
-
-@router.message(PostStates.waiting_for_channel)
-async def process_channel_input(message: Message, state: FSMContext):
-    """Обработка ввода канала"""
-    user_id = message.from_user.id
-    
-    channel_id = None
-    channel_name = "Неизвестный канал"
-    
-    if message.forward_from_chat:
-        channel_id = message.forward_from_chat.id
-        channel_name = message.forward_from_chat.title
-    elif message.text and message.text.startswith('-100'):
-        try:
-            channel_id = int(message.text.strip())
-            channel_name = f"Канал {channel_id}"
-        except ValueError:
-            await message.answer(
-                "❌ Неверный формат ID!\n\n"
-                "ID канала должен начинаться с -100 и содержать только цифры.\n"
-                "Пример: -1001234567890\n\n"
-                "Попробуйте еще раз:",
-                reply_markup=get_cancel_keyboard()
-            )
-            return
-    else:
-        await message.answer(
-            "❌ Пожалуйста, отправьте ID канала или перешлите сообщение из канала.",
-            reply_markup=get_cancel_keyboard()
-        )
-        return
-    
-    # Сохраняем канал
-    success = await add_user_channel(user_id, channel_id, channel_name)
-    
-    if not success:
-        await message.answer(
-            "❌ Ошибка при добавлении канала. Попробуйте позже.",
-            reply_markup=get_cancel_keyboard()
-        )
-        return
-    
-    await state.update_data(channel_id=channel_id, channel_name=channel_name)
-    await state.set_state(PostStates.waiting_for_content)
-    
-    await message.answer(
-        f"✅ Канал добавлен: {channel_name}\n\n"
-        "📝 Теперь отправьте контент для поста:\n\n"
-        "• Текст сообщения\n"
-        "• Фотографию с подписью\n"
-        "• Видео с подписью\n"
-        "• Документ с подписью\n\n"
-        "❓ Если хотите добавить фото с текстом, просто отправьте фото и в подписи напишите текст.",
+        "• Документ с подписью",
         reply_markup=get_cancel_keyboard()
     )
 
@@ -1216,13 +1080,11 @@ async def process_content(message: Message, state: FSMContext):
     """Обработка контента поста"""
     post_data = {}
     
-    # Определяем тип контента
     if message.text:
         if len(message.text) > POST_CHARACTER_LIMIT:
             await message.answer(
                 f"❌ Слишком длинный текст!\n"
-                f"Максимум {POST_CHARACTER_LIMIT} символов.\n\n"
-                f"У вас: {len(message.text)} символов.",
+                f"Максимум {POST_CHARACTER_LIMIT} символов.",
                 reply_markup=get_cancel_keyboard()
             )
             return
@@ -1232,7 +1094,6 @@ async def process_content(message: Message, state: FSMContext):
             'media_file_id': None,
             'media_caption': None
         }
-    
     elif message.photo:
         post_data = {
             'message_type': 'photo',
@@ -1240,7 +1101,6 @@ async def process_content(message: Message, state: FSMContext):
             'media_file_id': message.photo[-1].file_id,
             'media_caption': message.caption or ''
         }
-    
     elif message.video:
         post_data = {
             'message_type': 'video',
@@ -1248,7 +1108,6 @@ async def process_content(message: Message, state: FSMContext):
             'media_file_id': message.video.file_id,
             'media_caption': message.caption or ''
         }
-    
     elif message.document:
         post_data = {
             'message_type': 'document',
@@ -1256,7 +1115,6 @@ async def process_content(message: Message, state: FSMContext):
             'media_file_id': message.document.file_id,
             'media_caption': message.caption or ''
         }
-    
     else:
         await message.answer(
             "❌ Неподдерживаемый тип контента!\n\n"
@@ -1283,8 +1141,6 @@ async def process_content(message: Message, state: FSMContext):
 async def process_date(message: Message, state: FSMContext):
     """Обработка даты публикации"""
     date_str = message.text.strip()
-    
-    # Пробуем распарсить дату
     now_moscow = datetime.now(MOSCOW_TZ)
     date_obj = parse_datetime(date_str, "00:00")
     
@@ -1292,18 +1148,15 @@ async def process_date(message: Message, state: FSMContext):
         await message.answer(
             "❌ Неверный формат даты!\n\n"
             "Используйте: ДД.ММ.ГГГГ\n"
-            f"Пример: {now_moscow.strftime('%d.%m.%Y')}\n\n"
-            "Попробуйте еще раз:",
+            f"Пример: {now_moscow.strftime('%d.%m.%Y')}",
             reply_markup=get_cancel_keyboard()
         )
         return
     
-    # Проверяем, что дата не в прошлом
     if date_obj.date() < now_moscow.date():
         await message.answer(
             "❌ Дата не может быть в прошлом!\n\n"
-            f"Сегодня: {now_moscow.strftime('%d.%m.%Y')}\n"
-            "Укажите сегодняшнюю или будущую дату.",
+            f"Сегодня: {now_moscow.strftime('%d.%m.%Y')}",
             reply_markup=get_cancel_keyboard()
         )
         return
@@ -1323,40 +1176,32 @@ async def process_date(message: Message, state: FSMContext):
 async def process_time(message: Message, state: FSMContext):
     """Обработка времени публикации"""
     time_str = message.text.strip()
-    
     data = await state.get_data()
     date_str = data.get('date_str')
     
-    # Пробуем распарсить время
     scheduled_time = parse_datetime(date_str, time_str)
     
     if not scheduled_time:
         await message.answer(
             "❌ Неверный формат времени!\n\n"
             "Используйте: ЧЧ:ММ\n"
-            "Пример: 14:30\n\n"
-            "Попробуйте еще раз:",
+            "Пример: 14:30",
             reply_markup=get_cancel_keyboard()
         )
         return
     
-    # Проверяем, что время не в прошлом
     now_moscow = datetime.now(MOSCOW_TZ)
     if scheduled_time < now_moscow:
         await message.answer(
             "❌ Время не может быть в прошлом!\n\n"
-            f"Сейчас: {now_moscow.strftime('%H:%M')}\n"
-            "Укажите будущее время.",
+            f"Сейчас: {now_moscow.strftime('%H:%M')}",
             reply_markup=get_cancel_keyboard()
         )
         return
     
     await state.update_data(time_str=time_str, scheduled_time=scheduled_time)
-    
-    # Показываем превью
     data = await state.get_data()
     await show_post_preview(message, data)
-    
     await state.set_state(PostStates.waiting_for_confirmation)
 
 async def show_post_preview(message: Message, data: Dict):
@@ -1374,11 +1219,8 @@ async def show_post_preview(message: Message, data: Dict):
     )
     
     if message_type == 'text':
-        text_preview = message_text[:200]
-        if len(message_text) > 200:
-            text_preview += "..."
+        text_preview = message_text[:200] + ("..." if len(message_text) > 200 else "")
         preview_text += f"Текст:\n{text_preview}"
-    
     elif message_type in ['photo', 'video', 'document']:
         media_type = {
             'photo': '📷 Фото',
@@ -1388,19 +1230,14 @@ async def show_post_preview(message: Message, data: Dict):
         
         preview_text += f"{media_type}"
         if media_caption:
-            caption_preview = media_caption[:200]
-            if len(media_caption) > 200:
-                caption_preview += "..."
+            caption_preview = media_caption[:200] + ("..." if len(media_caption) > 200 else "")
             preview_text += f" с подписью:\n{caption_preview}"
         else:
             preview_text += " без подписи"
     
     preview_text += "\n\n✅ Все верно?"
     
-    await message.answer(
-        preview_text,
-        reply_markup=get_confirmation_keyboard()
-    )
+    await message.answer(preview_text, reply_markup=get_confirmation_keyboard())
 
 @router.callback_query(F.data == "confirm_yes")
 async def confirm_post(callback: CallbackQuery, state: FSMContext):
@@ -1408,10 +1245,8 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     user_id = callback.from_user.id
     
-    # Увеличиваем счетчик постов
     await increment_user_posts(user_id)
     
-    # Сохраняем пост
     post_id = await save_scheduled_post(
         user_id,
         data['channel_id'],
@@ -1421,25 +1256,21 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
     
     if not post_id:
         await callback.message.edit_text(
-            "❌ Ошибка при сохранении поста!\n\n"
-            "Попробуйте еще раз или обратитесь в поддержку.",
+            "❌ Ошибка при сохранении поста!",
             reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
         )
         await state.clear()
         return
     
     # Планируем отправку
-    # Для APScheduler конвертируем в UTC
     scheduled_time_utc = data['scheduled_time'].astimezone(pytz.UTC)
     scheduler.add_job(
         send_scheduled_post,
         trigger=DateTrigger(run_date=scheduled_time_utc),
         args=(data['channel_id'], data, post_id),
-        id=f"post_{post_id}",
-        replace_existing=True
+        id=f"post_{post_id}"
     )
     
-    # Получаем обновленную статистику
     posts_today = await get_user_posts_today(user_id)
     _, daily_limit = await get_tariff_limits(user_id)
     
@@ -1448,24 +1279,22 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
         f"📢 Канал: {data['channel_name']}\n"
         f"⏰ Время: {format_datetime(data['scheduled_time'])}\n"
         f"📝 ID поста: {post_id}\n\n"
-        f"📊 Сегодня: {posts_today}/{daily_limit} постов\n\n"
-        f"📍 Пост будет автоматически опубликован в указанное время.",
+        f"📊 Сегодня: {posts_today}/{daily_limit} постов",
         reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
     )
     
-    logger.info(f"📅 Пост {post_id} запланирован пользователем {user_id}")
     await state.clear()
 
 @router.callback_query(F.data == "confirm_no")
 async def reject_post(callback: CallbackQuery, state: FSMContext):
     """Отказ от поста"""
     await state.clear()
-    is_admin = callback.from_user.id == ADMIN_ID
+    user_id = callback.from_user.id
+    is_admin = user_id == ADMIN_ID
     
     await callback.message.edit_text(
-        "❌ Планирование отменено\n\n"
-        "Вы можете начать заново.",
-        reply_markup=get_main_menu(callback.from_user.id, is_admin)
+        "❌ Планирование отменено",
+        reply_markup=get_main_menu(user_id, is_admin)
     )
 
 async def send_scheduled_post(channel_id: int, post_data: Dict, post_id: int):
@@ -1478,21 +1307,18 @@ async def send_scheduled_post(channel_id: int, post_data: Dict, post_id: int):
                 chat_id=channel_id,
                 text=post_data.get('message_text')
             )
-            
         elif message_type == 'photo':
             await bot.send_photo(
                 chat_id=channel_id,
                 photo=post_data.get('media_file_id'),
                 caption=post_data.get('media_caption')
             )
-            
         elif message_type == 'video':
             await bot.send_video(
                 chat_id=channel_id,
                 video=post_data.get('media_file_id'),
                 caption=post_data.get('media_caption')
             )
-            
         elif message_type == 'document':
             await bot.send_document(
                 chat_id=channel_id,
@@ -1502,23 +1328,31 @@ async def send_scheduled_post(channel_id: int, post_data: Dict, post_id: int):
         
         # Обновляем статус в БД
         conn = await get_db_connection()
-        await conn.execute('''
-            UPDATE scheduled_posts 
-            SET is_sent = TRUE 
-            WHERE id = $1
-        ''', post_id)
+        await conn.execute('UPDATE scheduled_posts SET is_sent = TRUE WHERE id = $1', post_id)
         await conn.close()
         
         logger.info(f"✅ Пост {post_id} отправлен в канал {channel_id}")
-        
     except Exception as e:
         logger.error(f"❌ Ошибка отправки поста {post_id}: {e}")
 
-# ... остальные обработчики остаются такими же, как в предыдущем коде ...
+# ========== ADMIN HANDLERS ==========
+@router.callback_query(F.data == "admin_panel")
+async def admin_panel(callback: CallbackQuery):
+    """Админ панель"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "👑 Админ-панель\n\n👇 Выберите действие:",
+        reply_markup=get_admin_keyboard()
+    )
 
 # ========== RESTORE JOBS ==========
 async def restore_scheduled_jobs():
-    """Восстановление запланированных постов при перезапуске"""
+    """Восстановление запланированных постов"""
     try:
         conn = await get_db_connection()
         posts = await conn.fetch('''
@@ -1526,7 +1360,6 @@ async def restore_scheduled_jobs():
                    media_file_id, media_caption, scheduled_time
             FROM scheduled_posts
             WHERE is_sent = FALSE AND scheduled_time > NOW()
-            ORDER BY scheduled_time
         ''')
         await conn.close()
         
@@ -1540,7 +1373,6 @@ async def restore_scheduled_jobs():
                     'media_caption': post['media_caption']
                 }
                 
-                # В PostgreSQL TIMESTAMPTZ уже возвращается как aware datetime
                 scheduled_time = post['scheduled_time']
                 if scheduled_time.tzinfo is None:
                     scheduled_time = pytz.UTC.localize(scheduled_time)
@@ -1549,22 +1381,15 @@ async def restore_scheduled_jobs():
                     send_scheduled_post,
                     trigger=DateTrigger(run_date=scheduled_time),
                     args=(post['channel_id'], post_data, post['id']),
-                    id=f"post_{post['id']}",
-                    replace_existing=True
+                    id=f"post_{post['id']}"
                 )
                 restored += 1
             except Exception as e:
                 logger.error(f"Ошибка восстановления поста {post['id']}: {e}")
         
         logger.info(f"✅ Восстановлено {restored} запланированных постов")
-        
     except Exception as e:
         logger.error(f"❌ Ошибка при восстановлении постов: {e}")
-
-# ========== SCHEDULED TASKS ==========
-async def scheduled_reset_posts():
-    """Ежедневный сброс счетчиков постов"""
-    await reset_daily_posts()
 
 # ========== STARTUP/SHUTDOWN ==========
 async def on_startup():
@@ -1572,33 +1397,14 @@ async def on_startup():
     logger.info("=" * 60)
     logger.info(f"🚀 ЗАПУСК БОТА")
     logger.info(f"👑 Admin ID: {ADMIN_ID}")
-    logger.info(f"🌐 Database: {'Настроена' if DATABASE_URL else 'Нет'}")
-    logger.info(f"🆘 Support: @{SUPPORT_BOT_USERNAME}")
-    logger.info(f"📞 Admin Contact: {ADMIN_CONTACT}")
     logger.info("=" * 60)
     
     try:
-        # Инициализация БД
-        logger.info("📊 Инициализация базы данных...")
         await init_db()
-        logger.info("✅ База данных инициализирована")
-        
-        # Миграция существующей БД
-        logger.info("🔧 Проверка и выполнение миграций...")
         await migrate_db()
-        logger.info("✅ Миграции выполнены")
-        
-        # Восстановление задач
-        logger.info("🔄 Восстановление запланированных постов...")
         await restore_scheduled_jobs()
-        logger.info("✅ Запланированные посты восстановлены")
         
-        # Запуск планировщика
-        logger.info("⏰ Запуск планировщика...")
         scheduler.start()
-        logger.info("✅ Планировщик запущен")
-        
-        # Добавляем ежедневный сброс счетчиков
         scheduler.add_job(
             scheduled_reset_posts,
             trigger='cron',
@@ -1607,106 +1413,66 @@ async def on_startup():
             timezone=MOSCOW_TZ,
             id='reset_posts'
         )
-        logger.info("✅ Задача сброса счетчиков добавлена")
         
-        # Проверяем, что бот работает
         me = await bot.get_me()
         logger.info(f"✅ Бот @{me.username} запущен (ID: {me.id})")
         
-        # Уведомление админу
         if ADMIN_ID:
             try:
                 await bot.send_message(
                     ADMIN_ID,
                     f"🤖 Бот @{me.username} успешно запущен!\n"
                     f"🆔 ID: {me.id}\n"
-                    f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}\n"
-                    f"📍 Готов к работе!\n\n"
-                    f"📊 База данных: OK\n"
-                    f"⏰ Планировщик: OK\n"
-                    f"👥 Пользователи: ожидание..."
+                    f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}"
                 )
-                logger.info(f"✅ Уведомление отправлено админу {ADMIN_ID}")
-            except Exception as e:
-                logger.warning(f"⚠️ Не удалось отправить уведомление админу: {e}")
+            except:
+                pass
         
         logger.info("=" * 60)
-        logger.info("🎉 БОТ УСПЕШНО ЗАПУЩЕН И ГОТОВ К РАБОТЕ!")
+        logger.info("🎉 БОТ УСПЕШНО ЗАПУЩЕН!")
         logger.info("=" * 60)
         return True
         
     except Exception as e:
         logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ: {e}")
-        logger.error(f"📌 Тип ошибки: {type(e).__name__}")
-        
-        # Пытаемся отправить уведомление админу об ошибке
-        if ADMIN_ID:
-            try:
-                await bot.send_message(
-                    ADMIN_ID,
-                    f"🚨 ОШИБКА ПРИ ЗАПУСКЕ БОТА!\n\n"
-                    f"❌ {type(e).__name__}: {str(e)[:200]}\n\n"
-                    f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
-                )
-            except:
-                pass
-        
         return False
 
 async def on_shutdown():
     """Действия при выключении бота"""
     logger.info("🛑 Выключение бота...")
-    
     if scheduler.running:
         scheduler.shutdown()
-        logger.info("✅ Планировщик остановлен")
-    
     logger.info("👋 Бот выключен")
+
+async def scheduled_reset_posts():
+    """Ежедневный сброс счетчиков постов"""
+    await reset_daily_posts()
 
 # ========== MAIN ==========
 async def main():
     """Основная функция"""
-    # Проверяем переменные окружения
-    logger.info("🔍 Проверка конфигурации...")
-    
-    missing_vars = []
-    if not API_TOKEN:
-        missing_vars.append("BOT_TOKEN")
-    if not DATABASE_URL:
-        missing_vars.append("DATABASE_URL")
-    
-    if missing_vars:
-        logger.error(f"❌ Отсутствуют обязательные переменные: {', '.join(missing_vars)}")
-        logger.error("ℹ️ Добавьте их в настройках Railway (Environment Variables)")
+    if not API_TOKEN or not DATABASE_URL:
+        logger.error("❌ Отсутствуют обязательные переменные")
         return
     
-    logger.info("✅ Все обязательные переменные присутствуют")
-    
-    # Запуск startup процедур
-    logger.info("🚀 Запуск процедур инициализации...")
     if not await on_startup():
-        logger.error("❌ Не удалось запустить бота из-за ошибок при инициализации")
+        logger.error("❌ Не удалось запустить бота")
         return
     
     try:
-        # Запуск polling
-        logger.info("🔄 Запуск polling...")
         await dp.start_polling(bot, skip_updates=True)
     except KeyboardInterrupt:
-        logger.info("⚠️ Получен сигнал прерывания (Ctrl+C)")
+        logger.info("⚠️ Получен сигнал прерывания")
     except Exception as e:
-        logger.error(f"💥 КРИТИЧЕСКАЯ ОШИБКА ВО ВРЕМЯ РАБОТЫ: {e}")
-        logger.error(f"📌 Тип ошибки: {type(e).__name__}")
+        logger.error(f"💥 КРИТИЧЕСКАЯ ОШИБКА: {e}")
     finally:
-        # Выполняем shutdown процедуры
-        logger.info("🔄 Запуск процедур завершения...")
         await on_shutdown()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Бот остановлен пользователем")
+        print("\n👋 Бот остановлен")
     except Exception as e:
         print(f"💥 Фатальная ошибка: {e}")
         sys.exit(1)
