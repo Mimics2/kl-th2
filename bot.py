@@ -118,7 +118,6 @@ async def init_db():
     try:
         conn = await get_db_connection()
         
-        # Таблица пользователей
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id BIGINT PRIMARY KEY,
@@ -133,7 +132,6 @@ async def init_db():
             )
         ''')
         
-        # Таблица каналов
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS channels (
                 id BIGSERIAL PRIMARY KEY,
@@ -145,7 +143,6 @@ async def init_db():
             )
         ''')
         
-        # Таблица запланированных постов
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS scheduled_posts (
                 id BIGSERIAL PRIMARY KEY,
@@ -161,7 +158,6 @@ async def init_db():
             )
         ''')
         
-        # Таблица заказов тарифов
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS tariff_orders (
                 id BIGSERIAL PRIMARY KEY,
@@ -206,7 +202,6 @@ async def migrate_db():
             except Exception as e:
                 logger.error(f"Ошибка при добавлении колонки {column}: {e}")
         
-        # Обновляем админа
         if ADMIN_ID > 0:
             await conn.execute('''
                 UPDATE users 
@@ -268,7 +263,6 @@ async def create_tariff_order(user_id: int, tariff_id: str) -> bool:
         ''', user_id, tariff_id)
         await conn.close()
         
-        # Уведомляем админа
         if ADMIN_ID:
             tariff_info = TARIFFS.get(tariff_id, {})
             try:
@@ -406,7 +400,6 @@ async def add_user_channel(user_id: int, channel_id: int, channel_name: str) -> 
 async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, scheduled_time: datetime) -> Optional[int]:
     """Сохраняет запланированный пост в БД"""
     try:
-        # Конвертируем время в UTC
         if scheduled_time.tzinfo is None:
             scheduled_time = MOSCOW_TZ.localize(scheduled_time)
         scheduled_time_utc = scheduled_time.astimezone(pytz.UTC)
@@ -425,7 +418,7 @@ async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, sc
         post_data.get('message_text'),
         post_data.get('media_file_id'),
         post_data.get('media_caption'),
-        scheduled_time_utc  # Передаем datetime объект, а не строку!
+        scheduled_time_utc
         )
         
         await conn.close()
@@ -471,6 +464,104 @@ async def get_user_stats(user_id: int) -> Dict:
         logger.error(f"Ошибка получения статистики: {e}")
         return {'total_posts': 0, 'active_posts': 0, 'sent_posts': 0, 'channels': 0}
 
+async def get_total_stats() -> Dict:
+    """Получает общую статистику"""
+    try:
+        conn = await get_db_connection()
+        
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users") or 0
+        mini_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE tariff = 'mini'") or 0
+        standard_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE tariff = 'standard'") or 0
+        vip_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE tariff = 'vip'") or 0
+        
+        total_posts = await conn.fetchval("SELECT COUNT(*) FROM scheduled_posts") or 0
+        active_posts = await conn.fetchval("SELECT COUNT(*) FROM scheduled_posts WHERE is_sent = FALSE") or 0
+        sent_posts = await conn.fetchval("SELECT COUNT(*) FROM scheduled_posts WHERE is_sent = TRUE") or 0
+        
+        total_channels = await conn.fetchval("SELECT COUNT(*) FROM channels WHERE is_active = TRUE") or 0
+        
+        pending_orders = await conn.fetchval("SELECT COUNT(*) FROM tariff_orders WHERE status = 'pending'") or 0
+        completed_orders = await conn.fetchval("SELECT COUNT(*) FROM tariff_orders WHERE status = 'completed'") or 0
+        
+        await conn.close()
+        
+        return {
+            'total_users': total_users,
+            'mini_users': mini_users,
+            'standard_users': standard_users,
+            'vip_users': vip_users,
+            'total_posts': total_posts,
+            'active_posts': active_posts,
+            'sent_posts': sent_posts,
+            'total_channels': total_channels,
+            'pending_orders': pending_orders,
+            'completed_orders': completed_orders
+        }
+    except Exception as e:
+        logger.error(f"Ошибка получения общей статистики: {e}")
+        return {}
+
+async def get_all_users() -> List[Dict]:
+    """Получает всех пользователей"""
+    try:
+        conn = await get_db_connection()
+        users = await conn.fetch('''
+            SELECT id, username, first_name, tariff, is_admin, created_at
+            FROM users 
+            ORDER BY created_at DESC
+        ''')
+        await conn.close()
+        return [dict(user) for user in users]
+    except Exception as e:
+        logger.error(f"Ошибка получения пользователей: {e}")
+        return []
+
+async def get_tariff_orders(status: str = None) -> List[Dict]:
+    """Получает заказы тарифов"""
+    try:
+        conn = await get_db_connection()
+        if status:
+            orders = await conn.fetch('''
+                SELECT * FROM tariff_orders 
+                WHERE status = $1
+                ORDER BY order_date DESC
+            ''', status)
+        else:
+            orders = await conn.fetch('''
+                SELECT * FROM tariff_orders 
+                ORDER BY order_date DESC
+            ''')
+        
+        await conn.close()
+        return [dict(order) for order in orders]
+    except Exception as e:
+        logger.error(f"Ошибка получения заказов: {e}")
+        return []
+
+async def update_order_status(order_id: int, status: str, admin_notes: str = None) -> bool:
+    """Обновляет статус заказа"""
+    try:
+        conn = await get_db_connection()
+        
+        if admin_notes:
+            await conn.execute('''
+                UPDATE tariff_orders 
+                SET status = $1, processed_date = NOW(), admin_notes = $2
+                WHERE id = $3
+            ''', status, admin_notes, order_id)
+        else:
+            await conn.execute('''
+                UPDATE tariff_orders 
+                SET status = $1, processed_date = NOW()
+                WHERE id = $2
+            ''', status, order_id)
+        
+        await conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка обновления статуса заказа: {e}")
+        return False
+
 def format_datetime(dt: datetime) -> str:
     """Форматирует дату-время в читаемый вид"""
     moscow_time = dt.astimezone(MOSCOW_TZ)
@@ -482,7 +573,6 @@ def parse_datetime(date_str: str, time_str: str) -> Optional[datetime]:
         date_str = date_str.strip()
         time_str = time_str.strip()
         
-        # Парсим дату
         date_formats = ["%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"]
         date_obj = None
         
@@ -496,7 +586,6 @@ def parse_datetime(date_str: str, time_str: str) -> Optional[datetime]:
         if not date_obj:
             return None
         
-        # Парсим время
         time_formats = ["%H:%M", "%H.%M"]
         time_obj = None
         
@@ -510,7 +599,6 @@ def parse_datetime(date_str: str, time_str: str) -> Optional[datetime]:
         if not time_obj:
             return None
         
-        # Комбинируем
         combined = datetime.combine(date_obj.date(), time_obj.time())
         return MOSCOW_TZ.localize(combined)
     except Exception:
@@ -615,10 +703,35 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура админ-панели"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Общая статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="👥 Управление пользователями", callback_data="admin_users")],
+        [InlineKeyboardButton(text="👥 Список пользователей", callback_data="admin_users_list")],
         [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="🛒 Управление заказами", callback_data="admin_orders")],
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
+    ])
+
+def get_admin_orders_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура управления заказами"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Все заказы", callback_data="admin_all_orders")],
+        [InlineKeyboardButton(text="⏳ Ожидающие заказы", callback_data="admin_pending_orders")],
+        [InlineKeyboardButton(text="✅ Выполненные заказы", callback_data="admin_completed_orders")],
+        [InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin_panel")]
+    ])
+
+def get_order_action_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура действий с заказом"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Выполнить заказ", callback_data=f"complete_order_{order_id}")],
+        [InlineKeyboardButton(text="❌ Отклонить заказ", callback_data=f"reject_order_{order_id}")],
+        [InlineKeyboardButton(text="📝 Добавить заметку", callback_data=f"add_note_{order_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад к заказам", callback_data="admin_orders")]
+    ])
+
+def get_broadcast_confirmation_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура подтверждения рассылки"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, отправить всем", callback_data="confirm_broadcast")],
+        [InlineKeyboardButton(text="❌ Нет, отменить", callback_data="admin_panel")]
     ])
 
 # ========== STATES ==========
@@ -630,10 +743,8 @@ class PostStates(StatesGroup):
     waiting_for_confirmation = State()
 
 class AdminStates(StatesGroup):
-    waiting_for_user_id = State()
-    waiting_for_tariff = State()
     waiting_for_broadcast = State()
-    waiting_for_order_action = State()
+    waiting_for_order_note = State()
 
 # ========== BASIC HANDLERS ==========
 @router.message(CommandStart())
@@ -644,7 +755,6 @@ async def cmd_start(message: Message):
     first_name = message.from_user.first_name or "Пользователь"
     is_admin = user_id == ADMIN_ID
     
-    # Регистрируем пользователя
     try:
         conn = await get_db_connection()
         await conn.execute('''
@@ -767,10 +877,14 @@ async def show_my_stats(callback: CallbackQuery):
         f"📍 Время по Москве: {datetime.now(MOSCOW_TZ).strftime('%H:%M')}"
     )
     
-    await callback.message.edit_text(
-        stats_text,
-        reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
-    )
+    # Проверяем, изменился ли текст сообщения
+    if callback.message.text != stats_text:
+        await callback.message.edit_text(
+            stats_text,
+            reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
+        )
+    else:
+        await callback.answer("✅ Статистика обновлена")
 
 # ========== CHANNELS HANDLERS ==========
 @router.callback_query(F.data == "my_channels")
@@ -806,7 +920,6 @@ async def add_channel_start(callback: CallbackQuery, state: FSMContext):
     """Начало добавления канала"""
     user_id = callback.from_user.id
     
-    # Проверяем лимит каналов
     channels_count = await get_user_channels_count(user_id)
     channels_limit, _ = await get_tariff_limits(user_id)
     
@@ -863,7 +976,6 @@ async def process_channel_input(message: Message, state: FSMContext):
         )
         return
     
-    # Сохраняем канал
     success = await add_user_channel(user_id, channel_id, channel_name)
     
     if not success:
@@ -1019,7 +1131,6 @@ async def start_scheduling(callback: CallbackQuery, state: FSMContext):
     """Начало планирования поста"""
     user_id = callback.from_user.id
     
-    # Проверяем лимит постов за сегодня
     posts_today = await get_user_posts_today(user_id)
     _, daily_limit = await get_tariff_limits(user_id)
     
@@ -1058,7 +1169,6 @@ async def select_channel(callback: CallbackQuery, state: FSMContext):
     """Выбор канала из списка"""
     channel_id = int(callback.data.split("_")[1])
     
-    # Получаем имя канала
     channels = await get_user_channels(callback.from_user.id)
     channel_name = next((ch['channel_name'] for ch in channels if ch['channel_id'] == channel_id), "Неизвестный канал")
     
@@ -1262,7 +1372,6 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         return
     
-    # Планируем отправку
     scheduled_time_utc = data['scheduled_time'].astimezone(pytz.UTC)
     scheduler.add_job(
         send_scheduled_post,
@@ -1326,7 +1435,6 @@ async def send_scheduled_post(channel_id: int, post_data: Dict, post_id: int):
                 caption=post_data.get('media_caption')
             )
         
-        # Обновляем статус в БД
         conn = await get_db_connection()
         await conn.execute('UPDATE scheduled_posts SET is_sent = TRUE WHERE id = $1', post_id)
         await conn.close()
@@ -1348,6 +1456,470 @@ async def admin_panel(callback: CallbackQuery):
     await callback.message.edit_text(
         "👑 Админ-панель\n\n👇 Выберите действие:",
         reply_markup=get_admin_keyboard()
+    )
+
+@router.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    """Статистика для админа"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    stats = await get_total_stats()
+    
+    stats_text = (
+        "📊 Общая статистика:\n\n"
+        f"👥 Пользователи: {stats.get('total_users', 0)}\n"
+        f"   • Mini: {stats.get('mini_users', 0)}\n"
+        f"   • Standard: {stats.get('standard_users', 0)}\n"
+        f"   • VIP: {stats.get('vip_users', 0)}\n\n"
+        f"📅 Посты:\n"
+        f"   • Всего: {stats.get('total_posts', 0)}\n"
+        f"   • Активные: {stats.get('active_posts', 0)}\n"
+        f"   • Отправлено: {stats.get('sent_posts', 0)}\n\n"
+        f"📢 Каналы: {stats.get('total_channels', 0)}\n\n"
+        f"🛒 Заказы:\n"
+        f"   • Ожидают: {stats.get('pending_orders', 0)}\n"
+        f"   • Выполнены: {stats.get('completed_orders', 0)}\n\n"
+        f"📍 Время: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M')}"
+    )
+    
+    await callback.message.edit_text(
+        stats_text,
+        reply_markup=get_admin_keyboard()
+    )
+
+@router.callback_query(F.data == "admin_users_list")
+async def admin_users_list(callback: CallbackQuery):
+    """Список пользователей для админа"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    users = await get_all_users()
+    
+    if not users:
+        await callback.message.edit_text(
+            "👥 Пользователи не найдены.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    users_text = "👥 Список пользователей:\n\n"
+    
+    for i, user in enumerate(users[:50], 1):  # Показываем только первые 50
+        username = user.get('username', 'нет')
+        first_name = user.get('first_name', 'Пользователь')
+        tariff = user.get('tariff', 'mini')
+        created_at = user.get('created_at')
+        
+        if created_at:
+            if isinstance(created_at, str):
+                created_str = created_at
+            else:
+                created_str = created_at.strftime("%d.%m.%Y")
+        else:
+            created_str = "неизвестно"
+        
+        users_text += f"{i}. ID: {user['id']}\n"
+        users_text += f"   Имя: {first_name}\n"
+        users_text += f"   Ник: @{username}\n"
+        users_text += f"   Тариф: {tariff}\n"
+        users_text += f"   Дата: {created_str}\n\n"
+    
+    if len(users) > 50:
+        users_text += f"\n... и еще {len(users) - 50} пользователей"
+    
+    await callback.message.edit_text(
+        users_text,
+        reply_markup=get_admin_keyboard()
+    )
+
+@router.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    """Начало рассылки"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.waiting_for_broadcast)
+    await callback.message.edit_text(
+        "📢 Рассылка сообщения\n\n"
+        "Отправьте сообщение для рассылки всем пользователям:\n"
+        "(текст, фото, видео или документ)",
+        reply_markup=get_cancel_keyboard()
+    )
+
+@router.message(AdminStates.waiting_for_broadcast)
+async def process_broadcast_message(message: Message, state: FSMContext):
+    """Обработка сообщения для рассылки"""
+    await state.update_data(broadcast_message=message)
+    
+    users = await get_all_users()
+    users_count = len(users)
+    
+    await message.answer(
+        f"📢 Подтверждение рассылки\n\n"
+        f"Сообщение будет отправлено {users_count} пользователям.\n\n"
+        f"Вы уверены, что хотите отправить это сообщение?",
+        reply_markup=get_broadcast_confirmation_keyboard()
+    )
+
+@router.callback_query(F.data == "confirm_broadcast")
+async def confirm_broadcast(callback: CallbackQuery, state: FSMContext):
+    """Подтверждение и отправка рассылки"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    data = await state.get_data()
+    broadcast_message = data.get('broadcast_message')
+    
+    if not broadcast_message:
+        await callback.answer("❌ Сообщение не найдено", show_alert=True)
+        return
+    
+    users = await get_all_users()
+    sent_count = 0
+    error_count = 0
+    
+    await callback.message.edit_text(
+        f"📢 Начинаю рассылку...\n\n"
+        f"Всего пользователей: {len(users)}\n"
+        f"Отправлено: 0/{len(users)}"
+    )
+    
+    for user in users:
+        try:
+            if broadcast_message.text:
+                await bot.send_message(
+                    chat_id=user['id'],
+                    text=broadcast_message.text
+                )
+            elif broadcast_message.photo:
+                await bot.send_photo(
+                    chat_id=user['id'],
+                    photo=broadcast_message.photo[-1].file_id,
+                    caption=broadcast_message.caption or ''
+                )
+            elif broadcast_message.video:
+                await bot.send_video(
+                    chat_id=user['id'],
+                    video=broadcast_message.video.file_id,
+                    caption=broadcast_message.caption or ''
+                )
+            elif broadcast_message.document:
+                await bot.send_document(
+                    chat_id=user['id'],
+                    document=broadcast_message.document.file_id,
+                    caption=broadcast_message.caption or ''
+                )
+            
+            sent_count += 1
+            
+            if sent_count % 10 == 0:
+                await callback.message.edit_text(
+                    f"📢 Рассылка...\n\n"
+                    f"Всего пользователей: {len(users)}\n"
+                    f"Отправлено: {sent_count}/{len(users)}"
+                )
+            
+            await asyncio.sleep(0.1)
+            
+        except Exception as e:
+            error_count += 1
+            logger.error(f"Ошибка при отправке пользователю {user['id']}: {e}")
+    
+    await state.clear()
+    
+    await callback.message.edit_text(
+        f"✅ Рассылка завершена!\n\n"
+        f"📊 Результаты:\n"
+        f"• Всего пользователей: {len(users)}\n"
+        f"• Успешно отправлено: {sent_count}\n"
+        f"• Ошибок: {error_count}",
+        reply_markup=get_admin_keyboard()
+    )
+
+@router.callback_query(F.data == "admin_orders")
+async def admin_orders_menu(callback: CallbackQuery):
+    """Меню управления заказами"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "🛒 Управление заказами тарифов\n\n👇 Выберите действие:",
+        reply_markup=get_admin_orders_keyboard()
+    )
+
+@router.callback_query(F.data == "admin_all_orders")
+async def admin_all_orders(callback: CallbackQuery):
+    """Все заказы"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    orders = await get_tariff_orders()
+    
+    if not orders:
+        await callback.message.edit_text(
+            "🛒 Заказы не найдены.",
+            reply_markup=get_admin_orders_keyboard()
+        )
+        return
+    
+    orders_text = "🛒 Все заказы:\n\n"
+    
+    for i, order in enumerate(orders[:20], 1):
+        order_date = order.get('order_date')
+        if order_date:
+            if isinstance(order_date, str):
+                date_str = order_date
+            else:
+                date_str = order_date.strftime("%d.%m.%Y %H:%M")
+        else:
+            date_str = "неизвестно"
+        
+        status_emoji = "⏳" if order['status'] == 'pending' else "✅" if order['status'] == 'completed' else "❌"
+        
+        orders_text += f"{i}. ID: {order['id']}\n"
+        orders_text += f"   Пользователь: {order['user_id']}\n"
+        orders_text += f"   Тариф: {order['tariff']}\n"
+        orders_text += f"   Статус: {status_emoji} {order['status']}\n"
+        orders_text += f"   Дата: {date_str}\n\n"
+    
+    if len(orders) > 20:
+        orders_text += f"\n... и еще {len(orders) - 20} заказов"
+    
+    await callback.message.edit_text(
+        orders_text,
+        reply_markup=get_admin_orders_keyboard()
+    )
+
+@router.callback_query(F.data == "admin_pending_orders")
+async def admin_pending_orders(callback: CallbackQuery):
+    """Ожидающие заказы"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    orders = await get_tariff_orders('pending')
+    
+    if not orders:
+        await callback.message.edit_text(
+            "⏳ Ожидающих заказов нет.",
+            reply_markup=get_admin_orders_keyboard()
+        )
+        return
+    
+    orders_text = "⏳ Ожидающие заказы:\n\n"
+    
+    for i, order in enumerate(orders, 1):
+        order_date = order.get('order_date')
+        if order_date:
+            if isinstance(order_date, str):
+                date_str = order_date
+            else:
+                date_str = order_date.strftime("%d.%m.%Y %H:%M")
+        else:
+            date_str = "неизвестно"
+        
+        tariff_info = TARIFFS.get(order['tariff'], {})
+        tariff_name = tariff_info.get('name', order['tariff'])
+        price = tariff_info.get('price', 0)
+        
+        orders_text += f"{i}. ID: {order['id']}\n"
+        orders_text += f"   Пользователь: {order['user_id']}\n"
+        orders_text += f"   Тариф: {tariff_name}\n"
+        orders_text += f"   Стоимость: {price} USD\n"
+        orders_text += f"   Дата: {date_str}\n\n"
+        orders_text += f"   Действия:\n"
+        
+        buttons = [
+            [InlineKeyboardButton(text="✅ Выполнить", callback_data=f"complete_order_{order['id']}")],
+            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_order_{order['id']}")],
+            [InlineKeyboardButton(text="📝 Заметка", callback_data=f"add_note_{order['id']}")]
+        ]
+        
+        if i < len(orders):
+            orders_text += "\n" + "-" * 30 + "\n\n"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад к заказам", callback_data="admin_orders")]
+    ])
+    
+    await callback.message.edit_text(
+        orders_text,
+        reply_markup=keyboard
+    )
+
+@router.callback_query(F.data.startswith("complete_order_"))
+async def complete_order(callback: CallbackQuery):
+    """Выполнение заказа"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    order_id = int(callback.data.split("_")[2])
+    
+    success = await update_order_status(order_id, 'completed')
+    
+    if success:
+        await callback.answer("✅ Заказ выполнен!", show_alert=True)
+        
+        conn = await get_db_connection()
+        order = await conn.fetchrow('SELECT user_id, tariff FROM tariff_orders WHERE id = $1', order_id)
+        await conn.close()
+        
+        if order:
+            await update_user_tariff(order['user_id'], order['tariff'])
+            
+            try:
+                await bot.send_message(
+                    order['user_id'],
+                    f"🎉 Ваш заказ тарифа выполнен!\n\n"
+                    f"💎 Тариф: {TARIFFS.get(order['tariff'], {}).get('name', order['tariff'])} активирован.\n"
+                    f"📅 Дата активации: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M')}\n\n"
+                    f"📍 Тариф действителен 30 дней."
+                )
+            except Exception as e:
+                logger.error(f"Не удалось уведомить пользователя {order['user_id']}: {e}")
+    
+    await admin_pending_orders(callback)
+
+@router.callback_query(F.data.startswith("reject_order_"))
+async def reject_order(callback: CallbackQuery):
+    """Отклонение заказа"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    order_id = int(callback.data.split("_")[2])
+    
+    success = await update_order_status(order_id, 'rejected')
+    
+    if success:
+        await callback.answer("❌ Заказ отклонен!", show_alert=True)
+    
+    await admin_pending_orders(callback)
+
+@router.callback_query(F.data.startswith("add_note_"))
+async def add_note_start(callback: CallbackQuery, state: FSMContext):
+    """Начало добавления заметки к заказу"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    order_id = int(callback.data.split("_")[2])
+    
+    await state.update_data(order_id=order_id)
+    await state.set_state(AdminStates.waiting_for_order_note)
+    
+    await callback.message.edit_text(
+        f"📝 Добавление заметки к заказу #{order_id}\n\n"
+        f"Введите заметку для этого заказа:",
+        reply_markup=get_cancel_keyboard()
+    )
+
+@router.message(AdminStates.waiting_for_order_note)
+async def process_order_note(message: Message, state: FSMContext):
+    """Обработка заметки к заказу"""
+    data = await state.get_data()
+    order_id = data.get('order_id')
+    
+    if not order_id:
+        await message.answer("❌ Ошибка: заказ не найден")
+        await state.clear()
+        return
+    
+    success = await update_order_status(order_id, 'pending', message.text)
+    
+    if success:
+        await message.answer(
+            f"✅ Заметка добавлена к заказу #{order_id}",
+            reply_markup=get_admin_orders_keyboard()
+        )
+    else:
+        await message.answer(
+            "❌ Ошибка при добавлении заметки",
+            reply_markup=get_admin_orders_keyboard()
+        )
+    
+    await state.clear()
+
+@router.callback_query(F.data == "admin_completed_orders")
+async def admin_completed_orders(callback: CallbackQuery):
+    """Выполненные заказы"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    orders = await get_tariff_orders('completed')
+    
+    if not orders:
+        await callback.message.edit_text(
+            "✅ Выполненных заказов нет.",
+            reply_markup=get_admin_orders_keyboard()
+        )
+        return
+    
+    orders_text = "✅ Выполненные заказы:\n\n"
+    
+    for i, order in enumerate(orders[:20], 1):
+        order_date = order.get('order_date')
+        processed_date = order.get('processed_date')
+        
+        if order_date:
+            if isinstance(order_date, str):
+                date_str = order_date
+            else:
+                date_str = order_date.strftime("%d.%m.%Y %H:%M")
+        else:
+            date_str = "неизвестно"
+        
+        if processed_date:
+            if isinstance(processed_date, str):
+                proc_str = processed_date
+            else:
+                proc_str = processed_date.strftime("%d.%m.%Y %H:%M")
+        else:
+            proc_str = "неизвестно"
+        
+        orders_text += f"{i}. ID: {order['id']}\n"
+        orders_text += f"   Пользователь: {order['user_id']}\n"
+        orders_text += f"   Тариф: {order['tariff']}\n"
+        orders_text += f"   Заказ: {date_str}\n"
+        orders_text += f"   Выполнен: {proc_str}\n\n"
+    
+    if len(orders) > 20:
+        orders_text += f"\n... и еще {len(orders) - 20} заказов"
+    
+    await callback.message.edit_text(
+        orders_text,
+        reply_markup=get_admin_orders_keyboard()
     )
 
 # ========== RESTORE JOBS ==========
