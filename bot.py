@@ -45,7 +45,7 @@ GEMINI_API_KEYS = [
     "AIzaSyA4jtchIEaTWrHnr_yQcRGTsZIWTAstXNA_2",
     "AIzaSyANoeHQtBBxInIYCfNHHO_JGE6DWmhQ2Rg_2"
 ]
-GEMINI_MODEL = "gemini-2.0-flash-exp"
+GEMINI_MODEL = "gemini-2.5-flash"
 REQUESTS_PER_KEY = 5
 REQUEST_COOLDOWN = 60
 
