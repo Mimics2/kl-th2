@@ -37,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=API_TOKEN)
-storage = MemoryStorage()  # Используем MemoryStorage для простоты
+storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
@@ -60,16 +60,16 @@ async def get_db_connection():
         raise
 
 async def init_db():
-    """Инициализация таблиц в PostgreSQL - ПРОСТАЯ ВЕРСИЯ"""
+    """Инициализация таблиц в PostgreSQL"""
     try:
         conn = await get_db_connection()
         
-        # Удаляем старые таблицы если есть проблемы
-        await conn.execute('DROP TABLE IF EXISTS scheduled_posts CASCADE')
-        await conn.execute('DROP TABLE IF EXISTS channels CASCADE')
-        await conn.execute('DROP TABLE IF EXISTS users CASCADE')
+        # Удаляем старые таблицы если есть проблемы (только для разработки!)
+        # await conn.execute('DROP TABLE IF EXISTS scheduled_posts CASCADE')
+        # await conn.execute('DROP TABLE IF EXISTS channels CASCADE')
+        # await conn.execute('DROP TABLE IF EXISTS users CASCADE')
         
-        # Таблица пользователей (простая)
+        # Таблица пользователей
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id BIGINT PRIMARY KEY,
@@ -107,19 +107,6 @@ async def init_db():
                 is_sent BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT NOW()
             )
-        ''')
-        
-        # Индексы
-        await conn.execute('''
-            CREATE INDEX IF NOT EXISTS idx_posts_time ON scheduled_posts(scheduled_time) WHERE is_sent = FALSE
-        ''')
-        
-        await conn.execute('''
-            CREATE INDEX IF NOT EXISTS idx_posts_user ON scheduled_posts(user_id)
-        ''')
-        
-        await conn.execute('''
-            CREATE INDEX IF NOT EXISTS idx_channels_user ON channels(user_id)
         ''')
         
         # Добавляем админа
@@ -259,6 +246,34 @@ async def get_user_stats(user_id: int) -> Dict:
         logger.error(f"Ошибка получения статистики: {e}")
         return {'total_posts': 0, 'active_posts': 0, 'sent_posts': 0, 'channels': 0}
 
+async def get_total_stats() -> Dict:
+    """Получает общую статистику для админа"""
+    try:
+        conn = await get_db_connection()
+        
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users") or 0
+        active_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_active = TRUE") or 0
+        
+        total_posts = await conn.fetchval("SELECT COUNT(*) FROM scheduled_posts") or 0
+        active_posts = await conn.fetchval("SELECT COUNT(*) FROM scheduled_posts WHERE is_sent = FALSE") or 0
+        sent_posts = await conn.fetchval("SELECT COUNT(*) FROM scheduled_posts WHERE is_sent = TRUE") or 0
+        
+        total_channels = await conn.fetchval("SELECT COUNT(*) FROM channels WHERE is_active = TRUE") or 0
+        
+        await conn.close()
+        
+        return {
+            'total_users': total_users,
+            'active_users': active_users,
+            'total_posts': total_posts,
+            'active_posts': active_posts,
+            'sent_posts': sent_posts,
+            'total_channels': total_channels
+        }
+    except Exception as e:
+        logger.error(f"Ошибка получения общей статистики: {e}")
+        return {}
+
 def format_datetime(dt: datetime) -> str:
     """Форматирует дату-время в читаемый вид"""
     moscow_time = dt.astimezone(MOSCOW_TZ)
@@ -267,7 +282,6 @@ def format_datetime(dt: datetime) -> str:
 def parse_datetime(date_str: str, time_str: str) -> Optional[datetime]:
     """Парсит дату и время из строк"""
     try:
-        # Убираем пробелы
         date_str = date_str.strip()
         time_str = time_str.strip()
         
@@ -305,21 +319,21 @@ def parse_datetime(date_str: str, time_str: str) -> Optional[datetime]:
             time_obj.time()
         )
         
-        # Добавляем московскую таймзону
         return MOSCOW_TZ.localize(combined)
     except Exception:
         return None
 
 # ========== KEYBOARDS ==========
-def get_main_menu(user_id: int) -> InlineKeyboardMarkup:
-    """Главное меню"""
+def get_main_menu(user_id: int, is_admin: bool = False) -> InlineKeyboardMarkup:
+    """Главное меню - ТОЛЬКО обычные функции"""
     buttons = [
         [InlineKeyboardButton(text="📅 Запланировать пост", callback_data="schedule_post")],
         [InlineKeyboardButton(text="📊 Моя статистика", callback_data="my_stats")],
         [InlineKeyboardButton(text="📢 Мои каналы", callback_data="my_channels")],
     ]
     
-    if user_id == ADMIN_ID:
+    # ТОЛЬКО админ видит админ-панель
+    if is_admin:
         buttons.append([InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_panel")])
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -342,8 +356,8 @@ def get_channels_keyboard(channels: List[Dict]) -> InlineKeyboardMarkup:
             callback_data=f"channel_{channel['channel_id']}"
         )])
     
-    buttons.append([InlineKeyboardButton(text="➕ Добавить канал", callback_data="add_channel")])
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить новый канал", callback_data="add_channel")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")])
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -352,8 +366,16 @@ def get_confirmation_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Да, все верно", callback_data="confirm_yes"),
-            InlineKeyboardButton(text="❌ Нет, исправить", callback_data="confirm_no")
+            InlineKeyboardButton(text="🔄 Нет, начать заново", callback_data="confirm_no")
         ]
+    ])
+
+def get_admin_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура админ-панели (ТОЛЬКО ДЛЯ АДМИНА)"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Общая статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
     ])
 
 # ========== STATES ==========
@@ -372,54 +394,90 @@ async def cmd_start(message: Message):
     username = message.from_user.username or ""
     first_name = message.from_user.first_name or "Пользователь"
     
+    # Проверяем, является ли пользователь админом
+    is_admin = user_id == ADMIN_ID
+    
     # Регистрируем пользователя
     try:
         conn = await get_db_connection()
         await conn.execute('''
-            INSERT INTO users (id, username, first_name)
-            VALUES ($1, $2, $3)
+            INSERT INTO users (id, username, first_name, is_admin)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (id) DO UPDATE 
             SET username = EXCLUDED.username, first_name = EXCLUDED.first_name
-        ''', user_id, username, first_name)
+        ''', user_id, username, first_name, is_admin)
         await conn.close()
     except Exception as e:
         logger.error(f"Ошибка регистрации пользователя: {e}")
     
+    # Простое приветствие без HTML разметки
     welcome_text = (
-        f"👋 <b>Привет, {first_name}!</b>\n\n"
-        "🤖 <b>Я — бот для планирования постов в Telegram</b>\n\n"
-        "✨ <b>Что я умею:</b>\n"
-        "• 📅 Запланировать пост с текстом и медиа\n"
+        "👋 Привет, {name}!\n\n"
+        "🤖 Я — бот для планирования постов в Telegram каналах.\n\n"
+        "✨ Что я умею:\n"
+        "• 📅 Запланировать пост с текстом, фото, видео или документом\n"
         "• 📊 Показать вашу статистику\n"
-        "• 📢 Управлять каналами\n"
+        "• 📢 Управлять вашими каналами\n"
         "• ⏰ Автоматически публиковать в нужное время\n\n"
-        "📍 <i>Время указывается по Москве</i>\n\n"
-        "👇 <b>Выберите действие:</b>"
-    )
+        "📍 Время указывается по Москве\n\n"
+        "👇 Выберите действие:"
+    ).format(name=first_name)
     
     await message.answer(
         welcome_text,
-        reply_markup=get_main_menu(user_id)
+        reply_markup=get_main_menu(user_id, is_admin)
     )
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    """Команда помощи"""
+    help_text = (
+        "📚 Помощь по использованию бота:\n\n"
+        
+        "1. Добавьте меня в канал как администратора\n"
+        "2. Дайте права на отправку сообщений\n"
+        "3. Перешлите мне любое сообщение из канала\n\n"
+        
+        "📅 Планирование поста:\n"
+        "1. Выберите 'Запланировать пост'\n"
+        "2. Выберите канал\n"
+        "3. Отправьте контент (текст, фото, видео или документ)\n"
+        "4. Укажите дату в формате ДД.ММ.ГГГГ\n"
+        "5. Укажите время в формате ЧЧ:ММ\n"
+        "6. Подтвердите публикацию\n\n"
+        
+        "💡 Советы:\n"
+        "• Вы можете запланировать пост на несколько месяцев вперед\n"
+        "• Посты публикуются автоматически\n"
+        "• Вы можете добавить несколько каналов\n\n"
+        
+        "📞 Поддержка: @ваш_username_для_поддержки"
+    )
+    
+    await message.answer(help_text)
 
 @router.callback_query(F.data == "back_to_main")
 async def back_to_main(callback: CallbackQuery, state: FSMContext):
     """Возврат в главное меню"""
     await state.clear()
+    is_admin = callback.from_user.id == ADMIN_ID
+    
     await callback.message.edit_text(
-        "🤖 <b>Главное меню</b>\n\n"
+        "🤖 Главное меню\n\n"
         "👇 Выберите действие:",
-        reply_markup=get_main_menu(callback.from_user.id)
+        reply_markup=get_main_menu(callback.from_user.id, is_admin)
     )
 
 @router.callback_query(F.data == "cancel")
 async def cancel_action(callback: CallbackQuery, state: FSMContext):
     """Отмена текущего действия"""
     await state.clear()
+    is_admin = callback.from_user.id == ADMIN_ID
+    
     await callback.message.edit_text(
         "❌ Действие отменено.\n\n"
         "👇 Выберите действие:",
-        reply_markup=get_main_menu(callback.from_user.id)
+        reply_markup=get_main_menu(callback.from_user.id, is_admin)
     )
 
 # ========== POST SCHEDULING ==========
@@ -436,21 +494,21 @@ async def start_scheduling(callback: CallbackQuery, state: FSMContext):
     
     if not channels:
         await callback.message.edit_text(
-            "📢 <b>Сначала нужно добавить канал!</b>\n\n"
+            "📢 Сначала нужно добавить канал!\n\n"
             "Чтобы запланировать пост, добавьте меня в канал как администратора "
             "и перешлите любое сообщение из канала.\n\n"
             "👇 Нажмите кнопку ниже, чтобы добавить канал:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➕ Добавить канал", callback_data="add_channel")],
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]
+                [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
             ])
         )
         return
     
     await state.set_state(PostStates.waiting_for_channel)
     await callback.message.edit_text(
-        "📢 <b>Выберите канал для поста:</b>\n\n"
-        "👇 Выберите из списка:",
+        "📢 Выберите канал для поста:\n\n"
+        "👇 Выберите из списка ваших каналов:",
         reply_markup=get_channels_keyboard(channels)
     )
 
@@ -467,12 +525,13 @@ async def select_channel(callback: CallbackQuery, state: FSMContext):
     await state.set_state(PostStates.waiting_for_content)
     
     await callback.message.edit_text(
-        f"📢 <b>Канал выбран:</b> {channel_name}\n\n"
-        "📝 <b>Теперь отправьте контент для поста:</b>\n\n"
+        f"✅ Канал выбран: {channel_name}\n\n"
+        "📝 Теперь отправьте контент для поста:\n\n"
         "• Текст сообщения\n"
         "• Фотографию с подписью\n"
         "• Видео с подписью\n"
-        "• Документ с подписью",
+        "• Документ с подписью\n\n"
+        "❓ Если хотите добавить фото с текстом, просто отправьте фото и в подписи напишите текст.",
         reply_markup=get_cancel_keyboard()
     )
 
@@ -481,12 +540,13 @@ async def add_channel_start(callback: CallbackQuery, state: FSMContext):
     """Добавление нового канала"""
     await state.set_state(PostStates.waiting_for_channel)
     await callback.message.edit_text(
-        "📢 <b>Добавление канала</b>\n\n"
+        "📢 Добавление канала\n\n"
         "Чтобы я мог публиковать посты в вашем канале:\n\n"
-        "1. Добавьте меня в канал как <b>администратора</b>\n"
-        "2. Дайте права на <b>отправку сообщений</b>\n"
-        "3. Пришлите мне ID канала в формате <code>-1001234567890</code>\n"
+        "1. Добавьте меня в канал как администратора\n"
+        "2. Дайте права на отправку сообщений\n"
+        "3. Пришлите мне ID канала в формате -1001234567890\n"
         "4. Или просто перешлите любое сообщение из канала\n\n"
+        "🔧 ID канала можно получить через бота @username_to_id_bot\n\n"
         "👇 Отправьте ID или перешлите сообщение:",
         reply_markup=get_cancel_keyboard()
     )
@@ -506,9 +566,10 @@ async def process_channel_input(message: Message, state: FSMContext):
             channel_name = f"Канал {channel_id}"
         except ValueError:
             await message.answer(
-                "❌ Неверный формат ID!\n"
+                "❌ Неверный формат ID!\n\n"
                 "ID канала должен начинаться с -100 и содержать только цифры.\n"
-                "Пример: <code>-1001234567890</code>",
+                "Пример: -1001234567890\n\n"
+                "Попробуйте еще раз:",
                 reply_markup=get_cancel_keyboard()
             )
             return
@@ -533,12 +594,13 @@ async def process_channel_input(message: Message, state: FSMContext):
     await state.set_state(PostStates.waiting_for_content)
     
     await message.answer(
-        f"✅ <b>Канал добавлен:</b> {channel_name}\n\n"
-        "📝 <b>Теперь отправьте контент для поста:</b>\n\n"
+        f"✅ Канал добавлен: {channel_name}\n\n"
+        "📝 Теперь отправьте контент для поста:\n\n"
         "• Текст сообщения\n"
         "• Фотографию с подписью\n"
         "• Видео с подписью\n"
-        "• Документ с подписью",
+        "• Документ с подписью\n\n"
+        "❓ Если хотите добавить фото с текстом, просто отправьте фото и в подписи напишите текст.",
         reply_markup=get_cancel_keyboard()
     )
 
@@ -552,7 +614,8 @@ async def process_content(message: Message, state: FSMContext):
         if len(message.text) > POST_CHARACTER_LIMIT:
             await message.answer(
                 f"❌ Слишком длинный текст!\n"
-                f"Максимум {POST_CHARACTER_LIMIT} символов.",
+                f"Максимум {POST_CHARACTER_LIMIT} символов.\n\n"
+                f"У вас: {len(message.text)} символов.",
                 reply_markup=get_cancel_keyboard()
             )
             return
@@ -589,7 +652,7 @@ async def process_content(message: Message, state: FSMContext):
     
     else:
         await message.answer(
-            "❌ Неподдерживаемый тип контента!\n"
+            "❌ Неподдерживаемый тип контента!\n\n"
             "Отправьте текст, фото, видео или документ.",
             reply_markup=get_cancel_keyboard()
         )
@@ -602,10 +665,10 @@ async def process_content(message: Message, state: FSMContext):
     tomorrow = (now_moscow + timedelta(days=1)).strftime("%d.%m.%Y")
     
     await message.answer(
-        "📅 <b>Теперь укажите дату публикации:</b>\n\n"
-        f"📅 <b>Формат:</b> ДД.ММ.ГГГГ\n"
-        f"📅 <b>Пример:</b> {tomorrow}\n\n"
-        f"📍 <i>Сегодня: {now_moscow.strftime('%d.%m.%Y')}</i>",
+        "📅 Теперь укажите дату публикации:\n\n"
+        f"Формат: ДД.ММ.ГГГГ\n"
+        f"Пример: {tomorrow}\n\n"
+        f"Сегодня: {now_moscow.strftime('%d.%m.%Y')}",
         reply_markup=get_cancel_keyboard()
     )
 
@@ -620,9 +683,10 @@ async def process_date(message: Message, state: FSMContext):
     
     if not date_obj:
         await message.answer(
-            "❌ Неверный формат даты!\n"
-            "Используйте: <b>ДД.ММ.ГГГГ</b>\n"
-            f"Пример: <code>{now_moscow.strftime('%d.%m.%Y')}</code>",
+            "❌ Неверный формат даты!\n\n"
+            "Используйте: ДД.ММ.ГГГГ\n"
+            f"Пример: {now_moscow.strftime('%d.%m.%Y')}\n\n"
+            "Попробуйте еще раз:",
             reply_markup=get_cancel_keyboard()
         )
         return
@@ -630,8 +694,9 @@ async def process_date(message: Message, state: FSMContext):
     # Проверяем, что дата не в прошлом
     if date_obj.date() < now_moscow.date():
         await message.answer(
-            "❌ Дата не может быть в прошлом!\n"
-            f"Сегодня: {now_moscow.strftime('%d.%m.%Y')}",
+            "❌ Дата не может быть в прошлом!\n\n"
+            f"Сегодня: {now_moscow.strftime('%d.%m.%Y')}\n"
+            "Укажите сегодняшнюю или будущую дату.",
             reply_markup=get_cancel_keyboard()
         )
         return
@@ -640,10 +705,10 @@ async def process_date(message: Message, state: FSMContext):
     await state.set_state(PostStates.waiting_for_time)
     
     await message.answer(
-        "⏰ <b>Теперь укажите время публикации:</b>\n\n"
-        "⏰ <b>Формат:</b> ЧЧ:ММ\n"
-        "⏰ <b>Пример:</b> 14:30\n\n"
-        f"📍 <i>Сейчас: {now_moscow.strftime('%H:%M')}</i>",
+        "⏰ Теперь укажите время публикации:\n\n"
+        "Формат: ЧЧ:ММ\n"
+        "Пример: 14:30\n\n"
+        f"Сейчас: {now_moscow.strftime('%H:%M')}",
         reply_markup=get_cancel_keyboard()
     )
 
@@ -660,9 +725,10 @@ async def process_time(message: Message, state: FSMContext):
     
     if not scheduled_time:
         await message.answer(
-            "❌ Неверный формат времени!\n"
-            "Используйте: <b>ЧЧ:ММ</b>\n"
-            "Пример: <code>14:30</code>",
+            "❌ Неверный формат времени!\n\n"
+            "Используйте: ЧЧ:ММ\n"
+            "Пример: 14:30\n\n"
+            "Попробуйте еще раз:",
             reply_markup=get_cancel_keyboard()
         )
         return
@@ -671,8 +737,9 @@ async def process_time(message: Message, state: FSMContext):
     now_moscow = datetime.now(MOSCOW_TZ)
     if scheduled_time < now_moscow:
         await message.answer(
-            "❌ Время не может быть в прошлом!\n"
-            f"Сейчас: {now_moscow.strftime('%H:%M')}",
+            "❌ Время не может быть в прошлом!\n\n"
+            f"Сейчас: {now_moscow.strftime('%H:%M')}\n"
+            "Укажите будущее время.",
             reply_markup=get_cancel_keyboard()
         )
         return
@@ -694,30 +761,34 @@ async def show_post_preview(message: Message, data: Dict):
     media_caption = data.get('media_caption', '')
     
     preview_text = (
-        f"📋 <b>Превью поста</b>\n\n"
-        f"📢 <b>Канал:</b> {channel_name}\n"
-        f"⏰ <b>Время публикации:</b> {format_datetime(scheduled_time)}\n\n"
+        "📋 Превью поста\n\n"
+        f"Канал: {channel_name}\n"
+        f"Время публикации: {format_datetime(scheduled_time)}\n\n"
     )
     
     if message_type == 'text':
-        preview_text += f"📝 <b>Текст:</b>\n{message_text[:300]}..."
-        if len(message_text) > 300:
-            preview_text += "\n<i>(показаны первые 300 символов)</i>"
+        text_preview = message_text[:200]
+        if len(message_text) > 200:
+            text_preview += "..."
+        preview_text += f"Текст:\n{text_preview}"
     
     elif message_type in ['photo', 'video', 'document']:
         media_type = {
-            'photo': '🖼 Фото',
-            'video': '🎬 Видео',
-            'document': '📄 Документ'
+            'photo': 'Фото',
+            'video': 'Видео',
+            'document': 'Документ'
         }.get(message_type, 'Медиа')
         
         preview_text += f"{media_type}"
         if media_caption:
-            preview_text += f" с подписью:\n{media_caption[:300]}..."
-            if len(media_caption) > 300:
-                preview_text += "\n<i>(показаны первые 300 символов)</i>"
+            caption_preview = media_caption[:200]
+            if len(media_caption) > 200:
+                caption_preview += "..."
+            preview_text += f" с подписью:\n{caption_preview}"
+        else:
+            preview_text += " без подписи"
     
-    preview_text += "\n\n✅ <b>Все верно?</b>"
+    preview_text += "\n\n✅ Все верно?"
     
     # Отправляем превью
     await message.answer(
@@ -735,10 +806,11 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
     stats = await get_user_stats(user_id)
     if stats['active_posts'] >= MAX_POSTS_PER_USER:
         await callback.message.edit_text(
-            f"❌ <b>Достигнут лимит постов!</b>\n\n"
+            f"❌ Достигнут лимит постов!\n\n"
             f"У вас уже {stats['active_posts']} активных постов.\n"
-            f"Максимум: {MAX_POSTS_PER_USER} постов одновременно.",
-            reply_markup=get_main_menu(user_id)
+            f"Максимум: {MAX_POSTS_PER_USER} постов одновременно.\n\n"
+            "Дождитесь публикации некоторых постов.",
+            reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
         )
         await state.clear()
         return
@@ -753,9 +825,9 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
     
     if not post_id:
         await callback.message.edit_text(
-            "❌ <b>Ошибка при сохранении поста!</b>\n\n"
+            "❌ Ошибка при сохранении поста!\n\n"
             "Попробуйте еще раз или обратитесь в поддержку.",
-            reply_markup=get_main_menu(user_id)
+            reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
         )
         await state.clear()
         return
@@ -771,12 +843,13 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
     
     # Отправляем подтверждение
     await callback.message.edit_text(
-        f"✅ <b>Пост успешно запланирован!</b>\n\n"
-        f"📢 <b>Канал:</b> {data['channel_name']}\n"
-        f"⏰ <b>Время:</b> {format_datetime(data['scheduled_time'])}\n"
-        f"🆔 <b>ID поста:</b> <code>{post_id}</code>\n\n"
-        f"📍 Пост будет автоматически опубликован в указанное время.",
-        reply_markup=get_main_menu(user_id)
+        f"✅ Пост успешно запланирован!\n\n"
+        f"Канал: {data['channel_name']}\n"
+        f"Время: {format_datetime(data['scheduled_time'])}\n"
+        f"ID поста: {post_id}\n\n"
+        f"📍 Пост будет автоматически опубликован в указанное время.\n\n"
+        "👇 Что дальше?",
+        reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
     )
     
     logger.info(f"Пост {post_id} запланирован пользователем {user_id}")
@@ -786,10 +859,12 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
 async def reject_post(callback: CallbackQuery, state: FSMContext):
     """Отказ от поста"""
     await state.clear()
+    is_admin = callback.from_user.id == ADMIN_ID
+    
     await callback.message.edit_text(
-        "❌ <b>Планирование отменено</b>\n\n"
+        "❌ Планирование отменено\n\n"
         "Вы можете начать заново.",
-        reply_markup=get_main_menu(callback.from_user.id)
+        reply_markup=get_main_menu(callback.from_user.id, is_admin)
     )
 
 async def send_scheduled_post(channel_id: int, post_data: Dict, post_id: int):
@@ -800,32 +875,28 @@ async def send_scheduled_post(channel_id: int, post_data: Dict, post_id: int):
         if message_type == 'text':
             await bot.send_message(
                 chat_id=channel_id,
-                text=post_data.get('message_text'),
-                parse_mode="HTML"
+                text=post_data.get('message_text')
             )
             
         elif message_type == 'photo':
             await bot.send_photo(
                 chat_id=channel_id,
                 photo=post_data.get('media_file_id'),
-                caption=post_data.get('media_caption'),
-                parse_mode="HTML"
+                caption=post_data.get('media_caption')
             )
             
         elif message_type == 'video':
             await bot.send_video(
                 chat_id=channel_id,
                 video=post_data.get('media_file_id'),
-                caption=post_data.get('media_caption'),
-                parse_mode="HTML"
+                caption=post_data.get('media_caption')
             )
             
         elif message_type == 'document':
             await bot.send_document(
                 chat_id=channel_id,
                 document=post_data.get('media_file_id'),
-                caption=post_data.get('media_caption'),
-                parse_mode="HTML"
+                caption=post_data.get('media_caption')
             )
         
         # Обновляем статус в БД
@@ -842,7 +913,7 @@ async def send_scheduled_post(channel_id: int, post_data: Dict, post_id: int):
     except Exception as e:
         logger.error(f"❌ Ошибка отправки поста {post_id}: {e}")
 
-# ========== STATISTICS ==========
+# ========== USER STATISTICS ==========
 @router.callback_query(F.data == "my_stats")
 async def show_my_stats(callback: CallbackQuery):
     """Показ статистики пользователя"""
@@ -850,18 +921,19 @@ async def show_my_stats(callback: CallbackQuery):
     stats = await get_user_stats(user_id)
     
     stats_text = (
-        f"📊 <b>Ваша статистика</b>\n\n"
-        f"👤 <b>Пользователь:</b> {callback.from_user.first_name}\n"
-        f"📅 <b>Всего постов:</b> {stats['total_posts']}\n"
-        f"✅ <b>Опубликовано:</b> {stats['sent_posts']}\n"
-        f"⏳ <b>Ожидает публикации:</b> {stats['active_posts']}\n"
-        f"📢 <b>Каналов:</b> {stats['channels']}\n\n"
-        f"📍 <i>Обновлено: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}</i>"
+        f"📊 Ваша статистика\n\n"
+        f"Пользователь: {callback.from_user.first_name}\n"
+        f"Всего постов: {stats['total_posts']}\n"
+        f"Опубликовано: {stats['sent_posts']}\n"
+        f"Ожидает публикации: {stats['active_posts']}\n"
+        f"Каналов: {stats['channels']}\n\n"
+        f"Обновлено: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
     )
     
+    is_admin = user_id == ADMIN_ID
     await callback.message.edit_text(
         stats_text,
-        reply_markup=get_main_menu(user_id)
+        reply_markup=get_main_menu(user_id, is_admin)
     )
 
 @router.callback_query(F.data == "my_channels")
@@ -872,44 +944,39 @@ async def show_my_channels(callback: CallbackQuery):
     
     if not channels:
         await callback.message.edit_text(
-            "📢 <b>У вас нет добавленных каналов</b>\n\n"
+            "📢 У вас нет добавленных каналов\n\n"
             "Добавьте канал, чтобы начать планировать посты.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➕ Добавить канал", callback_data="add_channel")],
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]
+                [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
             ])
         )
         return
     
-    channels_text = "📢 <b>Ваши каналы:</b>\n\n"
+    channels_text = "📢 Ваши каналы:\n\n"
     for i, channel in enumerate(channels, 1):
         channels_text += f"{i}. {channel['channel_name']}\n"
     
-    channels_text += f"\n📍 Всего: {len(channels)} каналов"
+    channels_text += f"\nВсего: {len(channels)} каналов"
     
+    is_admin = user_id == ADMIN_ID
     await callback.message.edit_text(
         channels_text,
-        reply_markup=get_main_menu(user_id)
+        reply_markup=get_main_menu(user_id, is_admin)
     )
 
 # ========== ADMIN FUNCTIONS ==========
 @router.callback_query(F.data == "admin_panel")
 async def admin_panel(callback: CallbackQuery):
-    """Админ-панель"""
+    """Админ-панель - ТОЛЬКО ДЛЯ АДМИНА"""
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("⛔ Только для администратора!", show_alert=True)
         return
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Общая статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]
-    ])
-    
     await callback.message.edit_text(
-        "👑 <b>Админ-панель</b>\n\n"
+        "👑 Админ-панель\n\n"
         "👇 Выберите действие:",
-        reply_markup=keyboard
+        reply_markup=get_admin_keyboard()
     )
 
 @router.callback_query(F.data == "admin_stats")
@@ -919,72 +986,53 @@ async def admin_stats(callback: CallbackQuery):
         await callback.answer("⛔ Только для администратора!", show_alert=True)
         return
     
-    try:
-        conn = await get_db_connection()
-        
-        total_users = await conn.fetchval("SELECT COUNT(*) FROM users") or 0
-        active_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_active = TRUE") or 0
-        
-        total_posts = await conn.fetchval("SELECT COUNT(*) FROM scheduled_posts") or 0
-        active_posts = await conn.fetchval("SELECT COUNT(*) FROM scheduled_posts WHERE is_sent = FALSE") or 0
-        sent_posts = await conn.fetchval("SELECT COUNT(*) FROM scheduled_posts WHERE is_sent = TRUE") or 0
-        
-        total_channels = await conn.fetchval("SELECT COUNT(*) FROM channels WHERE is_active = TRUE") or 0
-        
-        await conn.close()
-        
-        stats_text = (
-            f"📊 <b>Общая статистика бота</b>\n\n"
-            f"👥 <b>Пользователи:</b>\n"
-            f"   • Всего: {total_users}\n"
-            f"   • Активных: {active_users}\n\n"
-            f"📅 <b>Посты:</b>\n"
-            f"   • Всего: {total_posts}\n"
-            f"   • Ожидает: {active_posts}\n"
-            f"   • Опубликовано: {sent_posts}\n\n"
-            f"📢 <b>Каналы:</b> {total_channels}\n\n"
-            f"📍 <i>Обновлено: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}</i>"
-        )
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")]
-        ])
-        
+    stats = await get_total_stats()
+    
+    if not stats:
         await callback.message.edit_text(
-            stats_text,
-            reply_markup=keyboard
+            "❌ Ошибка получения статистики",
+            reply_markup=get_admin_keyboard()
         )
-        
-    except Exception as e:
-        logger.error(f"Ошибка получения статистики: {e}")
-        await callback.message.edit_text(
-            f"❌ Ошибка: {e}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")]
-            ])
-        )
+        return
+    
+    stats_text = (
+        f"📊 Общая статистика бота\n\n"
+        f"👥 Пользователи:\n"
+        f"   • Всего: {stats['total_users']}\n"
+        f"   • Активных: {stats['active_users']}\n\n"
+        f"📅 Посты:\n"
+        f"   • Всего: {stats['total_posts']}\n"
+        f"   • Ожидает: {stats['active_posts']}\n"
+        f"   • Опубликовано: {stats['sent_posts']}\n\n"
+        f"📢 Каналы: {stats['total_channels']}\n\n"
+        f"Обновлено: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
+    )
+    
+    await callback.message.edit_text(
+        stats_text,
+        reply_markup=get_admin_keyboard()
+    )
 
 @router.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_start(callback: CallbackQuery):
-    """Начало рассылки"""
+    """Начало рассылки - ТОЛЬКО ДЛЯ АДМИНА"""
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("⛔ Только для администратора!", show_alert=True)
         return
     
     await callback.message.edit_text(
-        "📢 <b>Рассылка сообщений</b>\n\n"
+        "📢 Рассылка сообщений\n\n"
         "Используйте команду:\n"
-        "<code>/broadcast Ваше сообщение здесь</code>\n\n"
+        "/broadcast Ваше сообщение здесь\n\n"
         "Чтобы отправить рассылку всем пользователям.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")]
-        ])
+        reply_markup=get_admin_keyboard()
     )
 
 @router.message(Command("broadcast"))
 async def cmd_broadcast(message: Message):
-    """Команда рассылки"""
+    """Команда рассылки - ТОЛЬКО ДЛЯ АДМИНА"""
     if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас нет прав для этой команды.")
         return
     
     if len(message.text) < 12:  # /broadcast + пробел
@@ -1011,24 +1059,29 @@ async def cmd_broadcast(message: Message):
     
     status_msg = await message.answer(f"📢 Начинаю рассылку для {total} пользователей...")
     
-    for user in users:
+    for i, user in enumerate(users):
         try:
             await bot.send_message(
                 user['id'],
-                f"📢 <b>Сообщение от администратора</b>\n\n{broadcast_text}",
-                parse_mode="HTML"
+                f"📢 Сообщение от администратора\n\n{broadcast_text}"
             )
             success += 1
-            await asyncio.sleep(0.05)
+            
+            # Обновляем статус каждые 10 сообщений
+            if (i + 1) % 10 == 0:
+                await status_msg.edit_text(f"📢 Рассылка: {i + 1}/{total} отправлено...")
+            
+            await asyncio.sleep(0.1)  # Задержка против ограничений Telegram
+            
         except Exception as e:
             failed += 1
     
     await status_msg.edit_text(
-        f"✅ <b>Рассылка завершена!</b>\n\n"
-        f"📊 <b>Итоги:</b>\n"
-        f"• Всего: {total}\n"
-        f"• Успешно: {success}\n"
-        f"• Не удалось: {failed}"
+        f"✅ Рассылка завершена!\n\n"
+        f"📊 Итоги:\n"
+        f"• Всего получателей: {total}\n"
+        f"• Успешно отправлено: {success}\n"
+        f"• Не удалось отправить: {failed}"
     )
 
 # ========== RESTORE JOBS ==========
@@ -1098,7 +1151,8 @@ async def on_startup():
                 await bot.send_message(
                     ADMIN_ID,
                     f"🤖 Бот @{me.username} успешно запущен!\n"
-                    f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}"
+                    f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}\n"
+                    f"📍 Готов к работе!"
                 )
                 logger.info(f"✅ Уведомление отправлено админу {ADMIN_ID}")
             except Exception as e:
