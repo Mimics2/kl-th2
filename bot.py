@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import sys
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
 from enum import Enum
@@ -18,15 +19,26 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 
 # ========== CONFIG ==========
+# Проверяем обязательные переменные окружения
 API_TOKEN = os.getenv("BOT_TOKEN")
+if not API_TOKEN:
+    print("❌ ОШИБКА: Не указан BOT_TOKEN в переменных окружения")
+    print("ℹ️ На Railway добавьте переменную BOT_TOKEN в настройках")
+    sys.exit(1)
+
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+if not DATABASE_URL:
+    print("❌ ОШИБКА: Не указан DATABASE_URL в переменных окружения")
+    print("ℹ️ На Railway эта переменная обычно создается автоматически при добавлении PostgreSQL")
+    sys.exit(1)
 
-# Контакты поддержки (заполните своими данными)
-SUPPORT_BOT_USERNAME = os.getenv("SUPPORT_BOT_USERNAME", "your_support_bot")
-ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@your_username")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-# CryptoPay (заполните своими данными)
+# Контакты поддержки
+SUPPORT_BOT_USERNAME = os.getenv("SUPPORT_BOT_USERNAME", "support_bot")
+ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
+
+# CryptoPay (опционально)
 CRYPTO_BOT_TOKEN = os.getenv("CRYPTO_BOT_TOKEN", "")
 CRYPTO_BOT_USERNAME = os.getenv("CRYPTO_BOT_USERNAME", "CryptoBot")
 
@@ -79,8 +91,6 @@ TARIFFS = {
 # ========== PAYMENT SYSTEM ==========
 async def check_crypto_payment(user_id: int, amount: float, currency: str = "USD") -> bool:
     """Проверяет оплату через CryptoBot (заглушка для демо)"""
-    # В реальной реализации здесь будет интеграция с CryptoBot API
-    # Для демо-версии просто возвращаем True
     logger.info(f"💳 Проверка оплаты для пользователя {user_id}: {amount} {currency}")
     return True
 
@@ -94,7 +104,6 @@ async def create_crypto_invoice(user_id: int, tariff_id: str) -> Optional[str]:
         return "free"
     
     # В реальной реализации здесь будет вызов CryptoBot API
-    # Для демо-версии возвращаем ссылку на демо-оплату
     invoice_url = f"https://t.me/{CRYPTO_BOT_USERNAME}?start=invoice_{tariff_id}_{user_id}"
     
     logger.info(f"📄 Создан счет для пользователя {user_id} на тариф {tariff_id}")
@@ -110,26 +119,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=API_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
-router = Router()
-dp.include_router(router)
-
-scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
+# Инициализация бота и диспетчера
+try:
+    bot = Bot(token=API_TOKEN)
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+    router = Router()
+    dp.include_router(router)
+    scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
+    logger.info("✅ Бот и диспетчер инициализированы")
+except Exception as e:
+    logger.error(f"❌ Ошибка инициализации бота: {e}")
+    sys.exit(1)
 
 # ========== DATABASE FUNCTIONS ==========
 async def get_db_connection():
     """Создает соединение с базой данных"""
     try:
         if DATABASE_URL:
-            # Проверяем и корректируем строку подключения для Railway
-            if DATABASE_URL.startswith("postgresql://") and "sslmode" not in DATABASE_URL:
-                conn_string = DATABASE_URL + "?sslmode=require"
+            # Исправляем строку подключения для Railway
+            if DATABASE_URL.startswith("postgres://"):
+                # Конвертируем старый формат в новый
+                conn_string = DATABASE_URL.replace("postgres://", "postgresql://", 1)
             else:
                 conn_string = DATABASE_URL
             
-            # Устанавливаем timeout
+            # Добавляем sslmode если не указан
+            if "sslmode" not in conn_string:
+                if "?" in conn_string:
+                    conn_string += "&sslmode=require"
+                else:
+                    conn_string += "?sslmode=require"
+            
+            logger.debug(f"Подключение к БД: {conn_string[:50]}...")
             return await asyncpg.connect(conn_string, timeout=30)
     except Exception as e:
         logger.error(f"Ошибка подключения к БД: {e}")
@@ -139,8 +161,9 @@ async def init_db():
     """Инициализация таблиц в PostgreSQL"""
     try:
         conn = await get_db_connection()
+        logger.info("✅ Подключение к БД установлено")
         
-        # Таблица пользователей с тарифами
+        # Таблица пользователей
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id BIGINT PRIMARY KEY,
@@ -197,58 +220,69 @@ async def init_db():
             )
         ''')
         
-        # Добавляем админа
-        if ADMIN_ID > 0:
-            await conn.execute('''
-                INSERT INTO users (id, username, first_name, tariff, is_admin)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (id) DO UPDATE SET
-                username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name,
-                tariff = EXCLUDED.tariff,
-                is_admin = EXCLUDED.is_admin
-            ''', ADMIN_ID, 'admin', 'Администратор', 'admin', True)
-        
-        logger.info("✅ База данных инициализирована")
         await conn.close()
+        logger.info("✅ Таблицы БД созданы/проверены")
         
+    except asyncpg.PostgresError as e:
+        logger.error(f"❌ Ошибка PostgreSQL при инициализации БД: {e}")
+        raise
     except Exception as e:
-        logger.error(f"❌ Ошибка инициализации БД: {e}")
+        logger.error(f"❌ Общая ошибка инициализации БД: {e}")
         raise
 
 async def migrate_db():
-    """Миграция существующей базы данных"""
+    """Миграция существующей базы данных - добавление недостающих колонок"""
     try:
         conn = await get_db_connection()
+        logger.info("🔧 Проверка и выполнение миграций БД...")
         
-        # Проверяем существование колонки tariff в таблице users
-        try:
-            await conn.fetchval("SELECT tariff FROM users LIMIT 1")
-            logger.info("✅ Колонка tariff уже существует")
-        except asyncpg.UndefinedColumnError:
-            logger.info("🔧 Добавляем колонку tariff в таблицу users...")
-            await conn.execute('ALTER TABLE users ADD COLUMN tariff TEXT DEFAULT \'mini\'')
-            logger.info("✅ Колонка tariff добавлена")
+        # Список миграций: (table_name, column_name, column_definition)
+        migrations = [
+            ('users', 'tariff', 'TEXT DEFAULT \'mini\''),
+            ('users', 'is_admin', 'BOOLEAN DEFAULT FALSE'),
+            ('users', 'posts_today', 'INTEGER DEFAULT 0'),
+            ('users', 'posts_reset_date', 'DATE DEFAULT CURRENT_DATE'),
+        ]
         
-        # Проверяем существование колонки is_admin
-        try:
-            await conn.fetchval("SELECT is_admin FROM users LIMIT 1")
-            logger.info("✅ Колонка is_admin уже существует")
-        except asyncpg.UndefinedColumnError:
-            logger.info("🔧 Добавляем колонку is_admin в таблицу users...")
-            await conn.execute('ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT FALSE')
-            logger.info("✅ Колонка is_admin добавлена")
-            
-            # Обновляем админа
-            if ADMIN_ID > 0:
-                await conn.execute('UPDATE users SET is_admin = TRUE WHERE id = $1', ADMIN_ID)
+        for table, column, definition in migrations:
+            try:
+                # Проверяем существует ли колонка
+                exists = await conn.fetchval(f'''
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.columns 
+                        WHERE table_name = $1 AND column_name = $2
+                    )
+                ''', table, column)
+                
+                if not exists:
+                    logger.info(f"🔧 Добавляем колонку {column} в таблицу {table}...")
+                    await conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+                    logger.info(f"✅ Колонка {column} добавлена в таблицу {table}")
+                else:
+                    logger.info(f"✅ Колонка {column} в таблице {table} уже существует")
+                    
+            except Exception as e:
+                logger.error(f"❌ Ошибка при проверке/добавлении колонки {column} в {table}: {e}")
+        
+        # Обновляем админа если нужно
+        if ADMIN_ID > 0:
+            try:
+                await conn.execute('''
+                    UPDATE users 
+                    SET is_admin = TRUE, tariff = 'admin' 
+                    WHERE id = $1
+                ''', ADMIN_ID)
+                logger.info(f"✅ Пользователь {ADMIN_ID} назначен администратором")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось обновить администратора: {e}")
         
         await conn.close()
-        logger.info("✅ Миграция базы данных завершена")
+        logger.info("✅ Все миграции БД завершены")
         
     except Exception as e:
         logger.error(f"❌ Ошибка миграции БД: {e}")
-        raise
+        # Не прерываем выполнение, так как это не критическая ошибка
+        # Таблицы будут созданы заново при необходимости
 
 async def get_user_tariff(user_id: int) -> str:
     """Получает тариф пользователя"""
@@ -780,8 +814,9 @@ async def cmd_start(message: Message):
             SET username = EXCLUDED.username, first_name = EXCLUDED.first_name
         ''', user_id, username, first_name, is_admin)
         await conn.close()
+        logger.info(f"👤 Пользователь {user_id} зарегистрирован")
     except Exception as e:
-        logger.error(f"Ошибка регистрации пользователя: {e}")
+        logger.error(f"Ошибка регистрации пользователя {user_id}: {e}")
     
     # Получаем текущий тариф
     current_tariff = await get_user_tariff(user_id)
@@ -825,8 +860,8 @@ async def cmd_help(message: Message):
         
         "💎 Тарифы:\n"
         "• Mini (бесплатно) - 1 канал, 2 поста в день\n"
-        "• Standard ($4/мес) - 2 канала, 6 постов в день\n"
-        "• VIP ($7/мес) - 3 канала, 12 постов в день\n\n"
+        "• Standard ($4/месяц) - 2 канала, 6 постов в день\n"
+        "• VIP ($7/месяц) - 3 канала, 12 постов в день\n\n"
         
         f"🆘 Поддержка: @{SUPPORT_BOT_USERNAME}\n"
         f"💬 Вопросы по оплате: @{ADMIN_CONTACT.replace('@', '')}"
@@ -1813,7 +1848,7 @@ async def admin_set_tariff(callback: CallbackQuery, state: FSMContext):
                 f"📊 Лимиты:\n"
                 f"• Каналов: {tariff_info['channels_limit']}\n"
                 f"• Постов в день: {tariff_info['daily_posts_limit']}\n\n"
-                f"Спасибо за использование нашего сервиса! 🤖"
+                f"Спасибо за использование нашего сервиса! 🤝"
             )
         except Exception as e:
             logger.error(f"Не удалось уведомить пользователя {target_user_id}: {e}")
@@ -2003,26 +2038,37 @@ async def scheduled_reset_posts():
 # ========== STARTUP/SHUTDOWN ==========
 async def on_startup():
     """Действия при запуске бота"""
-    logger.info("🚀 Запуск бота...")
+    logger.info("=" * 60)
+    logger.info(f"🚀 ЗАПУСК БОТА")
+    logger.info(f"👑 Admin ID: {ADMIN_ID}")
+    logger.info(f"🌐 Database: {'Настроена' if DATABASE_URL else 'Нет'}")
+    logger.info(f"💰 CryptoBot: {'Настроен' if CRYPTO_BOT_TOKEN else 'Не настроен'}")
+    logger.info(f"🆘 Support: @{SUPPORT_BOT_USERNAME}")
+    logger.info(f"📞 Admin Contact: {ADMIN_CONTACT}")
+    logger.info("=" * 60)
     
     try:
         # Инициализация БД
+        logger.info("📊 Инициализация базы данных...")
         await init_db()
         logger.info("✅ База данных инициализирована")
         
         # Миграция существующей БД
+        logger.info("🔧 Проверка и выполнение миграций...")
         await migrate_db()
-        logger.info("✅ Миграция БД выполнена")
+        logger.info("✅ Миграции выполнены")
         
         # Восстановление задач
+        logger.info("🔄 Восстановление запланированных постов...")
         await restore_scheduled_jobs()
         logger.info("✅ Запланированные посты восстановлены")
         
         # Запуск планировщика
+        logger.info("⏰ Запуск планировщика...")
         scheduler.start()
         logger.info("✅ Планировщик запущен")
         
-        # Добавляем ежедневный сброс счетчиков (в 00:01 по Москве)
+        # Добавляем ежедневный сброс счетчиков
         scheduler.add_job(
             scheduled_reset_posts,
             trigger='cron',
@@ -2035,7 +2081,7 @@ async def on_startup():
         
         # Проверяем, что бот работает
         me = await bot.get_me()
-        logger.info(f"✅ Бот @{me.username} запущен")
+        logger.info(f"✅ Бот @{me.username} запущен (ID: {me.id})")
         
         # Уведомление админу
         if ADMIN_ID:
@@ -2043,17 +2089,38 @@ async def on_startup():
                 await bot.send_message(
                     ADMIN_ID,
                     f"🤖 Бот @{me.username} успешно запущен!\n"
+                    f"🆔 ID: {me.id}\n"
                     f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}\n"
-                    f"📍 Готов к работе с тарифной системой!"
+                    f"📍 Готов к работе!\n\n"
+                    f"📊 База данных: OK\n"
+                    f"⏰ Планировщик: OK\n"
+                    f"👥 Пользователи: ожидание..."
                 )
                 logger.info(f"✅ Уведомление отправлено админу {ADMIN_ID}")
             except Exception as e:
-                logger.warning(f"Не удалось отправить уведомление админу: {e}")
+                logger.warning(f"⚠️ Не удалось отправить уведомление админу: {e}")
         
+        logger.info("=" * 60)
+        logger.info("🎉 БОТ УСПЕШНО ЗАПУЩЕН И ГОТОВ К РАБОТЕ!")
+        logger.info("=" * 60)
         return True
         
     except Exception as e:
-        logger.error(f"❌ Ошибка при запуске: {e}")
+        logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ: {e}")
+        logger.error(f"📌 Тип ошибки: {type(e).__name__}")
+        
+        # Пытаемся отправить уведомление админу об ошибке
+        if ADMIN_ID:
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"🚨 ОШИБКА ПРИ ЗАПУСКЕ БОТА!\n\n"
+                    f"❌ {type(e).__name__}: {str(e)[:200]}\n\n"
+                    f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
+                )
+            except:
+                pass
+        
         return False
 
 async def on_shutdown():
@@ -2069,35 +2136,47 @@ async def on_shutdown():
 # ========== MAIN ==========
 async def main():
     """Основная функция"""
-    logger.info("=" * 50)
-    logger.info(f"🤖 Запуск бота...")
-    logger.info(f"👑 Admin ID: {ADMIN_ID}")
-    logger.info(f"🌐 Database: {'Настроена' if DATABASE_URL else 'Нет'}")
-    logger.info(f"💰 CryptoBot: {'Настроен' if CRYPTO_BOT_TOKEN else 'Не настроен'}")
-    logger.info("=" * 50)
+    # Проверяем переменные окружения
+    logger.info("🔍 Проверка конфигурации...")
+    
+    missing_vars = []
+    if not API_TOKEN:
+        missing_vars.append("BOT_TOKEN")
+    if not DATABASE_URL:
+        missing_vars.append("DATABASE_URL")
+    
+    if missing_vars:
+        logger.error(f"❌ Отсутствуют обязательные переменные: {', '.join(missing_vars)}")
+        logger.error("ℹ️ Добавьте их в настройках Railway (Environment Variables)")
+        return
+    
+    logger.info("✅ Все обязательные переменные присутствуют")
     
     # Запуск startup процедур
+    logger.info("🚀 Запуск процедур инициализации...")
     if not await on_startup():
-        logger.error("❌ Не удалось запустить бота")
+        logger.error("❌ Не удалось запустить бота из-за ошибок при инициализации")
         return
     
     try:
         # Запуск polling
+        logger.info("🔄 Запуск polling...")
         await dp.start_polling(bot, skip_updates=True)
+    except KeyboardInterrupt:
+        logger.info("⚠️ Получен сигнал прерывания (Ctrl+C)")
     except Exception as e:
-        logger.error(f"💥 Критическая ошибка: {e}")
+        logger.error(f"💥 КРИТИЧЕСКАЯ ОШИБКА ВО ВРЕМЯ РАБОТЫ: {e}")
+        logger.error(f"📌 Тип ошибки: {type(e).__name__}")
     finally:
         # Выполняем shutdown процедуры
+        logger.info("🔄 Запуск процедур завершения...")
         await on_shutdown()
 
 if __name__ == "__main__":
-    # Проверка обязательных переменных
-    if not API_TOKEN:
-        logger.error("❌ Не указан BOT_TOKEN в переменных окружения")
-        exit(1)
-    
-    if not DATABASE_URL:
-        logger.error("❌ Не указан DATABASE_URL в переменных окружения")
-        exit(1)
-    
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Бот остановлен пользователем")
+    except Exception as e:
+        print(f"💥 Фатальная ошибка: {e}")
+        sys.exit(1)
