@@ -38,10 +38,6 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SUPPORT_BOT_USERNAME = os.getenv("SUPPORT_BOT_USERNAME", "support_bot")
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
 
-# CryptoPay (опционально)
-CRYPTO_BOT_TOKEN = os.getenv("CRYPTO_BOT_TOKEN", "")
-CRYPTO_BOT_USERNAME = os.getenv("CRYPTO_BOT_USERNAME", "CryptoBot")
-
 # Настройки
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 POST_CHARACTER_LIMIT = 4000
@@ -88,27 +84,6 @@ TARIFFS = {
     }
 }
 
-# ========== PAYMENT SYSTEM ==========
-async def check_crypto_payment(user_id: int, amount: float, currency: str = "USD") -> bool:
-    """Проверяет оплату через CryptoBot (заглушка для демо)"""
-    logger.info(f"💳 Проверка оплаты для пользователя {user_id}: {amount} {currency}")
-    return True
-
-async def create_crypto_invoice(user_id: int, tariff_id: str) -> Optional[str]:
-    """Создает счет в CryptoBot (заглушка для демо)"""
-    tariff_info = TARIFFS.get(tariff_id)
-    if not tariff_info:
-        return None
-    
-    if tariff_info['price'] == 0:
-        return "free"
-    
-    # В реальной реализации здесь будет вызов CryptoBot API
-    invoice_url = f"https://t.me/{CRYPTO_BOT_USERNAME}?start=invoice_{tariff_id}_{user_id}"
-    
-    logger.info(f"📄 Создан счет для пользователя {user_id} на тариф {tariff_id}")
-    return invoice_url
-
 # ========== SETUP ==========
 logging.basicConfig(
     level=logging.INFO,
@@ -151,7 +126,6 @@ async def get_db_connection():
                 else:
                     conn_string += "?sslmode=require"
             
-            logger.debug(f"Подключение к БД: {conn_string[:50]}...")
             return await asyncpg.connect(conn_string, timeout=30)
     except Exception as e:
         logger.error(f"Ошибка подключения к БД: {e}")
@@ -200,23 +174,22 @@ async def init_db():
                 message_text TEXT,
                 media_file_id TEXT,
                 media_caption TEXT,
-                scheduled_time TIMESTAMP NOT NULL,
+                scheduled_time TIMESTAMP WITH TIME ZONE NOT NULL,
                 is_sent BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT NOW()
             )
         ''')
         
-        # Таблица платежей
+        # Таблица заказов тарифов
         await conn.execute('''
-            CREATE TABLE IF NOT EXISTS payments (
+            CREATE TABLE IF NOT EXISTS tariff_orders (
                 id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT,
+                user_id BIGINT NOT NULL,
                 tariff TEXT NOT NULL,
-                amount DECIMAL(10,2),
-                currency TEXT,
                 status TEXT DEFAULT 'pending',
-                payment_date TIMESTAMP DEFAULT NOW(),
-                expires_at TIMESTAMP
+                order_date TIMESTAMP DEFAULT NOW(),
+                processed_date TIMESTAMP,
+                admin_notes TEXT
             )
         ''')
         
@@ -281,8 +254,6 @@ async def migrate_db():
         
     except Exception as e:
         logger.error(f"❌ Ошибка миграции БД: {e}")
-        # Не прерываем выполнение, так как это не критическая ошибка
-        # Таблицы будут созданы заново при необходимости
 
 async def get_user_tariff(user_id: int) -> str:
     """Получает тариф пользователя"""
@@ -325,42 +296,36 @@ async def update_user_tariff(user_id: int, tariff: str) -> bool:
         logger.error(f"Ошибка обновления тарифа: {e}")
         return False
 
-async def process_payment(user_id: int, tariff_id: str) -> bool:
-    """Обработка оплаты тарифа"""
-    tariff_info = TARIFFS.get(tariff_id)
-    if not tariff_info:
-        return False
-    
+async def create_tariff_order(user_id: int, tariff_id: str) -> bool:
+    """Создает заказ на тариф"""
     try:
-        # Проверяем оплату
-        payment_success = await check_crypto_payment(user_id, tariff_info['price'], tariff_info['currency'])
+        conn = await get_db_connection()
+        await conn.execute('''
+            INSERT INTO tariff_orders (user_id, tariff, status)
+            VALUES ($1, $2, 'pending')
+        ''', user_id, tariff_id)
+        await conn.close()
         
-        if payment_success:
-            # Обновляем тариф
-            success = await update_user_tariff(user_id, tariff_id)
-            
-            if success:
-                # Сохраняем информацию о платеже
-                conn = await get_db_connection()
-                await conn.execute('''
-                    INSERT INTO payments (user_id, tariff, amount, currency, status, expires_at)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                ''', 
-                user_id, 
-                tariff_id,
-                tariff_info['price'],
-                tariff_info['currency'],
-                'completed',
-                datetime.now(pytz.UTC) + timedelta(days=30)  # Тариф на 30 дней
+        # Уведомляем админа о новом заказе
+        if ADMIN_ID:
+            tariff_info = TARIFFS.get(tariff_id, {})
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"🛒 НОВЫЙ ЗАКАЗ ТАРИФА!\n\n"
+                    f"👤 Пользователь: {user_id}\n"
+                    f"💎 Тариф: {tariff_info.get('name', tariff_id)}\n"
+                    f"💰 Стоимость: {tariff_info.get('price', 0)} {tariff_info.get('currency', 'USD')}\n"
+                    f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}\n\n"
+                    f"📋 Для обработки заказа используйте команду /admin"
                 )
-                await conn.close()
-                
-                logger.info(f"💳 Платеж обработан: пользователь {user_id} -> тариф {tariff_id}")
-                return True
+            except Exception as e:
+                logger.error(f"Не удалось уведомить админа о заказе: {e}")
         
-        return False
+        logger.info(f"📝 Создан заказ тарифа {tariff_id} для пользователя {user_id}")
+        return True
     except Exception as e:
-        logger.error(f"Ошибка обработки платежа: {e}")
+        logger.error(f"Ошибка создания заказа тарифа: {e}")
         return False
 
 async def get_tariff_limits(user_id: int) -> Tuple[int, int]:
@@ -516,7 +481,10 @@ async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, sc
     """Сохраняет запланированный пост в БД"""
     try:
         # Конвертируем время в UTC для хранения в БД
-        scheduled_time_utc = scheduled_time.astimezone(pytz.UTC)
+        if scheduled_time.tzinfo is None:
+            scheduled_time_utc = MOSCOW_TZ.localize(scheduled_time).astimezone(pytz.UTC)
+        else:
+            scheduled_time_utc = scheduled_time.astimezone(pytz.UTC)
         
         conn = await get_db_connection()
         
@@ -594,8 +562,9 @@ async def get_total_stats() -> Dict:
         
         total_channels = await conn.fetchval("SELECT COUNT(*) FROM channels WHERE is_active = TRUE") or 0
         
-        # Статистика платежей
-        total_revenue = await conn.fetchval("SELECT SUM(amount) FROM payments WHERE status = 'completed'") or 0
+        # Статистика заказов
+        pending_orders = await conn.fetchval("SELECT COUNT(*) FROM tariff_orders WHERE status = 'pending'") or 0
+        completed_orders = await conn.fetchval("SELECT COUNT(*) FROM tariff_orders WHERE status = 'completed'") or 0
         
         await conn.close()
         
@@ -608,7 +577,8 @@ async def get_total_stats() -> Dict:
             'active_posts': active_posts,
             'sent_posts': sent_posts,
             'total_channels': total_channels,
-            'total_revenue': total_revenue
+            'pending_orders': pending_orders,
+            'completed_orders': completed_orders
         }
     except Exception as e:
         logger.error(f"Ошибка получения общей статистики: {e}")
@@ -737,24 +707,24 @@ def get_tariffs_keyboard(user_tariff: str = 'mini') -> InlineKeyboardMarkup:
             callback_data=f"tariff_info_{tariff_id}"
         )])
     
-    buttons.append([InlineKeyboardButton(text="💬 Заказать тариф", url=f"https://t.me/{ADMIN_CONTACT.replace('@', '')}")])
+    buttons.append([InlineKeyboardButton(text="⏰ Проверить время", callback_data="check_time")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")])
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_tariff_payment_keyboard(tariff_id: str) -> InlineKeyboardMarkup:
-    """Клавиатура для оплаты тарифа"""
+def get_tariff_order_keyboard(tariff_id: str) -> InlineKeyboardMarkup:
+    """Клавиатура для заказа тарифа"""
     tariff_info = TARIFFS.get(tariff_id)
     
-    if tariff_info and tariff_info['price'] > 0:
+    if tariff_info and tariff_info['price'] == 0:
         buttons = [
-            [InlineKeyboardButton(text="💳 Оплатить через CryptoBot", callback_data=f"pay_{tariff_id}")],
-            [InlineKeyboardButton(text="💬 Связаться с менеджером", url=f"https://t.me/{ADMIN_CONTACT.replace('@', '')}")],
+            [InlineKeyboardButton(text="🆓 Активировать бесплатный тариф", callback_data=f"activate_{tariff_id}")],
             [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="tariffs")]
         ]
     else:
         buttons = [
-            [InlineKeyboardButton(text="🆓 Активировать бесплатный тариф", callback_data=f"activate_{tariff_id}")],
+            [InlineKeyboardButton(text="💳 Заказать тариф", callback_data=f"order_{tariff_id}")],
+            [InlineKeyboardButton(text="💬 Связаться с менеджером", url=f"https://t.me/{ADMIN_CONTACT.replace('@', '')}")],
             [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="tariffs")]
         ]
     
@@ -766,7 +736,7 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📊 Общая статистика", callback_data="admin_stats")],
         [InlineKeyboardButton(text="👥 Управление пользователями", callback_data="admin_users")],
         [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="💳 Статистика платежей", callback_data="admin_payments")],
+        [InlineKeyboardButton(text="🛒 Управление заказами", callback_data="admin_orders")],
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
     ])
 
@@ -775,6 +745,15 @@ def get_admin_users_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔍 Найти пользователя по ID", callback_data="admin_find_user")],
         [InlineKeyboardButton(text="💎 Изменить тариф пользователя", callback_data="admin_change_tariff")],
+        [InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin_panel")]
+    ])
+
+def get_admin_orders_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура управления заказами"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Список заказов", callback_data="admin_orders_list")],
+        [InlineKeyboardButton(text="⏳ Ожидающие заказы", callback_data="admin_pending_orders")],
+        [InlineKeyboardButton(text="✅ Выполненные заказы", callback_data="admin_completed_orders")],
         [InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin_panel")]
     ])
 
@@ -790,9 +769,7 @@ class AdminStates(StatesGroup):
     waiting_for_user_id = State()
     waiting_for_tariff = State()
     waiting_for_broadcast = State()
-
-class PaymentStates(StatesGroup):
-    waiting_for_payment = State()
+    waiting_for_order_action = State()
 
 # ========== HANDLERS ==========
 @router.message(CommandStart())
@@ -863,11 +840,29 @@ async def cmd_help(message: Message):
         "• Standard ($4/месяц) - 2 канала, 6 постов в день\n"
         "• VIP ($7/месяц) - 3 канала, 12 постов в день\n\n"
         
+        "🕐 Проверьте текущее время Москвы в разделе 'Тарифы' -> 'Проверить время'\n\n"
+        
         f"🆘 Поддержка: @{SUPPORT_BOT_USERNAME}\n"
         f"💬 Вопросы по оплате: @{ADMIN_CONTACT.replace('@', '')}"
     )
     
     await message.answer(help_text)
+
+@router.callback_query(F.data == "check_time")
+async def check_time(callback: CallbackQuery):
+    """Проверка текущего времени"""
+    now_moscow = datetime.now(MOSCOW_TZ)
+    time_text = (
+        f"🕐 Текущее время по Москве:\n\n"
+        f"📅 Дата: {now_moscow.strftime('%d.%m.%Y')}\n"
+        f"⏰ Время: {now_moscow.strftime('%H:%M:%S')}\n\n"
+        f"📍 Используйте это время для планирования постов."
+    )
+    
+    await callback.message.edit_text(
+        time_text,
+        reply_markup=get_tariffs_keyboard()
+    )
 
 @router.callback_query(F.data == "back_to_main")
 async def back_to_main(callback: CallbackQuery, state: FSMContext):
@@ -893,7 +888,7 @@ async def cancel_action(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_main_menu(callback.from_user.id, is_admin)
     )
 
-# ========== TARIFFS AND PAYMENTS ==========
+# ========== TARIFFS ==========
 @router.callback_query(F.data == "tariffs")
 async def show_tariffs(callback: CallbackQuery):
     """Показ тарифов"""
@@ -952,14 +947,25 @@ async def tariff_info(callback: CallbackQuery):
     
     info_text += f"📝 {tariff_info['description']}\n\n"
     
-    if tariff_id == current_tariff:
+    if tariff_id == 'mini':
+        info_text += "🆓 Это бесплатный тариф, вы можете активировать его сразу"
+    elif tariff_id == current_tariff:
         info_text += "✅ Это ваш текущий тариф"
     else:
-        info_text += "👇 Выберите способ оплаты:"
+        info_text += (
+            "💳 Для заказа тарифа:\n"
+            "1. Нажмите кнопку 'Заказать тариф'\n"
+            "2. Напишите менеджеру: @ваш_менеджер\n"
+            "3. Оплатите через CryptoBot\n"
+            "4. Пришлите скриншот оплаты и ваш ID\n\n"
+            f"📋 Ваш ID для заказа: {user_id}\n\n"
+            "⏳ Тарифы активируются в течение 24 часов после оплаты.\n"
+            "🙏 Отнеситесь с пониманием к времени обработки заказа."
+        )
     
     await callback.message.edit_text(
         info_text,
-        reply_markup=get_tariff_payment_keyboard(tariff_id)
+        reply_markup=get_tariff_order_keyboard(tariff_id)
     )
 
 @router.callback_query(F.data.startswith("activate_"))
@@ -981,7 +987,7 @@ async def activate_free_tariff(callback: CallbackQuery):
             "Теперь вы можете:\n"
             "• Добавить 1 канал\n"
             "• Публиковать до 2 постов в день\n\n"
-            "Чтобы увеличить лимиты, выберите платный тариф.",
+            "Чтобы увеличить лимиты, закажите платный тариф.",
             reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
         )
     else:
@@ -990,9 +996,9 @@ async def activate_free_tariff(callback: CallbackQuery):
             reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
         )
 
-@router.callback_query(F.data.startswith("pay_"))
-async def start_payment(callback: CallbackQuery, state: FSMContext):
-    """Начало оплаты тарифа"""
+@router.callback_query(F.data.startswith("order_"))
+async def order_tariff(callback: CallbackQuery):
+    """Заказ платного тарифа"""
     user_id = callback.from_user.id
     tariff_id = callback.data.split("_")[1]
     tariff_info = TARIFFS.get(tariff_id)
@@ -1001,86 +1007,34 @@ async def start_payment(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Неверный тариф!", show_alert=True)
         return
     
-    # Сохраняем информацию о платеже
-    await state.update_data(tariff_id=tariff_id, user_id=user_id)
-    await state.set_state(PaymentStates.waiting_for_payment)
+    # Создаем заказ
+    success = await create_tariff_order(user_id, tariff_id)
     
-    # Создаем счет
-    invoice_url = await create_crypto_invoice(user_id, tariff_id)
-    
-    if invoice_url == "free":
-        # Бесплатный тариф
-        success = await update_user_tariff(user_id, tariff_id)
+    if success:
+        order_text = (
+            f"🛒 Заказ тарифа {tariff_info['name']} создан!\n\n"
+            f"💰 Стоимость: {tariff_info['price']} {tariff_info['currency']}\n"
+            f"⏱ Срок действия: 30 дней\n\n"
+            f"📋 Для завершения заказа:\n"
+            f"1. Напишите менеджеру: @{ADMIN_CONTACT.replace('@', '')}\n"
+            f"2. Укажите ваш Telegram ID: {user_id}\n"
+            f"3. Оплатите через CryptoBot (чек)\n"
+            f"4. Пришлите скриншот оплаты\n\n"
+            f"💳 Оплата производится через чек CryptoPay\n"
+            f"📞 По всем вопросам обращайтесь к менеджеру\n\n"
+            f"⏳ Тариф будет активирован в течение 24 часов после оплаты.\n"
+            f"🙏 Отнеситесь с пониманием к времени обработки заказа."
+        )
         
-        if success:
-            await callback.message.edit_text(
-                f"🎉 Тариф {tariff_info['name']} успешно активирован!\n\n"
-                f"Теперь вы можете:\n"
-                f"• Добавить {tariff_info['channels_limit']} каналов\n"
-                f"• Публиковать до {tariff_info['daily_posts_limit']} постов в день",
-                reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
-            )
-        else:
-            await callback.message.edit_text(
-                "❌ Ошибка при активации тарифа. Попробуйте позже.",
-                reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
-            )
-        await state.clear()
-        return
-    
-    payment_text = (
-        f"💳 Оплата тарифа {tariff_info['name']}\n\n"
-        f"💰 Сумма: {tariff_info['price']} {tariff_info['currency']}\n"
-        f"⏱ Срок действия: 30 дней\n\n"
-        f"Для оплаты:\n"
-        f"1. Перейдите по ссылке ниже\n"
-        f"2. Оплатите счет в CryptoBot\n"
-        f"3. После оплаты нажмите кнопку '✅ Проверить оплату'\n\n"
-        f"📍 Ссылка для оплаты:"
-    )
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Перейти к оплате", url=invoice_url)],
-        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_payment_{tariff_id}")],
-        [InlineKeyboardButton(text="❌ Отменить", callback_data="tariffs")]
-    ])
-    
-    await callback.message.edit_text(
-        payment_text,
-        reply_markup=keyboard
-    )
-
-@router.callback_query(F.data.startswith("check_payment_"))
-async def check_payment(callback: CallbackQuery, state: FSMContext):
-    """Проверка оплаты"""
-    user_id = callback.from_user.id
-    tariff_id = callback.data.split("_")[2]
-    
-    # Проверяем оплату
-    tariff_info = TARIFFS.get(tariff_id)
-    if not tariff_info:
-        await callback.answer("❌ Тариф не найден!", show_alert=True)
-        return
-    
-    payment_success = await process_payment(user_id, tariff_id)
-    
-    if payment_success:
         await callback.message.edit_text(
-            f"🎉 Оплата подтверждена!\n\n"
-            f"Тариф {tariff_info['name']} успешно активирован на 30 дней.\n\n"
-            f"📊 Новые лимиты:\n"
-            f"• Каналов: {tariff_info['channels_limit']}\n"
-            f"• Постов в день: {tariff_info['daily_posts_limit']}\n\n"
-            f"Спасибо за покупку! 🤝",
-            reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
+            order_text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💬 Написать менеджеру", url=f"https://t.me/{ADMIN_CONTACT.replace('@', '')}")],
+                [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="tariffs")]
+            ])
         )
     else:
-        await callback.answer(
-            "❌ Оплата не найдена! Убедитесь, что вы оплатили счет и повторите проверку.",
-            show_alert=True
-        )
-    
-    await state.clear()
+        await callback.answer("❌ Ошибка при создании заказа", show_alert=True)
 
 # ========== POST SCHEDULING ==========
 @router.callback_query(F.data == "schedule_post")
@@ -1642,7 +1596,7 @@ async def admin_stats(callback: CallbackQuery):
         f"   ⏳ Ожидает: {stats['active_posts']}\n"
         f"   ✅ Опубликовано: {stats['sent_posts']}\n\n"
         f"📢 Каналы: {stats['total_channels']}\n"
-        f"💰 Выручка: ${stats['total_revenue']:.2f}\n\n"
+        f"🛒 Заказы: {stats['pending_orders']} ⏳ / {stats['completed_orders']} ✅\n\n"
         f"🕐 Обновлено: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
     )
     
@@ -1651,61 +1605,362 @@ async def admin_stats(callback: CallbackQuery):
         reply_markup=get_admin_keyboard()
     )
 
-@router.callback_query(F.data == "admin_payments")
-async def admin_payments(callback: CallbackQuery):
-    """Статистика платежей"""
+@router.callback_query(F.data == "admin_orders")
+async def admin_orders_panel(callback: CallbackQuery):
+    """Панель управления заказами"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Только для администратора!", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "🛒 Управление заказами тарифов\n\n"
+        "👇 Выберите действие:",
+        reply_markup=get_admin_orders_keyboard()
+    )
+
+@router.callback_query(F.data == "admin_orders_list")
+async def admin_orders_list(callback: CallbackQuery):
+    """Список всех заказов"""
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("⛔ Только для администратора!", show_alert=True)
         return
     
     try:
         conn = await get_db_connection()
-        
-        # Статистика по платежам
-        total_payments = await conn.fetchval("SELECT COUNT(*) FROM payments WHERE status = 'completed'") or 0
-        total_revenue = await conn.fetchval("SELECT SUM(amount) FROM payments WHERE status = 'completed'") or 0
-        pending_payments = await conn.fetchval("SELECT COUNT(*) FROM payments WHERE status = 'pending'") or 0
-        
-        # Последние 5 платежей
-        recent_payments = await conn.fetch('''
-            SELECT user_id, tariff, amount, currency, payment_date
-            FROM payments 
-            WHERE status = 'completed'
-            ORDER BY payment_date DESC 
-            LIMIT 5
+        orders = await conn.fetch('''
+            SELECT o.id, o.user_id, o.tariff, o.status, o.order_date, o.processed_date, 
+                   u.username, u.first_name
+            FROM tariff_orders o
+            LEFT JOIN users u ON o.user_id = u.id
+            ORDER BY o.order_date DESC
+            LIMIT 20
         ''')
-        
         await conn.close()
         
-        payments_text = (
-            f"💳 Статистика платежей\n\n"
-            f"💰 Общая выручка: ${total_revenue:.2f}\n"
-            f"📊 Всего платежей: {total_payments}\n"
-            f"⏳ Ожидает обработки: {pending_payments}\n\n"
-            f"📋 Последние платежи:\n"
-        )
+        if not orders:
+            await callback.message.edit_text(
+                "📭 Заказов пока нет",
+                reply_markup=get_admin_orders_keyboard()
+            )
+            return
         
-        if recent_payments:
-            for i, payment in enumerate(recent_payments, 1):
-                payments_text += (
-                    f"\n{i}. ID: {payment['user_id']}\n"
-                    f"   Тариф: {TARIFFS.get(payment['tariff'], {}).get('name', payment['tariff'])}\n"
-                    f"   Сумма: {payment['amount']} {payment['currency']}\n"
-                    f"   Дата: {payment['payment_date'].strftime('%d.%m.%Y %H:%M')}"
-                )
-        else:
-            payments_text += "\nНет данных о платежах"
+        orders_text = "📋 Список последних 20 заказов:\n\n"
+        
+        for i, order in enumerate(orders, 1):
+            tariff_info = TARIFFS.get(order['tariff'], {})
+            status_emoji = {
+                'pending': '⏳',
+                'completed': '✅',
+                'cancelled': '❌'
+            }.get(order['status'], '❓')
+            
+            orders_text += (
+                f"{i}. {status_emoji} Заказ #{order['id']}\n"
+                f"   👤 {order['first_name'] or 'Без имени'} (@{order['username'] or 'нет'})\n"
+                f"   🆔 ID: {order['user_id']}\n"
+                f"   💎 Тариф: {tariff_info.get('name', order['tariff'])}\n"
+                f"   📅 Дата: {order['order_date'].strftime('%d.%m.%Y %H:%M')}\n"
+                f"   📌 Статус: {order['status']}\n"
+                f"   ⚡ Действие: /process_order_{order['id']}\n\n"
+            )
+        
+        orders_text += "ℹ️ Для обработки заказа используйте команду из списка выше"
         
         await callback.message.edit_text(
-            payments_text,
-            reply_markup=get_admin_keyboard()
+            orders_text,
+            reply_markup=get_admin_orders_keyboard()
         )
         
     except Exception as e:
-        logger.error(f"Ошибка получения статистики платежей: {e}")
+        logger.error(f"Ошибка получения списка заказов: {e}")
         await callback.message.edit_text(
-            "❌ Ошибка получения статистики платежей",
-            reply_markup=get_admin_keyboard()
+            "❌ Ошибка получения списка заказов",
+            reply_markup=get_admin_orders_keyboard()
+        )
+
+@router.message(F.text.startswith("/process_order_"))
+async def process_order_command(message: Message):
+    """Обработка заказа по команде"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        order_id = int(message.text.split("_")[2])
+        
+        conn = await get_db_connection()
+        order = await conn.fetchrow('''
+            SELECT o.id, o.user_id, o.tariff, o.status, u.username, u.first_name
+            FROM tariff_orders o
+            LEFT JOIN users u ON o.user_id = u.id
+            WHERE o.id = $1
+        ''', order_id)
+        
+        if not order:
+            await message.answer("❌ Заказ не найден")
+            return
+        
+        if order['status'] == 'completed':
+            await message.answer("ℹ️ Этот заказ уже обработан")
+            return
+        
+        tariff_info = TARIFFS.get(order['tariff'], {})
+        
+        order_info = (
+            f"🛒 Обработка заказа #{order['id']}\n\n"
+            f"👤 Пользователь: {order['first_name'] or 'Без имени'} (@{order['username'] or 'нет'})\n"
+            f"🆔 ID: {order['user_id']}\n"
+            f"💎 Тариф: {tariff_info.get('name', order['tariff'])}\n"
+            f"💰 Цена: {tariff_info.get('price', 0)} {tariff_info.get('currency', 'USD')}\n"
+            f"📅 Дата заказа: {order['order_date'].strftime('%d.%m.%Y %H:%M')}\n"
+            f"📌 Статус: {order['status']}\n\n"
+            f"👇 Выберите действие:"
+        )
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Выполнить", callback_data=f"complete_order_{order_id}"),
+                InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_order_{order_id}")
+            ],
+            [InlineKeyboardButton(text="💎 Активировать тариф", callback_data=f"activate_order_{order_id}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_orders")]
+        ])
+        
+        await message.answer(order_info, reply_markup=keyboard)
+        
+    except (ValueError, IndexError):
+        await message.answer("❌ Неверный формат команды. Используйте: /process_order_<ID>")
+    except Exception as e:
+        logger.error(f"Ошибка обработки команды заказа: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+
+@router.callback_query(F.data.startswith("complete_order_"))
+async def complete_order(callback: CallbackQuery):
+    """Завершение заказа"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Только для администратора!", show_alert=True)
+        return
+    
+    try:
+        order_id = int(callback.data.split("_")[2])
+        
+        conn = await get_db_connection()
+        await conn.execute('''
+            UPDATE tariff_orders 
+            SET status = 'completed', processed_date = NOW() 
+            WHERE id = $1
+        ''', order_id)
+        await conn.close()
+        
+        await callback.answer("✅ Заказ отмечен как выполненный", show_alert=True)
+        await callback.message.edit_text(
+            f"✅ Заказ #{order_id} отмечен как выполненный",
+            reply_markup=get_admin_orders_keyboard()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка завершения заказа: {e}")
+        await callback.answer("❌ Ошибка завершения заказа", show_alert=True)
+
+@router.callback_query(F.data.startswith("cancel_order_"))
+async def cancel_order(callback: CallbackQuery):
+    """Отмена заказа"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Только для администратора!", show_alert=True)
+        return
+    
+    try:
+        order_id = int(callback.data.split("_")[2])
+        
+        conn = await get_db_connection()
+        await conn.execute('''
+            UPDATE tariff_orders 
+            SET status = 'cancelled', processed_date = NOW() 
+            WHERE id = $1
+        ''', order_id)
+        await conn.close()
+        
+        await callback.answer("✅ Заказ отменен", show_alert=True)
+        await callback.message.edit_text(
+            f"✅ Заказ #{order_id} отменен",
+            reply_markup=get_admin_orders_keyboard()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка отмены заказа: {e}")
+        await callback.answer("❌ Ошибка отмены заказа", show_alert=True)
+
+@router.callback_query(F.data.startswith("activate_order_"))
+async def activate_order_tariff(callback: CallbackQuery):
+    """Активация тарифа по заказу"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Только для администратора!", show_alert=True)
+        return
+    
+    try:
+        order_id = int(callback.data.split("_")[2])
+        
+        conn = await get_db_connection()
+        order = await conn.fetchrow('''
+            SELECT user_id, tariff FROM tariff_orders WHERE id = $1
+        ''', order_id)
+        
+        if not order:
+            await callback.answer("❌ Заказ не найден", show_alert=True)
+            return
+        
+        # Активируем тариф
+        success = await update_user_tariff(order['user_id'], order['tariff'])
+        
+        if success:
+            # Отмечаем заказ как выполненный
+            await conn.execute('''
+                UPDATE tariff_orders 
+                SET status = 'completed', processed_date = NOW() 
+                WHERE id = $1
+            ''', order_id)
+            
+            # Уведомляем пользователя
+            tariff_info = TARIFFS.get(order['tariff'], {})
+            try:
+                await bot.send_message(
+                    order['user_id'],
+                    f"🎉 Ваш тариф активирован!\n\n"
+                    f"💎 Тариф: {tariff_info.get('name', order['tariff'])}\n"
+                    f"📊 Лимиты:\n"
+                    f"• Каналов: {tariff_info.get('channels_limit', 0)}\n"
+                    f"• Постов в день: {tariff_info.get('daily_posts_limit', 0)}\n\n"
+                    f"Спасибо за заказ! 🤝\n\n"
+                    f"📍 Теперь вы можете пользоваться всеми возможностями тарифа."
+                )
+            except Exception as e:
+                logger.error(f"Не удалось уведомить пользователя {order['user_id']}: {e}")
+            
+            await conn.close()
+            
+            await callback.answer("✅ Тариф активирован", show_alert=True)
+            await callback.message.edit_text(
+                f"✅ Тариф для пользователя {order['user_id']} успешно активирован!\n"
+                f"Заказ #{order_id} отмечен как выполненный.",
+                reply_markup=get_admin_orders_keyboard()
+            )
+        else:
+            await conn.close()
+            await callback.answer("❌ Ошибка активации тарифа", show_alert=True)
+        
+    except Exception as e:
+        logger.error(f"Ошибка активации тарифа по заказу: {e}")
+        await callback.answer("❌ Ошибка активации тарифа", show_alert=True)
+
+@router.callback_query(F.data == "admin_pending_orders")
+async def admin_pending_orders(callback: CallbackQuery):
+    """Список ожидающих заказов"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Только для администратора!", show_alert=True)
+        return
+    
+    try:
+        conn = await get_db_connection()
+        orders = await conn.fetch('''
+            SELECT o.id, o.user_id, o.tariff, o.order_date, 
+                   u.username, u.first_name
+            FROM tariff_orders o
+            LEFT JOIN users u ON o.user_id = u.id
+            WHERE o.status = 'pending'
+            ORDER BY o.order_date
+        ''')
+        await conn.close()
+        
+        if not orders:
+            await callback.message.edit_text(
+                "✅ Нет ожидающих заказов",
+                reply_markup=get_admin_orders_keyboard()
+            )
+            return
+        
+        orders_text = f"⏳ Ожидающие заказы ({len(orders)}):\n\n"
+        
+        for i, order in enumerate(orders, 1):
+            tariff_info = TARIFFS.get(order['tariff'], {})
+            time_ago = datetime.now(MOSCOW_TZ) - order['order_date'].replace(tzinfo=pytz.UTC).astimezone(MOSCOW_TZ)
+            hours_ago = int(time_ago.total_seconds() / 3600)
+            
+            orders_text += (
+                f"{i}. ⏳ Заказ #{order['id']} ({hours_ago}ч назад)\n"
+                f"   👤 {order['first_name'] or 'Без имени'} (@{order['username'] or 'нет'})\n"
+                f"   🆔 ID: {order['user_id']}\n"
+                f"   💎 Тариф: {tariff_info.get('name', order['tariff'])}\n"
+                f"   💰 Цена: {tariff_info.get('price', 0)} {tariff_info.get('currency', 'USD')}\n"
+                f"   ⚡ Действие: /process_order_{order['id']}\n\n"
+            )
+        
+        orders_text += "ℹ️ Для обработки заказа используйте команду из списка выше"
+        
+        await callback.message.edit_text(
+            orders_text,
+            reply_markup=get_admin_orders_keyboard()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения ожидающих заказов: {e}")
+        await callback.message.edit_text(
+            "❌ Ошибка получения ожидающих заказов",
+            reply_markup=get_admin_orders_keyboard()
+        )
+
+@router.callback_query(F.data == "admin_completed_orders")
+async def admin_completed_orders(callback: CallbackQuery):
+    """Список выполненных заказов"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Только для администратора!", show_alert=True)
+        return
+    
+    try:
+        conn = await get_db_connection()
+        orders = await conn.fetch('''
+            SELECT o.id, o.user_id, o.tariff, o.order_date, o.processed_date,
+                   u.username, u.first_name
+            FROM tariff_orders o
+            LEFT JOIN users u ON o.user_id = u.id
+            WHERE o.status = 'completed'
+            ORDER BY o.processed_date DESC
+            LIMIT 20
+        ''')
+        await conn.close()
+        
+        if not orders:
+            await callback.message.edit_text(
+                "📭 Нет выполненных заказов",
+                reply_markup=get_admin_orders_keyboard()
+            )
+            return
+        
+        orders_text = "✅ Выполненные заказы:\n\n"
+        
+        for i, order in enumerate(orders, 1):
+            tariff_info = TARIFFS.get(order['tariff'], {})
+            process_time = order['processed_date'] - order['order_date']
+            hours_to_process = int(process_time.total_seconds() / 3600)
+            
+            orders_text += (
+                f"{i}. ✅ Заказ #{order['id']}\n"
+                f"   👤 {order['first_name'] or 'Без имени'} (@{order['username'] or 'нет'})\n"
+                f"   🆔 ID: {order['user_id']}\n"
+                f"   💎 Тариф: {tariff_info.get('name', order['tariff'])}\n"
+                f"   📅 Заказ: {order['order_date'].strftime('%d.%m %H:%M')}\n"
+                f"   ✅ Выполнен: {order['processed_date'].strftime('%d.%m %H:%M')}\n"
+                f"   ⏱ Обработка: {hours_to_process} часов\n\n"
+            )
+        
+        await callback.message.edit_text(
+            orders_text,
+            reply_markup=get_admin_orders_keyboard()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения выполненных заказов: {e}")
+        await callback.message.edit_text(
+            "❌ Ошибка получения выполненных заказов",
+            reply_markup=get_admin_orders_keyboard()
         )
 
 @router.callback_query(F.data == "admin_users")
@@ -1843,7 +2098,7 @@ async def admin_set_tariff(callback: CallbackQuery, state: FSMContext):
         try:
             await bot.send_message(
                 target_user_id,
-                f"🎉 Ваш тариф изменен!\n\n"
+                f"🎉 Ваш тариф изменен администратором!\n\n"
                 f"💎 Новый тариф: {tariff_info['name']}\n"
                 f"📊 Лимиты:\n"
                 f"• Каналов: {tariff_info['channels_limit']}\n"
@@ -2042,7 +2297,6 @@ async def on_startup():
     logger.info(f"🚀 ЗАПУСК БОТА")
     logger.info(f"👑 Admin ID: {ADMIN_ID}")
     logger.info(f"🌐 Database: {'Настроена' if DATABASE_URL else 'Нет'}")
-    logger.info(f"💰 CryptoBot: {'Настроен' if CRYPTO_BOT_TOKEN else 'Не настроен'}")
     logger.info(f"🆘 Support: @{SUPPORT_BOT_USERNAME}")
     logger.info(f"📞 Admin Contact: {ADMIN_CONTACT}")
     logger.info("=" * 60)
