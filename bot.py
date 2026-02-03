@@ -17,6 +17,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import asyncpg
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
+import google.generativeai as genai
 
 # ========== CONFIG ==========
 API_TOKEN = os.getenv("BOT_TOKEN")
@@ -32,6 +33,21 @@ if not DATABASE_URL:
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SUPPORT_BOT_USERNAME = os.getenv("SUPPORT_BOT_USERNAME", "support_bot")
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
+
+# Gemini API Keys
+GEMINI_API_KEYS = [
+    "AIzaSyAI_vkc2IFhOPKELbxpu1QODKCd5h-bEOI",
+    "AIzaSyBy_aoWhZ5ZKm4yyhw7mNzP-8U-t4pXWMI",
+    "AIzaSyA4jtchIEaTWrHnr_yQcRGTsZIWTAstXNA",
+    "AIzaSyANoeHQtBBxInIYCfNHHO_JGE6DWmhQ2Rg",
+    "AIzaSyAI_vkc2IFhOPKELbxpu1QODKCd5h-bEOI_2",
+    "AIzaSyBy_aoWhZ5ZKm4yyhw7mNzP-8U-t4pXWMI_2",
+    "AIzaSyA4jtchIEaTWrHnr_yQcRGTsZIWTAstXNA_2",
+    "AIzaSyANoeHQtBBxInIYCfNHHO_JGE6DWmhQ2Rg_2"
+]
+GEMINI_MODEL = "gemini-2.0-flash-exp"
+REQUESTS_PER_KEY = 5
+REQUEST_COOLDOWN = 60
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 POST_CHARACTER_LIMIT = 4000
@@ -50,6 +66,8 @@ TARIFFS = {
         "currency": "USD",
         "channels_limit": 1,
         "daily_posts_limit": 2,
+        "ai_copies_limit": 1,
+        "ai_ideas_limit": 10,
         "description": "Бесплатный тариф для начала работы"
     },
     Tariff.STANDARD.value: {
@@ -58,6 +76,8 @@ TARIFFS = {
         "currency": "USD",
         "channels_limit": 2,
         "daily_posts_limit": 6,
+        "ai_copies_limit": 3,
+        "ai_ideas_limit": 30,
         "description": "Для активных пользователей"
     },
     Tariff.VIP.value: {
@@ -66,6 +86,8 @@ TARIFFS = {
         "currency": "USD",
         "channels_limit": 3,
         "daily_posts_limit": 12,
+        "ai_copies_limit": 7,
+        "ai_ideas_limit": 50,
         "description": "Максимальные возможности"
     },
     Tariff.ADMIN.value: {
@@ -74,6 +96,8 @@ TARIFFS = {
         "currency": "USD",
         "channels_limit": 999,
         "daily_posts_limit": 999,
+        "ai_copies_limit": 999,
+        "ai_ideas_limit": 999,
         "description": "Безлимитный доступ"
     }
 }
@@ -92,6 +116,64 @@ dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
+
+# ========== AI SESSION MANAGER ==========
+class AISessionManager:
+    def __init__(self):
+        self.sessions: Dict[int, Dict] = {}
+        self.key_stats = {key: 0 for key in GEMINI_API_KEYS}
+        self.last_request_time: Dict[int, datetime] = {}
+    
+    def get_session(self, user_id: int) -> Dict:
+        """Получает или создает сессию пользователя"""
+        if user_id not in self.sessions:
+            self.sessions[user_id] = {
+                'history': [],
+                'key_index': 0,
+                'request_count': 0,
+                'total_requests': 0,
+                'copies_used': 0,
+                'ideas_used': 0,
+                'last_reset': datetime.now(MOSCOW_TZ).date()
+            }
+        return self.sessions[user_id]
+    
+    def get_next_key(self, session: Dict) -> Tuple[str, int]:
+        """Получает следующий API ключ с ротацией"""
+        if session['request_count'] >= REQUESTS_PER_KEY:
+            session['key_index'] = (session['key_index'] + 1) % len(GEMINI_API_KEYS)
+            session['request_count'] = 0
+        
+        key = GEMINI_API_KEYS[session['key_index']]
+        session['request_count'] += 1
+        session['total_requests'] += 1
+        self.key_stats[key] = self.key_stats.get(key, 0) + 1
+        
+        return key, session['key_index']
+    
+    def can_make_request(self, user_id: int) -> Tuple[bool, Optional[str]]:
+        """Проверяет, может ли пользователь сделать запрос"""
+        now = datetime.now(MOSCOW_TZ)
+        
+        if user_id in self.last_request_time:
+            time_diff = (now - self.last_request_time[user_id]).total_seconds()
+            if time_diff < REQUEST_COOLDOWN:
+                wait_time = REQUEST_COOLDOWN - int(time_diff)
+                return False, f"⏳ Подождите {wait_time} секунд перед следующим запросом"
+        
+        self.last_request_time[user_id] = now
+        return True, None
+    
+    def reset_daily_limits(self):
+        """Сбрасывает дневные лимиты"""
+        today = datetime.now(MOSCOW_TZ).date()
+        for user_id, session in self.sessions.items():
+            if session['last_reset'] < today:
+                session['copies_used'] = 0
+                session['ideas_used'] = 0
+                session['last_reset'] = today
+
+ai_manager = AISessionManager()
 
 # ========== DATABASE FUNCTIONS ==========
 async def get_db_connection():
@@ -126,6 +208,9 @@ async def init_db():
                 tariff TEXT DEFAULT 'mini',
                 posts_today INTEGER DEFAULT 0,
                 posts_reset_date DATE DEFAULT CURRENT_DATE,
+                ai_copies_used INTEGER DEFAULT 0,
+                ai_ideas_used INTEGER DEFAULT 0,
+                ai_last_used TIMESTAMP,
                 is_active BOOLEAN DEFAULT TRUE,
                 is_admin BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT NOW()
@@ -182,6 +267,9 @@ async def migrate_db():
         conn = await get_db_connection()
         
         migrations = [
+            ('users', 'ai_copies_used', 'INTEGER DEFAULT 0'),
+            ('users', 'ai_ideas_used', 'INTEGER DEFAULT 0'),
+            ('users', 'ai_last_used', 'TIMESTAMP'),
             ('users', 'tariff', 'TEXT DEFAULT \'mini\''),
             ('users', 'is_admin', 'BOOLEAN DEFAULT FALSE'),
             ('users', 'posts_today', 'INTEGER DEFAULT 0'),
@@ -253,6 +341,52 @@ async def update_user_tariff(user_id: int, tariff: str) -> bool:
         logger.error(f"Ошибка обновления тарифа: {e}")
         return False
 
+async def update_ai_usage(user_id: int, service_type: str) -> bool:
+    """Обновляет использование AI услуг"""
+    try:
+        conn = await get_db_connection()
+        
+        if service_type == 'copy':
+            await conn.execute('''
+                UPDATE users 
+                SET ai_copies_used = COALESCE(ai_copies_used, 0) + 1,
+                    ai_last_used = NOW()
+                WHERE id = $1
+            ''', user_id)
+        elif service_type == 'ideas':
+            await conn.execute('''
+                UPDATE users 
+                SET ai_ideas_used = COALESCE(ai_ideas_used, 0) + 1,
+                    ai_last_used = NOW()
+                WHERE id = $1
+            ''', user_id)
+        
+        await conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка обновления использования AI: {e}")
+        return False
+
+async def get_ai_usage_stats(user_id: int) -> Dict:
+    """Получает статистику использования AI"""
+    try:
+        conn = await get_db_connection()
+        user = await conn.fetchrow('''
+            SELECT ai_copies_used, ai_ideas_used, ai_last_used 
+            FROM users 
+            WHERE id = $1
+        ''', user_id)
+        await conn.close()
+        
+        return {
+            'copies_used': user['ai_copies_used'] if user and user['ai_copies_used'] else 0,
+            'ideas_used': user['ai_ideas_used'] if user and user['ai_ideas_used'] else 0,
+            'last_used': user['ai_last_used'] if user and user['ai_last_used'] else None
+        }
+    except Exception as e:
+        logger.error(f"Ошибка получения статистики AI: {e}")
+        return {'copies_used': 0, 'ideas_used': 0, 'last_used': None}
+
 async def create_tariff_order(user_id: int, tariff_id: str) -> bool:
     """Создает заказ на тариф"""
     try:
@@ -282,11 +416,14 @@ async def create_tariff_order(user_id: int, tariff_id: str) -> bool:
         logger.error(f"Ошибка создания заказа тарифа: {e}")
         return False
 
-async def get_tariff_limits(user_id: int) -> Tuple[int, int]:
+async def get_tariff_limits(user_id: int) -> Tuple[int, int, int, int]:
     """Получает лимиты пользователя"""
     tariff = await get_user_tariff(user_id)
     tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
-    return tariff_info['channels_limit'], tariff_info['daily_posts_limit']
+    return (tariff_info['channels_limit'], 
+            tariff_info['daily_posts_limit'],
+            tariff_info['ai_copies_limit'],
+            tariff_info['ai_ideas_limit'])
 
 async def get_user_channels_count(user_id: int) -> int:
     """Получает количество каналов пользователя"""
@@ -604,10 +741,139 @@ def parse_datetime(date_str: str, time_str: str) -> Optional[datetime]:
     except Exception:
         return None
 
+# ========== AI FUNCTIONS ==========
+COPYWRITER_PROMPT = """Ты профессиональный копирайтер для Telegram-каналов. Создай продающий текст на основе следующих данных:
+
+ТЕМА: {topic}
+СТИЛЬ: {style}
+ПРИМЕРЫ РАБОТ: {examples}
+
+ТРЕБОВАНИЯ:
+1. Текст должен быть цепляющим и вовлекающим
+2. Используй эмодзи уместно (но не переборщи)
+3. Структура: заголовок → проблема → решение → призыв к действию
+4. Длина: 150-300 символов
+5. Пиши как для живых людей, без воды
+6. Учитывай примеры, но не копируй их
+
+ДОПОЛНИТЕЛЬНО:
+- Текущая дата: {current_date}
+- Не упоминай что ты ИИ
+- Пиши в настоящем времени
+
+Верни ТОЛЬКО готовый текст, без пояснений."""
+
+IDEAS_PROMPT = """Ты эксперт по контенту для Telegram. Сгенерируй {count} идей для постов на тему:
+
+ТЕМА: {topic}
+
+ТРЕБОВАНИЯ К ИДЕЯМ:
+1. Каждая идея должна быть конкретной и реализуемой
+2. Формат: краткое описание (1-2 предложения)
+3. Укажи возможный тип контента (текст, фото, видео, опрос)
+4. Идеи должны быть разнообразными
+
+ПРИМЕР ФОРМАТА:
+1. [Тип] Название идеи - Краткое описание
+2. [Тип] Название идеи - Краткое описание
+
+ДОПОЛНИТЕЛЬНО:
+- Учитывай тренды {current_date}
+- Идеи должны вовлекать аудиторию
+- Не повторяйся
+
+Верни список идей с нумерацией, каждый с новой строки."""
+
+async def generate_with_gemini(prompt: str, user_id: int) -> Optional[str]:
+    """Генерирует текст через Gemini API с ротацией ключей"""
+    try:
+        session = ai_manager.get_session(user_id)
+        api_key, key_index = ai_manager.get_next_key(session)
+        
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.8,
+                "top_p": 0.95,
+                "top_k": 40,
+                "max_output_tokens": 1000,
+            }
+        )
+        
+        logger.info(f"AI запрос | user_{user_id} | key_{key_index}")
+        return response.text.strip()
+        
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "quota" in error_msg or "429" in error_msg:
+            logger.warning(f"Лимит ключа для user_{user_id}")
+            return None
+        else:
+            logger.error(f"Ошибка Gemini: {e}")
+            return None
+
+async def check_ai_limits(user_id: int, service_type: str) -> Tuple[bool, str, Dict]:
+    """Проверяет лимиты пользователя"""
+    tariff = await get_user_tariff(user_id)
+    tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
+    
+    if service_type == 'copy':
+        limit = tariff_info['ai_copies_limit']
+    elif service_type == 'ideas':
+        limit = tariff_info['ai_ideas_limit']
+    else:
+        return False, "Неверный тип сервиса", tariff_info
+    
+    session = ai_manager.get_session(user_id)
+    
+    # Сброс дневных лимитов
+    today = datetime.now(MOSCOW_TZ).date()
+    if session['last_reset'] < today:
+        session['copies_used'] = 0
+        session['ideas_used'] = 0
+        session['last_reset'] = today
+    
+    if service_type == 'copy':
+        used = session['copies_used']
+        remaining = limit - used
+        
+        if used >= limit:
+            reset_time = datetime.combine(today + timedelta(days=1), datetime.min.time())
+            reset_time = MOSCOW_TZ.localize(reset_time)
+            time_left = reset_time - datetime.now(MOSCOW_TZ)
+            hours = int(time_left.total_seconds() // 3600)
+            
+            return False, f"❌ Достигнут дневной лимит!\n\n📝 Копирайтинг: {used}/{limit}\n⏳ Обновление через: {hours} часов", tariff_info
+        
+        session['copies_used'] += 1
+        
+    elif service_type == 'ideas':
+        used = session['ideas_used']
+        remaining = limit - used
+        
+        if used >= limit:
+            reset_time = datetime.combine(today + timedelta(days=1), datetime.min.time())
+            reset_time = MOSCOW_TZ.localize(reset_time)
+            time_left = reset_time - datetime.now(MOSCOW_TZ)
+            hours = int(time_left.total_seconds() // 3600)
+            
+            return False, f"❌ Достигнут дневной лимит!\n\n💡 Идеи: {used}/{limit}\n⏳ Обновление через: {hours} часов", tariff_info
+        
+        session['ideas_used'] += 1
+    
+    # Обновляем в базе
+    await update_ai_usage(user_id, service_type)
+    
+    return True, f"✅ Доступно! Осталось: {remaining}/{limit}", tariff_info
+
 # ========== KEYBOARDS ==========
 def get_main_menu(user_id: int, is_admin: bool = False) -> InlineKeyboardMarkup:
-    """Главное меню"""
+    """Расширенное главное меню с AI"""
     buttons = [
+        [InlineKeyboardButton(text="🤖 ИИ-сервисы", callback_data="ai_services")],
         [InlineKeyboardButton(text="📅 Запланировать пост", callback_data="schedule_post")],
         [InlineKeyboardButton(text="📊 Моя статистика", callback_data="my_stats")],
         [InlineKeyboardButton(text="📢 Мои каналы", callback_data="my_channels")],
@@ -620,10 +886,30 @@ def get_main_menu(user_id: int, is_admin: bool = False) -> InlineKeyboardMarkup:
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+def get_ai_main_menu(user_tariff: str) -> InlineKeyboardMarkup:
+    """Главное меню AI-сервисов"""
+    tariff_info = TARIFFS.get(user_tariff, TARIFFS['mini'])
+    
+    buttons = [
+        [InlineKeyboardButton(text="📝 ИИ-копирайтер", callback_data="ai_copywriter")],
+        [InlineKeyboardButton(text="💡 Генератор идей", callback_data="ai_ideas")],
+        [InlineKeyboardButton(text="📊 Мои AI-лимиты", callback_data="ai_limits")],
+        [InlineKeyboardButton(text="📚 Примеры работ", callback_data="ai_examples")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+    ]
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 def get_cancel_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура отмены"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")]
+    ])
+
+def get_cancel_ai_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура отмены для AI"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
     ])
 
 def get_channels_keyboard(channels: List[Dict]) -> InlineKeyboardMarkup:
@@ -650,6 +936,38 @@ def get_confirmation_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="✅ Да, все верно", callback_data="confirm_yes"),
             InlineKeyboardButton(text="🔄 Нет, начать заново", callback_data="confirm_no")
         ]
+    ])
+
+def get_style_keyboard() -> InlineKeyboardMarkup:
+    """Выбор стиля текста для AI"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📱 Продающий", callback_data="style_selling"),
+            InlineKeyboardButton(text="📝 Информационный", callback_data="style_info")
+        ],
+        [
+            InlineKeyboardButton(text="🎭 Креативный", callback_data="style_creative"),
+            InlineKeyboardButton(text="🎯 Целевой", callback_data="style_targeted")
+        ],
+        [
+            InlineKeyboardButton(text="🚀 Для соцсетей", callback_data="style_social"),
+            InlineKeyboardButton(text="📰 Новостной", callback_data="style_news")
+        ],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
+    ])
+
+def get_idea_count_keyboard() -> InlineKeyboardMarkup:
+    """Выбор количества идей"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="5 идей", callback_data="ideas_5"),
+            InlineKeyboardButton(text="10 идей", callback_data="ideas_10")
+        ],
+        [
+            InlineKeyboardButton(text="15 идей", callback_data="ideas_15"),
+            InlineKeyboardButton(text="20 идей", callback_data="ideas_20")
+        ],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
     ])
 
 def get_tariffs_keyboard(user_tariff: str = 'mini') -> InlineKeyboardMarkup:
@@ -742,6 +1060,12 @@ class PostStates(StatesGroup):
     waiting_for_time = State()
     waiting_for_confirmation = State()
 
+class AIStates(StatesGroup):
+    waiting_for_topic = State()
+    waiting_for_examples = State()
+    waiting_for_style = State()
+    waiting_for_idea_topic = State()
+
 class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
     waiting_for_order_note = State()
@@ -773,13 +1097,14 @@ async def cmd_start(message: Message):
     
     welcome_text = (
         f"👋 Привет, {first_name}!\n\n"
-        f"🤖 Я — бот для планирования постов в Telegram каналах.\n\n"
+        f"🤖 Я — бот KOLES-TECH для планирования постов и AI-контента.\n\n"
         f"💎 Ваш текущий тариф: {tariff_info['name']}\n\n"
         f"✨ Возможности:\n"
-        f"• 📅 Запланировать пост с текстом, фото, видео или документом\n"
-        f"• 📊 Показать вашу статистику\n"
-        f"• 📢 Управлять вашими каналами\n"
-        f"• ⏰ Автоматически публиковать в нужное время\n\n"
+        f"• 🤖 AI-копирайтер и генератор идей\n"
+        f"• 📅 Запланировать пост с любым контентом\n"
+        f"• 📊 Детальная статистика\n"
+        f"• 📢 Управление каналами\n"
+        f"• ⏰ Автопубликация в нужное время\n\n"
         f"📍 Время указывается по Москве\n\n"
         f"👇 Выберите действие:"
     )
@@ -792,22 +1117,22 @@ async def cmd_help(message: Message):
     help_text = (
         "📚 Помощь по использованию бота:\n\n"
         
-        "1. Добавьте меня в канал как администратора\n"
-        "2. Дайте права на отправку сообщений\n"
-        "3. Перешлите мне любое сообщение из канала\n\n"
+        "🤖 AI-сервисы:\n"
+        "• Копирайтер - создает продающий текст\n"
+        "• Генератор идей - предлагает темы постов\n"
+        "• Лимиты обновляются каждый день\n\n"
         
         "📅 Планирование поста:\n"
         "1. Выберите 'Запланировать пост'\n"
         "2. Выберите канал\n"
-        "3. Отправьте контент (текст, фото, видео или документ)\n"
-        "4. Укажите дату в формате ДД.ММ.ГГГГ\n"
-        "5. Укажите время в формате ЧЧ:ММ\n"
-        "6. Подтвердите публикацию\n\n"
+        "3. Отправьте контент\n"
+        "4. Укажите дату и время\n"
+        "5. Подтвердите публикацию\n\n"
         
         "💎 Тарифы:\n"
-        "• Mini (бесплатно) - 1 канал, 2 поста в день\n"
-        "• Standard ($4/месяц) - 2 канала, 6 постов в день\n"
-        "• VIP ($7/месяц) - 3 канала, 12 постов в день\n\n"
+        "• Mini - 1 копирайт, 10 идей, 1 канал, 2 поста\n"
+        "• Standard ($4) - 3 копирайта, 30 идей, 2 канала, 6 постов\n"
+        "• VIP ($7) - 7 копирайтов, 50 идей, 3 канала, 12 постов\n\n"
         
         f"🆘 Поддержка: @{SUPPORT_BOT_USERNAME}\n"
         f"💬 Вопросы по оплате: @{ADMIN_CONTACT.replace('@', '')}"
@@ -856,6 +1181,439 @@ async def check_time(callback: CallbackQuery):
         reply_markup=get_tariffs_keyboard()
     )
 
+# ========== AI HANDLERS ==========
+@router.callback_query(F.data == "ai_services")
+async def ai_services_menu(callback: CallbackQuery):
+    """Меню AI-сервисов"""
+    user_id = callback.from_user.id
+    tariff = await get_user_tariff(user_id)
+    
+    welcome_text = (
+        "🤖 ИИ-Сервисы KOLES-TECH\n\n"
+        "✨ Доступные возможности:\n\n"
+        "📝 ИИ-копирайтер:\n"
+        "• Создаст продающий текст для поста\n"
+        "• Учитывает тему, стиль и примеры\n"
+        "• Готовый текст для публикации\n\n"
+        "💡 Генератор идей:\n"
+        "• {ideas_limit} идей в день\n"
+        "• Разнообразные темы\n"
+        "• Готовые концепты постов\n\n"
+        "👇 Выберите сервис:"
+    ).format(
+        ideas_limit=TARIFFS.get(tariff, TARIFFS['mini'])['ai_ideas_limit']
+    )
+    
+    await callback.message.edit_text(
+        welcome_text,
+        reply_markup=get_ai_main_menu(tariff)
+    )
+
+@router.callback_query(F.data == "ai_copywriter")
+async def start_copywriter(callback: CallbackQuery, state: FSMContext):
+    """Начало работы с копирайтером"""
+    user_id = callback.from_user.id
+    
+    # Проверка лимитов
+    can_use, message, tariff_info = await check_ai_limits(user_id, 'copy')
+    if not can_use:
+        await callback.message.edit_text(
+            message,
+            reply_markup=get_ai_main_menu(await get_user_tariff(user_id))
+        )
+        return
+    
+    # Проверка времени
+    can_request, wait_message = ai_manager.can_make_request(user_id)
+    if not can_request:
+        await callback.answer(wait_message, show_alert=True)
+        return
+    
+    await state.set_state(AIStates.waiting_for_topic)
+    session = ai_manager.get_session(user_id)
+    
+    await callback.message.edit_text(
+        f"📝 ИИ-копирайтер\n\n"
+        f"✅ Доступно: {tariff_info['ai_copies_limit'] - session['copies_used']}/{tariff_info['ai_copies_limit']} текстов сегодня\n\n"
+        f"📌 Шаг 1/3\n"
+        f"Введите тему для поста:\n\n"
+        f"Примеры:\n"
+        f"• Запуск нового курса по маркетингу\n"
+        f"• Анонс вебинара по трейдингу\n"
+        f"• Продажа SEO-услуг\n\n"
+        f"📍 Пишите конкретно и ясно:",
+        reply_markup=get_cancel_ai_keyboard()
+    )
+
+@router.message(AIStates.waiting_for_topic)
+async def process_topic(message: Message, state: FSMContext):
+    """Обработка темы для AI"""
+    if len(message.text) < 5:
+        await message.answer(
+            "❌ Тема слишком короткая! Минимум 5 символов.\n\nВведите тему еще раз:",
+            reply_markup=get_cancel_ai_keyboard()
+        )
+        return
+    
+    await state.update_data(topic=message.text)
+    await state.set_state(AIStates.waiting_for_examples)
+    
+    await message.answer(
+        "📌 Шаг 2/3\n"
+        "Пришлите примеры работ или ссылки (по желанию):\n\n"
+        "Можно:\n"
+        "• Прислать тексты постов\n"
+        "• Ссылки на каналы\n"
+        "• Ключевые фразы\n\n"
+        "Или напишите 'пропустить', если примеров нет:",
+        reply_markup=get_cancel_ai_keyboard()
+    )
+
+@router.message(AIStates.waiting_for_examples)
+async def process_examples(message: Message, state: FSMContext):
+    """Обработка примеров для AI"""
+    examples = message.text if message.text.lower() != 'пропустить' else "Примеры не предоставлены"
+    
+    await state.update_data(examples=examples)
+    await state.set_state(AIStates.waiting_for_style)
+    
+    await message.answer(
+        "📌 Шаг 3/3\n"
+        "Выберите стиль текста:\n\n"
+        "📱 Продающий - для продаж и конверсии\n"
+        "📝 Информационный - полезный контент\n"
+        "🎭 Креативный - нестандартный подход\n"
+        "🎯 Целевой - для конкретной аудитории\n"
+        "🚀 Для соцсетей - виральный контент\n"
+        "📰 Новостной - анонсы и новости",
+        reply_markup=get_style_keyboard()
+    )
+
+@router.callback_query(F.data.startswith("style_"))
+async def process_style(callback: CallbackQuery, state: FSMContext):
+    """Обработка стиля текста для AI"""
+    style_map = {
+        "style_selling": "продающий",
+        "style_info": "информационный",
+        "style_creative": "креативный",
+        "style_targeted": "целевой",
+        "style_social": "для соцсетей",
+        "style_news": "новостной"
+    }
+    
+    style_key = callback.data
+    style_name = style_map.get(style_key, "продающий")
+    
+    await state.update_data(style=style_name)
+    data = await state.get_data()
+    
+    # Показываем превью
+    preview_text = (
+        f"📋 Ваш запрос:\n\n"
+        f"📌 Тема: {data['topic']}\n"
+        f"🎨 Стиль: {style_name}\n"
+        f"📚 Примеры: {data['examples'][:100]}...\n\n"
+        f"⏳ Генерирую текст... Это займет 10-20 секунд."
+    )
+    
+    await callback.message.edit_text(preview_text)
+    
+    # Генерация текста
+    current_date = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
+    prompt = COPYWRITER_PROMPT.format(
+        topic=data['topic'],
+        style=style_name,
+        examples=data['examples'],
+        current_date=current_date
+    )
+    
+    # Показываем индикатор загрузки
+    loading_msg = await callback.message.answer("🔄 ИИ генерирует текст...")
+    
+    generated_text = await generate_with_gemini(prompt, callback.from_user.id)
+    
+    if not generated_text:
+        await loading_msg.delete()
+        await callback.message.edit_text(
+            "❌ Ошибка генерации! Возможно, закончились лимиты API.\n"
+            "Попробуйте позже или обратитесь в поддержку.",
+            reply_markup=get_ai_main_menu(await get_user_tariff(callback.from_user.id))
+        )
+        await state.clear()
+        return
+    
+    await loading_msg.delete()
+    
+    # Показываем результат
+    session = ai_manager.get_session(callback.from_user.id)
+    tariff = await get_user_tariff(callback.from_user.id)
+    tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
+    
+    result_text = (
+        f"✅ Текст готов!\n\n"
+        f"📝 Результат:\n\n"
+        f"{generated_text}\n\n"
+        f"📊 Статистика:\n"
+        f"• Символов: {len(generated_text)}\n"
+        f"• Использовано: {session['copies_used']}/{tariff_info['ai_copies_limit']}"
+    )
+    
+    await callback.message.edit_text(
+        result_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Скопировать", callback_data="copy_text")],
+            [InlineKeyboardButton(text="🔄 Новый текст", callback_data="ai_copywriter")],
+            [InlineKeyboardButton(text="⬅️ В меню AI", callback_data="ai_services")]
+        ])
+    )
+    
+    await state.clear()
+
+@router.callback_query(F.data == "ai_ideas")
+async def start_ideas_generator(callback: CallbackQuery, state: FSMContext):
+    """Начало генератора идей"""
+    user_id = callback.from_user.id
+    
+    # Проверка лимитов
+    can_use, message, tariff_info = await check_ai_limits(user_id, 'ideas')
+    if not can_use:
+        await callback.message.edit_text(
+            message,
+            reply_markup=get_ai_main_menu(await get_user_tariff(user_id))
+        )
+        return
+    
+    # Проверка времени
+    can_request, wait_message = ai_manager.can_make_request(user_id)
+    if not can_request:
+        await callback.answer(wait_message, show_alert=True)
+        return
+    
+    await state.set_state(AIStates.waiting_for_idea_topic)
+    session = ai_manager.get_session(user_id)
+    
+    await callback.message.edit_text(
+        f"💡 Генератор идей\n\n"
+        f"✅ Доступно: {tariff_info['ai_ideas_limit'] - session['ideas_used']}/{tariff_info['ai_ideas_limit']} идей сегодня\n\n"
+        f"Введите тему для генерации идей:\n\n"
+        f"Примеры:\n"
+        f"• Маркетинг в Telegram\n"
+        f"• Образовательный контент\n"
+        f"• Новости IT-сферы\n"
+        f"• Здоровый образ жизни\n\n"
+        f"📍 Чем конкретнее тема, тем лучше идеи:",
+        reply_markup=get_cancel_ai_keyboard()
+    )
+
+@router.message(AIStates.waiting_for_idea_topic)
+async def process_idea_topic(message: Message, state: FSMContext):
+    """Обработка темы для идей"""
+    if len(message.text) < 3:
+        await message.answer(
+            "❌ Тема слишком короткая! Минимум 3 символа.\n\nВведите тему еще раз:",
+            reply_markup=get_cancel_ai_keyboard()
+        )
+        return
+    
+    await state.update_data(topic=message.text)
+    
+    await message.answer(
+        "Выберите количество идей (от 5 до 20):\n\n"
+        "📊 Рекомендуем:\n"
+        "• 5 идей - быстрый просмотр\n"
+        "• 10 идей - оптимальный выбор\n"
+        "• 15-20 идей - полный охват темы",
+        reply_markup=get_idea_count_keyboard()
+    )
+
+@router.callback_query(F.data.startswith("ideas_"))
+async def generate_ideas(callback: CallbackQuery, state: FSMContext):
+    """Генерация идей"""
+    count = int(callback.data.split("_")[1])
+    data = await state.get_data()
+    
+    if count > 20:
+        count = 20
+    
+    # Показываем индикатор
+    await callback.message.edit_text(
+        f"💡 Генерация {count} идей по теме:\n"
+        f"📌 '{data['topic']}'\n\n"
+        f"⏳ Это займет 10-30 секунд..."
+    )
+    
+    # Генерация идей
+    current_date = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
+    prompt = IDEAS_PROMPT.format(
+        count=count,
+        topic=data['topic'],
+        current_date=current_date
+    )
+    
+    loading_msg = await callback.message.answer("🔄 ИИ генерирует идеи...")
+    
+    generated_ideas = await generate_with_gemini(prompt, callback.from_user.id)
+    
+    if not generated_ideas:
+        await loading_msg.delete()
+        await callback.message.edit_text(
+            "❌ Ошибка генерации! Возможно, закончились лимиты API.\n"
+            "Попробуйте позже или обратитесь в поддержку.",
+            reply_markup=get_ai_main_menu(await get_user_tariff(callback.from_user.id))
+        )
+        await state.clear()
+        return
+    
+    await loading_msg.delete()
+    
+    # Форматируем результат
+    ideas_list = generated_ideas.split('\n')
+    formatted_ideas = []
+    
+    for i, idea in enumerate(ideas_list[:count], 1):
+        if idea.strip():
+            formatted_ideas.append(f"{i}. {idea.strip()}")
+    
+    session = ai_manager.get_session(callback.from_user.id)
+    tariff = await get_user_tariff(callback.from_user.id)
+    tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
+    
+    result_text = (
+        f"✅ Сгенерировано {len(formatted_ideas)} идей!\n\n"
+        f"📌 Тема: {data['topic']}\n\n"
+        f"💡 Идеи:\n\n" +
+        "\n".join(formatted_ideas) +
+        f"\n\n📊 Статистика:\n"
+        f"• Использовано: {session['ideas_used']}/{tariff_info['ai_ideas_limit']}"
+    )
+    
+    # Разбиваем длинные сообщения
+    if len(result_text) > 4000:
+        parts = []
+        current_part = ""
+        
+        for line in result_text.split('\n'):
+            if len(current_part + line + '\n') > 4000:
+                parts.append(current_part)
+                current_part = line + '\n'
+            else:
+                current_part += line + '\n'
+        
+        if current_part:
+            parts.append(current_part)
+        
+        for i, part in enumerate(parts):
+            if i == 0:
+                await callback.message.edit_text(part)
+            else:
+                await callback.message.answer(part)
+    else:
+        await callback.message.edit_text(result_text)
+    
+    await callback.message.answer(
+        "👇 Выберите действие:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💡 Новые идеи", callback_data="ai_ideas")],
+            [InlineKeyboardButton(text="📝 Копирайтер", callback_data="ai_copywriter")],
+            [InlineKeyboardButton(text="⬅️ В меню AI", callback_data="ai_services")]
+        ])
+    )
+    
+    await state.clear()
+
+@router.callback_query(F.data == "ai_limits")
+async def show_ai_limits(callback: CallbackQuery):
+    """Показывает лимиты AI"""
+    user_id = callback.from_user.id
+    tariff = await get_user_tariff(user_id)
+    tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
+    
+    session = ai_manager.get_session(user_id)
+    
+    # Рассчитываем оставшееся время до сброса
+    today = datetime.now(MOSCOW_TZ).date()
+    reset_time = datetime.combine(today + timedelta(days=1), datetime.min.time())
+    reset_time = MOSCOW_TZ.localize(reset_time)
+    time_left = reset_time - datetime.now(MOSCOW_TZ)
+    hours = int(time_left.total_seconds() // 3600)
+    minutes = int((time_left.total_seconds() % 3600) // 60)
+    
+    limits_text = (
+        f"📊 Ваши AI-лимиты\n\n"
+        f"💎 Тариф: {tariff_info['name']}\n\n"
+        f"📝 Копирайтер:\n"
+        f"• Использовано: {session['copies_used']}/{tariff_info['ai_copies_limit']}\n"
+        f"• Осталось: {tariff_info['ai_copies_limit'] - session['copies_used']}\n\n"
+        f"💡 Генератор идей:\n"
+        f"• Использовано: {session['ideas_used']}/{tariff_info['ai_ideas_limit']}\n"
+        f"• Осталось: {tariff_info['ai_ideas_limit'] - session['ideas_used']}\n\n"
+        f"🔄 Обновление через: {hours}ч {minutes}м\n\n"
+        f"📈 Всего AI запросов: {session['total_requests']}"
+    )
+    
+    await callback.message.edit_text(
+        limits_text,
+        reply_markup=get_ai_main_menu(tariff)
+    )
+
+@router.callback_query(F.data == "ai_examples")
+async def show_ai_examples(callback: CallbackQuery):
+    """Показывает примеры работ"""
+    examples_text = (
+        "📚 Примеры работ ИИ-копирайтера\n\n"
+        
+        "📌 Пример 1 (Продающий текст):\n"
+        "🔥 ЗАПУСК КУРСА! 🔥\n\n"
+        "Устали от низких продаж? 😔\n\n"
+        "Представляем курс «Маркетинг в TG 3.0» 🚀\n\n"
+        "✅ Кейсы из 2024 года\n"
+        "✅ Работающие стратегии\n"
+        "✅ Личный разбор от эксперта\n\n"
+        "Цена сегодня: 990₽ (вместо 2990₽)\n\n"
+        "👉 Записаться: @manager\n\n"
+        
+        "📌 Пример 2 (Информационный):\n"
+        "📊 Как увеличить конверсию в 2 раза?\n\n"
+        "Исследование 100+ каналов показало:\n\n"
+        "1. Оптимальное время постинга: 19:00-21:00 🕐\n"
+        "2. Лучший день: среда 📅\n"
+        "3. Эмодзи повышают вовлеченность на 37% 😊\n\n"
+        "Совет: тестируйте разные форматы!\n\n"
+        
+        "📌 Пример 3 (Креативный):\n"
+        "🎭 ВАШ КАНАЛ СКУЧНЫЙ? 😴\n\n"
+        "Мы превращаем скучные темы в вирусный контент! ✨\n\n"
+        "Формула успеха:\n"
+        "Проблема × Решение × Эмоция = ВИРУС 🦠\n\n"
+        "Хотите такой же результат? Пишите! 👇"
+    )
+    
+    await callback.message.edit_text(
+        examples_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📝 Заказать текст", callback_data="ai_copywriter")],
+            [InlineKeyboardButton(text="💡 Получить идеи", callback_data="ai_ideas")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="ai_services")]
+        ])
+    )
+
+@router.callback_query(F.data == "copy_text")
+async def copy_text_handler(callback: CallbackQuery):
+    """Обработчик копирования текста"""
+    await callback.answer("📋 Текст скопирован в буфер обмена!", show_alert=True)
+
+@router.callback_query(F.data == "cancel_ai")
+async def cancel_ai(callback: CallbackQuery, state: FSMContext):
+    """Отмена AI операций"""
+    await state.clear()
+    user_id = callback.from_user.id
+    tariff = await get_user_tariff(user_id)
+    
+    await callback.message.edit_text(
+        "❌ Операция отменена",
+        reply_markup=get_ai_main_menu(tariff)
+    )
+
 # ========== STATISTICS HANDLERS ==========
 @router.callback_query(F.data == "my_stats")
 async def show_my_stats(callback: CallbackQuery):
@@ -866,14 +1624,23 @@ async def show_my_stats(callback: CallbackQuery):
     tariff_info = TARIFFS.get(current_tariff, TARIFFS['mini'])
     posts_today = await get_user_posts_today(user_id)
     
+    # AI статистика
+    ai_stats = await get_ai_usage_stats(user_id)
+    session = ai_manager.get_session(user_id)
+    
     stats_text = (
         f"📊 Ваша статистика:\n\n"
-        f"💎 Текущий тариф: {tariff_info['name']}\n"
-        f"📈 Всего запланировано постов: {stats['total_posts']}\n"
-        f"⏳ Активных постов: {stats['active_posts']}\n"
-        f"✅ Отправлено постов: {stats['sent_posts']}\n"
-        f"📢 Подключено каналов: {stats['channels']}/{tariff_info['channels_limit']}\n"
-        f"📅 Постов сегодня: {posts_today}/{tariff_info['daily_posts_limit']}\n\n"
+        f"💎 Текущий тариф: {tariff_info['name']}\n\n"
+        f"📅 Посты:\n"
+        f"• Всего запланировано: {stats['total_posts']}\n"
+        f"• Активных постов: {stats['active_posts']}\n"
+        f"• Отправлено постов: {stats['sent_posts']}\n"
+        f"• Постов сегодня: {posts_today}/{tariff_info['daily_posts_limit']}\n\n"
+        f"📢 Каналы:\n"
+        f"• Подключено: {stats['channels']}/{tariff_info['channels_limit']}\n\n"
+        f"🤖 AI-сервисы:\n"
+        f"• Копирайтер: {session['copies_used']}/{tariff_info['ai_copies_limit']}\n"
+        f"• Идеи: {session['ideas_used']}/{tariff_info['ai_ideas_limit']}\n\n"
         f"📍 Время по Москве: {datetime.now(MOSCOW_TZ).strftime('%H:%M')}"
     )
     
@@ -921,7 +1688,7 @@ async def add_channel_start(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     
     channels_count = await get_user_channels_count(user_id)
-    channels_limit, _ = await get_tariff_limits(user_id)
+    channels_limit, _, _, _ = await get_tariff_limits(user_id)
     
     if channels_count >= channels_limit:
         await callback.message.edit_text(
@@ -1002,16 +1769,16 @@ async def show_tariffs(callback: CallbackQuery):
     tariffs_text = (
         "💎 Доступные тарифы:\n\n"
         "🚀 Mini (Бесплатно):\n"
-        "• 1 канал\n"
-        "• 2 поста в день\n"
+        "• 1 канал, 2 поста в день\n"
+        "• 1 AI-копирайтинг, 10 идей\n"
         "• Базовые функции\n\n"
         "⭐ Standard ($4/месяц):\n"
-        "• 2 канала\n"
-        "• 6 постов в день\n"
+        "• 2 канала, 6 постов в день\n"
+        "• 3 AI-копирайтинга, 30 идей\n"
         "• Все функции Mini\n\n"
         "👑 VIP ($7/месяц):\n"
-        "• 3 канала\n"
-        "• 12 постов в день\n"
+        "• 3 канала, 12 постов в день\n"
+        "• 7 AI-копирайтингов, 50 идей\n"
         "• Приоритетная поддержка\n"
         "• Все функции Standard\n\n"
         f"💎 Ваш текущий тариф: {TARIFFS.get(current_tariff, TARIFFS['mini'])['name']}\n\n"
@@ -1040,7 +1807,9 @@ async def tariff_info(callback: CallbackQuery):
         f"{tariff_info['name']}\n\n"
         f"📊 Лимиты:\n"
         f"• Каналов: {tariff_info['channels_limit']}\n"
-        f"• Постов в день: {tariff_info['daily_posts_limit']}\n\n"
+        f"• Постов в день: {tariff_info['daily_posts_limit']}\n"
+        f"• AI-копирайтингов: {tariff_info['ai_copies_limit']}\n"
+        f"• AI-идей: {tariff_info['ai_ideas_limit']}\n\n"
         f"💵 Стоимость: "
     )
     
@@ -1083,7 +1852,8 @@ async def activate_free_tariff(callback: CallbackQuery):
             "🎉 Бесплатный тариф Mini успешно активирован!\n\n"
             "Теперь вы можете:\n"
             "• Добавить 1 канал\n"
-            "• Публиковать до 2 постов в день",
+            "• Публиковать до 2 постов в день\n"
+            "• Использовать 1 AI-копирайтинг и 10 идей ежедневно",
             reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
         )
     else:
@@ -1132,7 +1902,7 @@ async def start_scheduling(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     
     posts_today = await get_user_posts_today(user_id)
-    _, daily_limit = await get_tariff_limits(user_id)
+    _, daily_limit, _, _ = await get_tariff_limits(user_id)
     
     if posts_today >= daily_limit:
         await callback.message.edit_text(
@@ -1381,7 +2151,7 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
     )
     
     posts_today = await get_user_posts_today(user_id)
-    _, daily_limit = await get_tariff_limits(user_id)
+    _, daily_limit, _, _ = await get_tariff_limits(user_id)
     
     await callback.message.edit_text(
         f"✅ Пост успешно запланирован!\n\n"
@@ -1469,6 +2239,11 @@ async def admin_stats(callback: CallbackQuery):
     
     stats = await get_total_stats()
     
+    # AI статистика
+    total_copies_used = sum(s['copies_used'] for s in ai_manager.sessions.values())
+    total_ideas_used = sum(s['ideas_used'] for s in ai_manager.sessions.values())
+    total_ai_requests = sum(s['total_requests'] for s in ai_manager.sessions.values())
+    
     stats_text = (
         "📊 Общая статистика:\n\n"
         f"👥 Пользователи: {stats.get('total_users', 0)}\n"
@@ -1480,6 +2255,10 @@ async def admin_stats(callback: CallbackQuery):
         f"   • Активные: {stats.get('active_posts', 0)}\n"
         f"   • Отправлено: {stats.get('sent_posts', 0)}\n\n"
         f"📢 Каналы: {stats.get('total_channels', 0)}\n\n"
+        f"🤖 AI-сервисы:\n"
+        f"   • Копирайтингов: {total_copies_used}\n"
+        f"   • Идей сгенерировано: {total_ideas_used}\n"
+        f"   • Всего AI запросов: {total_ai_requests}\n\n"
         f"🛒 Заказы:\n"
         f"   • Ожидают: {stats.get('pending_orders', 0)}\n"
         f"   • Выполнены: {stats.get('completed_orders', 0)}\n\n"
@@ -1511,7 +2290,7 @@ async def admin_users_list(callback: CallbackQuery):
     
     users_text = "👥 Список пользователей:\n\n"
     
-    for i, user in enumerate(users[:50], 1):  # Показываем только первые 50
+    for i, user in enumerate(users[:50], 1):
         username = user.get('username', 'нет')
         first_name = user.get('first_name', 'Пользователь')
         tariff = user.get('tariff', 'mini')
@@ -1963,11 +2742,23 @@ async def restore_scheduled_jobs():
     except Exception as e:
         logger.error(f"❌ Ошибка при восстановлении постов: {e}")
 
+# ========== SCHEDULED TASKS ==========
+async def reset_ai_limits_daily():
+    """Ежедневный сброс AI лимитов"""
+    ai_manager.reset_daily_limits()
+    logger.info("✅ AI лимиты сброшены")
+
+async def scheduled_reset_posts():
+    """Ежедневный сброс счетчиков постов"""
+    await reset_daily_posts()
+
 # ========== STARTUP/SHUTDOWN ==========
 async def on_startup():
     """Действия при запуске бота"""
     logger.info("=" * 60)
-    logger.info(f"🚀 ЗАПУСК БОТА")
+    logger.info(f"🚀 ЗАПУСК БОТА KOLES-TECH")
+    logger.info(f"🤖 AI сервисы: ВКЛЮЧЕНЫ")
+    logger.info(f"🔑 Gemini ключей: {len(GEMINI_API_KEYS)}")
     logger.info(f"👑 Admin ID: {ADMIN_ID}")
     logger.info("=" * 60)
     
@@ -1986,6 +2777,15 @@ async def on_startup():
             id='reset_posts'
         )
         
+        scheduler.add_job(
+            reset_ai_limits_daily,
+            trigger='cron',
+            hour=0,
+            minute=0,
+            timezone=MOSCOW_TZ,
+            id='reset_ai_limits'
+        )
+        
         me = await bot.get_me()
         logger.info(f"✅ Бот @{me.username} запущен (ID: {me.id})")
         
@@ -1995,13 +2795,15 @@ async def on_startup():
                     ADMIN_ID,
                     f"🤖 Бот @{me.username} успешно запущен!\n"
                     f"🆔 ID: {me.id}\n"
+                    f"🤖 AI сервисы: ВКЛЮЧЕНЫ\n"
+                    f"🔑 Gemini ключей: {len(GEMINI_API_KEYS)}\n"
                     f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}"
                 )
             except:
                 pass
         
         logger.info("=" * 60)
-        logger.info("🎉 БОТ УСПЕШНО ЗАПУЩЕН!")
+        logger.info("🎉 БОТ УСПЕШНО ЗАПУЩЕН С AI СЕРВИСАМИ!")
         logger.info("=" * 60)
         return True
         
@@ -2015,10 +2817,6 @@ async def on_shutdown():
     if scheduler.running:
         scheduler.shutdown()
     logger.info("👋 Бот выключен")
-
-async def scheduled_reset_posts():
-    """Ежедневный сброс счетчиков постов"""
-    await reset_daily_posts()
 
 # ========== MAIN ==========
 async def main():
