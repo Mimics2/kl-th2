@@ -76,6 +76,30 @@ TARIFFS = {
     }
 }
 
+# ========== PAYMENT SYSTEM ==========
+async def check_crypto_payment(user_id: int, amount: float, currency: str = "USD") -> bool:
+    """Проверяет оплату через CryptoBot (заглушка для демо)"""
+    # В реальной реализации здесь будет интеграция с CryptoBot API
+    # Для демо-версии просто возвращаем True
+    logger.info(f"💳 Проверка оплаты для пользователя {user_id}: {amount} {currency}")
+    return True
+
+async def create_crypto_invoice(user_id: int, tariff_id: str) -> Optional[str]:
+    """Создает счет в CryptoBot (заглушка для демо)"""
+    tariff_info = TARIFFS.get(tariff_id)
+    if not tariff_info:
+        return None
+    
+    if tariff_info['price'] == 0:
+        return "free"
+    
+    # В реальной реализации здесь будет вызов CryptoBot API
+    # Для демо-версии возвращаем ссылку на демо-оплату
+    invoice_url = f"https://t.me/{CRYPTO_BOT_USERNAME}?start=invoice_{tariff_id}_{user_id}"
+    
+    logger.info(f"📄 Создан счет для пользователя {user_id} на тариф {tariff_id}")
+    return invoice_url
+
 # ========== SETUP ==========
 logging.basicConfig(
     level=logging.INFO,
@@ -99,11 +123,14 @@ async def get_db_connection():
     """Создает соединение с базой данных"""
     try:
         if DATABASE_URL:
-            if "postgresql://" in DATABASE_URL and "sslmode" not in DATABASE_URL:
+            # Проверяем и корректируем строку подключения для Railway
+            if DATABASE_URL.startswith("postgresql://") and "sslmode" not in DATABASE_URL:
                 conn_string = DATABASE_URL + "?sslmode=require"
             else:
                 conn_string = DATABASE_URL
-            return await asyncpg.connect(conn_string)
+            
+            # Устанавливаем timeout
+            return await asyncpg.connect(conn_string, timeout=30)
     except Exception as e:
         logger.error(f"Ошибка подключения к БД: {e}")
         raise
@@ -176,6 +203,8 @@ async def init_db():
                 INSERT INTO users (id, username, first_name, tariff, is_admin)
                 VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (id) DO UPDATE SET
+                username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
                 tariff = EXCLUDED.tariff,
                 is_admin = EXCLUDED.is_admin
             ''', ADMIN_ID, 'admin', 'Администратор', 'admin', True)
@@ -185,6 +214,40 @@ async def init_db():
         
     except Exception as e:
         logger.error(f"❌ Ошибка инициализации БД: {e}")
+        raise
+
+async def migrate_db():
+    """Миграция существующей базы данных"""
+    try:
+        conn = await get_db_connection()
+        
+        # Проверяем существование колонки tariff в таблице users
+        try:
+            await conn.fetchval("SELECT tariff FROM users LIMIT 1")
+            logger.info("✅ Колонка tariff уже существует")
+        except asyncpg.UndefinedColumnError:
+            logger.info("🔧 Добавляем колонку tariff в таблицу users...")
+            await conn.execute('ALTER TABLE users ADD COLUMN tariff TEXT DEFAULT \'mini\'')
+            logger.info("✅ Колонка tariff добавлена")
+        
+        # Проверяем существование колонки is_admin
+        try:
+            await conn.fetchval("SELECT is_admin FROM users LIMIT 1")
+            logger.info("✅ Колонка is_admin уже существует")
+        except asyncpg.UndefinedColumnError:
+            logger.info("🔧 Добавляем колонку is_admin в таблицу users...")
+            await conn.execute('ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT FALSE')
+            logger.info("✅ Колонка is_admin добавлена")
+            
+            # Обновляем админа
+            if ADMIN_ID > 0:
+                await conn.execute('UPDATE users SET is_admin = TRUE WHERE id = $1', ADMIN_ID)
+        
+        await conn.close()
+        logger.info("✅ Миграция базы данных завершена")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка миграции БД: {e}")
         raise
 
 async def get_user_tariff(user_id: int) -> str:
@@ -207,10 +270,10 @@ async def get_user_tariff(user_id: int) -> str:
             return 'mini'
         
         # Админ всегда имеет тариф admin
-        if user['is_admin']:
+        if user.get('is_admin'):
             return 'admin'
             
-        return user['tariff']
+        return user.get('tariff', 'mini')
     except Exception as e:
         logger.error(f"Ошибка получения тарифа: {e}")
         return 'mini'
@@ -226,6 +289,44 @@ async def update_user_tariff(user_id: int, tariff: str) -> bool:
         return True
     except Exception as e:
         logger.error(f"Ошибка обновления тарифа: {e}")
+        return False
+
+async def process_payment(user_id: int, tariff_id: str) -> bool:
+    """Обработка оплаты тарифа"""
+    tariff_info = TARIFFS.get(tariff_id)
+    if not tariff_info:
+        return False
+    
+    try:
+        # Проверяем оплату
+        payment_success = await check_crypto_payment(user_id, tariff_info['price'], tariff_info['currency'])
+        
+        if payment_success:
+            # Обновляем тариф
+            success = await update_user_tariff(user_id, tariff_id)
+            
+            if success:
+                # Сохраняем информацию о платеже
+                conn = await get_db_connection()
+                await conn.execute('''
+                    INSERT INTO payments (user_id, tariff, amount, currency, status, expires_at)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                ''', 
+                user_id, 
+                tariff_id,
+                tariff_info['price'],
+                tariff_info['currency'],
+                'completed',
+                datetime.now(pytz.UTC) + timedelta(days=30)  # Тариф на 30 дней
+                )
+                await conn.close()
+                
+                logger.info(f"💳 Платеж обработан: пользователь {user_id} -> тариф {tariff_id}")
+                return True
+        
+        return False
+    except Exception as e:
+        logger.error(f"Ошибка обработки платежа: {e}")
         return False
 
 async def get_tariff_limits(user_id: int) -> Tuple[int, int]:
@@ -459,6 +560,9 @@ async def get_total_stats() -> Dict:
         
         total_channels = await conn.fetchval("SELECT COUNT(*) FROM channels WHERE is_active = TRUE") or 0
         
+        # Статистика платежей
+        total_revenue = await conn.fetchval("SELECT SUM(amount) FROM payments WHERE status = 'completed'") or 0
+        
         await conn.close()
         
         return {
@@ -469,7 +573,8 @@ async def get_total_stats() -> Dict:
             'total_posts': total_posts,
             'active_posts': active_posts,
             'sent_posts': sent_posts,
-            'total_channels': total_channels
+            'total_channels': total_channels,
+            'total_revenue': total_revenue
         }
     except Exception as e:
         logger.error(f"Ошибка получения общей статистики: {e}")
@@ -603,12 +708,31 @@ def get_tariffs_keyboard(user_tariff: str = 'mini') -> InlineKeyboardMarkup:
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+def get_tariff_payment_keyboard(tariff_id: str) -> InlineKeyboardMarkup:
+    """Клавиатура для оплаты тарифа"""
+    tariff_info = TARIFFS.get(tariff_id)
+    
+    if tariff_info and tariff_info['price'] > 0:
+        buttons = [
+            [InlineKeyboardButton(text="💳 Оплатить через CryptoBot", callback_data=f"pay_{tariff_id}")],
+            [InlineKeyboardButton(text="💬 Связаться с менеджером", url=f"https://t.me/{ADMIN_CONTACT.replace('@', '')}")],
+            [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="tariffs")]
+        ]
+    else:
+        buttons = [
+            [InlineKeyboardButton(text="🆓 Активировать бесплатный тариф", callback_data=f"activate_{tariff_id}")],
+            [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="tariffs")]
+        ]
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 def get_admin_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура админ-панели"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Общая статистика", callback_data="admin_stats")],
         [InlineKeyboardButton(text="👥 Управление пользователями", callback_data="admin_users")],
         [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="💳 Статистика платежей", callback_data="admin_payments")],
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
     ])
 
@@ -632,6 +756,9 @@ class AdminStates(StatesGroup):
     waiting_for_user_id = State()
     waiting_for_tariff = State()
     waiting_for_broadcast = State()
+
+class PaymentStates(StatesGroup):
+    waiting_for_payment = State()
 
 # ========== HANDLERS ==========
 @router.message(CommandStart())
@@ -701,8 +828,8 @@ async def cmd_help(message: Message):
         "• Standard ($4/мес) - 2 канала, 6 постов в день\n"
         "• VIP ($7/мес) - 3 канала, 12 постов в день\n\n"
         
-        "🆘 Поддержка: @ваш_support_bot\n"
-        "💬 Вопросы по оплате: @ваш_admin"
+        f"🆘 Поддержка: @{SUPPORT_BOT_USERNAME}\n"
+        f"💬 Вопросы по оплате: @{ADMIN_CONTACT.replace('@', '')}"
     )
     
     await message.answer(help_text)
@@ -731,7 +858,7 @@ async def cancel_action(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_main_menu(callback.from_user.id, is_admin)
     )
 
-# ========== TARIFFS ==========
+# ========== TARIFFS AND PAYMENTS ==========
 @router.callback_query(F.data == "tariffs")
 async def show_tariffs(callback: CallbackQuery):
     """Показ тарифов"""
@@ -792,27 +919,133 @@ async def tariff_info(callback: CallbackQuery):
     
     if tariff_id == current_tariff:
         info_text += "✅ Это ваш текущий тариф"
-    elif tariff_info['price'] == 0:
-        info_text += "🔄 Нажмите кнопку ниже, чтобы перейти на этот тариф"
     else:
-        info_text += (
-            "💳 Для покупки тарифа:\n"
-            "1. Напишите @ваш_admin\n"
-            "2. Укажите ваш Telegram ID\n"
-            "3. Оплатите тариф через CryptoBot\n"
-            "4. Пришлите скриншот оплаты\n\n"
-            f"Ваш ID: {user_id}"
-        )
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Заказать тариф", url=f"https://t.me/{ADMIN_CONTACT.replace('@', '')}")],
-        [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="tariffs")]
-    ])
+        info_text += "👇 Выберите способ оплаты:"
     
     await callback.message.edit_text(
         info_text,
+        reply_markup=get_tariff_payment_keyboard(tariff_id)
+    )
+
+@router.callback_query(F.data.startswith("activate_"))
+async def activate_free_tariff(callback: CallbackQuery):
+    """Активация бесплатного тарифа"""
+    user_id = callback.from_user.id
+    tariff_id = callback.data.split("_")[1]
+    
+    if tariff_id != 'mini':
+        await callback.answer("❌ Этот тариф не бесплатный!", show_alert=True)
+        return
+    
+    # Активируем тариф
+    success = await update_user_tariff(user_id, tariff_id)
+    
+    if success:
+        await callback.message.edit_text(
+            "🎉 Бесплатный тариф Mini успешно активирован!\n\n"
+            "Теперь вы можете:\n"
+            "• Добавить 1 канал\n"
+            "• Публиковать до 2 постов в день\n\n"
+            "Чтобы увеличить лимиты, выберите платный тариф.",
+            reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
+        )
+    else:
+        await callback.message.edit_text(
+            "❌ Ошибка при активации тарифа. Попробуйте позже.",
+            reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
+        )
+
+@router.callback_query(F.data.startswith("pay_"))
+async def start_payment(callback: CallbackQuery, state: FSMContext):
+    """Начало оплаты тарифа"""
+    user_id = callback.from_user.id
+    tariff_id = callback.data.split("_")[1]
+    tariff_info = TARIFFS.get(tariff_id)
+    
+    if not tariff_info or tariff_info['price'] == 0:
+        await callback.answer("❌ Неверный тариф!", show_alert=True)
+        return
+    
+    # Сохраняем информацию о платеже
+    await state.update_data(tariff_id=tariff_id, user_id=user_id)
+    await state.set_state(PaymentStates.waiting_for_payment)
+    
+    # Создаем счет
+    invoice_url = await create_crypto_invoice(user_id, tariff_id)
+    
+    if invoice_url == "free":
+        # Бесплатный тариф
+        success = await update_user_tariff(user_id, tariff_id)
+        
+        if success:
+            await callback.message.edit_text(
+                f"🎉 Тариф {tariff_info['name']} успешно активирован!\n\n"
+                f"Теперь вы можете:\n"
+                f"• Добавить {tariff_info['channels_limit']} каналов\n"
+                f"• Публиковать до {tariff_info['daily_posts_limit']} постов в день",
+                reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
+            )
+        else:
+            await callback.message.edit_text(
+                "❌ Ошибка при активации тарифа. Попробуйте позже.",
+                reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
+            )
+        await state.clear()
+        return
+    
+    payment_text = (
+        f"💳 Оплата тарифа {tariff_info['name']}\n\n"
+        f"💰 Сумма: {tariff_info['price']} {tariff_info['currency']}\n"
+        f"⏱ Срок действия: 30 дней\n\n"
+        f"Для оплаты:\n"
+        f"1. Перейдите по ссылке ниже\n"
+        f"2. Оплатите счет в CryptoBot\n"
+        f"3. После оплаты нажмите кнопку '✅ Проверить оплату'\n\n"
+        f"📍 Ссылка для оплаты:"
+    )
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Перейти к оплате", url=invoice_url)],
+        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_payment_{tariff_id}")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="tariffs")]
+    ])
+    
+    await callback.message.edit_text(
+        payment_text,
         reply_markup=keyboard
     )
+
+@router.callback_query(F.data.startswith("check_payment_"))
+async def check_payment(callback: CallbackQuery, state: FSMContext):
+    """Проверка оплаты"""
+    user_id = callback.from_user.id
+    tariff_id = callback.data.split("_")[2]
+    
+    # Проверяем оплату
+    tariff_info = TARIFFS.get(tariff_id)
+    if not tariff_info:
+        await callback.answer("❌ Тариф не найден!", show_alert=True)
+        return
+    
+    payment_success = await process_payment(user_id, tariff_id)
+    
+    if payment_success:
+        await callback.message.edit_text(
+            f"🎉 Оплата подтверждена!\n\n"
+            f"Тариф {tariff_info['name']} успешно активирован на 30 дней.\n\n"
+            f"📊 Новые лимиты:\n"
+            f"• Каналов: {tariff_info['channels_limit']}\n"
+            f"• Постов в день: {tariff_info['daily_posts_limit']}\n\n"
+            f"Спасибо за покупку! 🤝",
+            reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
+        )
+    else:
+        await callback.answer(
+            "❌ Оплата не найдена! Убедитесь, что вы оплатили счет и повторите проверку.",
+            show_alert=True
+        )
+    
+    await state.clear()
 
 # ========== POST SCHEDULING ==========
 @router.callback_query(F.data == "schedule_post")
@@ -1140,10 +1373,10 @@ async def show_post_preview(message: Message, data: Dict):
     
     elif message_type in ['photo', 'video', 'document']:
         media_type = {
-            'photo': 'Фото',
-            'video': 'Видео',
-            'document': 'Документ'
-        }.get(message_type, 'Медиа')
+            'photo': '📷 Фото',
+            'video': '🎥 Видео',
+            'document': '📎 Документ'
+        }.get(message_type, '📁 Медиа')
         
         preview_text += f"{media_type}"
         if media_caption:
@@ -1203,15 +1436,15 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
     
     await callback.message.edit_text(
         f"✅ Пост успешно запланирован!\n\n"
-        f"Канал: {data['channel_name']}\n"
-        f"Время: {format_datetime(data['scheduled_time'])}\n"
-        f"ID поста: {post_id}\n\n"
+        f"📢 Канал: {data['channel_name']}\n"
+        f"⏰ Время: {format_datetime(data['scheduled_time'])}\n"
+        f"📝 ID поста: {post_id}\n\n"
         f"📊 Сегодня: {posts_today}/{daily_limit} постов\n\n"
         f"📍 Пост будет автоматически опубликован в указанное время.",
         reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
     )
     
-    logger.info(f"Пост {post_id} запланирован пользователем {user_id}")
+    logger.info(f"📅 Пост {post_id} запланирован пользователем {user_id}")
     await state.clear()
 
 @router.callback_query(F.data == "confirm_no")
@@ -1313,7 +1546,7 @@ async def show_my_channels(callback: CallbackQuery):
         await callback.message.edit_text(
             f"📢 У вас нет добавленных каналов\n\n"
             f"💎 Ваш тариф позволяет добавить: {tariff_info['channels_limit']} канала(ов)\n\n"
-            "Добавьте канал, чтобы начать планировать посты.",
+            "➕ Добавьте канал, чтобы начать планировать посты.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➕ Добавить канал", callback_data="add_channel")],
                 [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
@@ -1366,14 +1599,15 @@ async def admin_stats(callback: CallbackQuery):
     stats_text = (
         f"📊 Общая статистика бота\n\n"
         f"👥 Пользователи (всего: {stats['total_users']}):\n"
-        f"   • Mini: {stats['mini_users']}\n"
-        f"   • Standard: {stats['standard_users']}\n"
-        f"   • VIP: {stats['vip_users']}\n\n"
+        f"   🚀 Mini: {stats['mini_users']}\n"
+        f"   ⭐ Standard: {stats['standard_users']}\n"
+        f"   👑 VIP: {stats['vip_users']}\n\n"
         f"📅 Посты:\n"
-        f"   • Всего: {stats['total_posts']}\n"
-        f"   • Ожидает: {stats['active_posts']}\n"
-        f"   • Опубликовано: {stats['sent_posts']}\n\n"
-        f"📢 Каналы: {stats['total_channels']}\n\n"
+        f"   📈 Всего: {stats['total_posts']}\n"
+        f"   ⏳ Ожидает: {stats['active_posts']}\n"
+        f"   ✅ Опубликовано: {stats['sent_posts']}\n\n"
+        f"📢 Каналы: {stats['total_channels']}\n"
+        f"💰 Выручка: ${stats['total_revenue']:.2f}\n\n"
         f"🕐 Обновлено: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
     )
     
@@ -1381,6 +1615,63 @@ async def admin_stats(callback: CallbackQuery):
         stats_text,
         reply_markup=get_admin_keyboard()
     )
+
+@router.callback_query(F.data == "admin_payments")
+async def admin_payments(callback: CallbackQuery):
+    """Статистика платежей"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Только для администратора!", show_alert=True)
+        return
+    
+    try:
+        conn = await get_db_connection()
+        
+        # Статистика по платежам
+        total_payments = await conn.fetchval("SELECT COUNT(*) FROM payments WHERE status = 'completed'") or 0
+        total_revenue = await conn.fetchval("SELECT SUM(amount) FROM payments WHERE status = 'completed'") or 0
+        pending_payments = await conn.fetchval("SELECT COUNT(*) FROM payments WHERE status = 'pending'") or 0
+        
+        # Последние 5 платежей
+        recent_payments = await conn.fetch('''
+            SELECT user_id, tariff, amount, currency, payment_date
+            FROM payments 
+            WHERE status = 'completed'
+            ORDER BY payment_date DESC 
+            LIMIT 5
+        ''')
+        
+        await conn.close()
+        
+        payments_text = (
+            f"💳 Статистика платежей\n\n"
+            f"💰 Общая выручка: ${total_revenue:.2f}\n"
+            f"📊 Всего платежей: {total_payments}\n"
+            f"⏳ Ожидает обработки: {pending_payments}\n\n"
+            f"📋 Последние платежи:\n"
+        )
+        
+        if recent_payments:
+            for i, payment in enumerate(recent_payments, 1):
+                payments_text += (
+                    f"\n{i}. ID: {payment['user_id']}\n"
+                    f"   Тариф: {TARIFFS.get(payment['tariff'], {}).get('name', payment['tariff'])}\n"
+                    f"   Сумма: {payment['amount']} {payment['currency']}\n"
+                    f"   Дата: {payment['payment_date'].strftime('%d.%m.%Y %H:%M')}"
+                )
+        else:
+            payments_text += "\nНет данных о платежах"
+        
+        await callback.message.edit_text(
+            payments_text,
+            reply_markup=get_admin_keyboard()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения статистики платежей: {e}")
+        await callback.message.edit_text(
+            "❌ Ошибка получения статистики платежей",
+            reply_markup=get_admin_keyboard()
+        )
 
 @router.callback_query(F.data == "admin_users")
 async def admin_users_panel(callback: CallbackQuery):
@@ -1719,8 +2010,13 @@ async def on_startup():
         await init_db()
         logger.info("✅ База данных инициализирована")
         
+        # Миграция существующей БД
+        await migrate_db()
+        logger.info("✅ Миграция БД выполнена")
+        
         # Восстановление задач
         await restore_scheduled_jobs()
+        logger.info("✅ Запланированные посты восстановлены")
         
         # Запуск планировщика
         scheduler.start()
@@ -1732,8 +2028,10 @@ async def on_startup():
             trigger='cron',
             hour=0,
             minute=1,
-            timezone=MOSCOW_TZ
+            timezone=MOSCOW_TZ,
+            id='reset_posts'
         )
+        logger.info("✅ Задача сброса счетчиков добавлена")
         
         # Проверяем, что бот работает
         me = await bot.get_me()
@@ -1775,6 +2073,7 @@ async def main():
     logger.info(f"🤖 Запуск бота...")
     logger.info(f"👑 Admin ID: {ADMIN_ID}")
     logger.info(f"🌐 Database: {'Настроена' if DATABASE_URL else 'Нет'}")
+    logger.info(f"💰 CryptoBot: {'Настроен' if CRYPTO_BOT_TOKEN else 'Не настроен'}")
     logger.info("=" * 50)
     
     # Запуск startup процедур
@@ -1792,4 +2091,13 @@ async def main():
         await on_shutdown()
 
 if __name__ == "__main__":
+    # Проверка обязательных переменных
+    if not API_TOKEN:
+        logger.error("❌ Не указан BOT_TOKEN в переменных окружения")
+        exit(1)
+    
+    if not DATABASE_URL:
+        logger.error("❌ Не указан DATABASE_URL в переменных окружения")
+        exit(1)
+    
     asyncio.run(main())
