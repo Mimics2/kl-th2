@@ -2,7 +2,8 @@ import os
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
+from enum import Enum
 
 import pytz
 from aiogram import Bot, Dispatcher, types, Router, F
@@ -21,10 +22,59 @@ API_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
+# Контакты поддержки (заполните своими данными)
+SUPPORT_BOT_USERNAME = os.getenv("SUPPORT_BOT_USERNAME", "your_support_bot")
+ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@your_username")
+
+# CryptoPay (заполните своими данными)
+CRYPTO_BOT_TOKEN = os.getenv("CRYPTO_BOT_TOKEN", "")
+CRYPTO_BOT_USERNAME = os.getenv("CRYPTO_BOT_USERNAME", "CryptoBot")
+
 # Настройки
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
-MAX_POSTS_PER_USER = 100
 POST_CHARACTER_LIMIT = 4000
+
+# ========== TARIFF SYSTEM ==========
+class Tariff(Enum):
+    MINI = "mini"      # Бесплатный
+    STANDARD = "standard"  # Платный
+    VIP = "vip"        # Платный
+    ADMIN = "admin"    # Безлимитный для админа
+
+TARIFFS = {
+    Tariff.MINI.value: {
+        "name": "🚀 Mini",
+        "price": 0,
+        "currency": "USD",
+        "channels_limit": 1,
+        "daily_posts_limit": 2,
+        "description": "Бесплатный тариф для начала работы"
+    },
+    Tariff.STANDARD.value: {
+        "name": "⭐ Standard",
+        "price": 4,
+        "currency": "USD",
+        "channels_limit": 2,
+        "daily_posts_limit": 6,
+        "description": "Для активных пользователей"
+    },
+    Tariff.VIP.value: {
+        "name": "👑 VIP",
+        "price": 7,
+        "currency": "USD",
+        "channels_limit": 3,
+        "daily_posts_limit": 12,
+        "description": "Максимальные возможности"
+    },
+    Tariff.ADMIN.value: {
+        "name": "⚡ Admin",
+        "price": 0,
+        "currency": "USD",
+        "channels_limit": 999,
+        "daily_posts_limit": 999,
+        "description": "Безлимитный доступ"
+    }
+}
 
 # ========== SETUP ==========
 logging.basicConfig(
@@ -49,7 +99,6 @@ async def get_db_connection():
     """Создает соединение с базой данных"""
     try:
         if DATABASE_URL:
-            # Для Railway PostgreSQL добавляем sslmode
             if "postgresql://" in DATABASE_URL and "sslmode" not in DATABASE_URL:
                 conn_string = DATABASE_URL + "?sslmode=require"
             else:
@@ -64,17 +113,15 @@ async def init_db():
     try:
         conn = await get_db_connection()
         
-        # Удаляем старые таблицы если есть проблемы (только для разработки!)
-        # await conn.execute('DROP TABLE IF EXISTS scheduled_posts CASCADE')
-        # await conn.execute('DROP TABLE IF EXISTS channels CASCADE')
-        # await conn.execute('DROP TABLE IF EXISTS users CASCADE')
-        
-        # Таблица пользователей
+        # Таблица пользователей с тарифами
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id BIGINT PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
+                tariff TEXT DEFAULT 'mini',
+                posts_today INTEGER DEFAULT 0,
+                posts_reset_date DATE DEFAULT CURRENT_DATE,
                 is_active BOOLEAN DEFAULT TRUE,
                 is_admin BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT NOW()
@@ -109,14 +156,29 @@ async def init_db():
             )
         ''')
         
+        # Таблица платежей
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS payments (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT,
+                tariff TEXT NOT NULL,
+                amount DECIMAL(10,2),
+                currency TEXT,
+                status TEXT DEFAULT 'pending',
+                payment_date TIMESTAMP DEFAULT NOW(),
+                expires_at TIMESTAMP
+            )
+        ''')
+        
         # Добавляем админа
         if ADMIN_ID > 0:
             await conn.execute('''
-                INSERT INTO users (id, username, first_name, is_active, is_admin)
+                INSERT INTO users (id, username, first_name, tariff, is_admin)
                 VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (id) DO UPDATE SET
+                tariff = EXCLUDED.tariff,
                 is_admin = EXCLUDED.is_admin
-            ''', ADMIN_ID, 'admin', 'Администратор', True, True)
+            ''', ADMIN_ID, 'admin', 'Администратор', 'admin', True)
         
         logger.info("✅ База данных инициализирована")
         await conn.close()
@@ -124,6 +186,138 @@ async def init_db():
     except Exception as e:
         logger.error(f"❌ Ошибка инициализации БД: {e}")
         raise
+
+async def get_user_tariff(user_id: int) -> str:
+    """Получает тариф пользователя"""
+    try:
+        conn = await get_db_connection()
+        user = await conn.fetchrow(
+            "SELECT tariff, is_admin FROM users WHERE id = $1", 
+            user_id
+        )
+        await conn.close()
+        
+        if not user:
+            # Создаем нового пользователя с тарифом mini
+            conn = await get_db_connection()
+            await conn.execute('''
+                INSERT INTO users (id, tariff) VALUES ($1, 'mini')
+            ''', user_id)
+            await conn.close()
+            return 'mini'
+        
+        # Админ всегда имеет тариф admin
+        if user['is_admin']:
+            return 'admin'
+            
+        return user['tariff']
+    except Exception as e:
+        logger.error(f"Ошибка получения тарифа: {e}")
+        return 'mini'
+
+async def update_user_tariff(user_id: int, tariff: str) -> bool:
+    """Обновляет тариф пользователя"""
+    try:
+        conn = await get_db_connection()
+        await conn.execute('''
+            UPDATE users SET tariff = $1 WHERE id = $2
+        ''', tariff, user_id)
+        await conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка обновления тарифа: {e}")
+        return False
+
+async def get_tariff_limits(user_id: int) -> Tuple[int, int]:
+    """Получает лимиты пользователя по тарифу"""
+    tariff = await get_user_tariff(user_id)
+    tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
+    return tariff_info['channels_limit'], tariff_info['daily_posts_limit']
+
+async def get_user_channels_count(user_id: int) -> int:
+    """Получает количество каналов пользователя"""
+    try:
+        conn = await get_db_connection()
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM channels WHERE user_id = $1 AND is_active = TRUE",
+            user_id
+        )
+        await conn.close()
+        return count or 0
+    except Exception as e:
+        logger.error(f"Ошибка получения количества каналов: {e}")
+        return 0
+
+async def reset_daily_posts():
+    """Сбрасывает счетчик постов за день (вызывается ежедневно)"""
+    try:
+        conn = await get_db_connection()
+        await conn.execute('''
+            UPDATE users 
+            SET posts_today = 0, posts_reset_date = CURRENT_DATE 
+            WHERE posts_reset_date < CURRENT_DATE
+        ''')
+        await conn.close()
+        logger.info("✅ Счетчики постов сброшены")
+    except Exception as e:
+        logger.error(f"Ошибка сброса счетчиков: {e}")
+
+async def increment_user_posts(user_id: int) -> bool:
+    """Увеличивает счетчик постов пользователя за сегодня"""
+    try:
+        conn = await get_db_connection()
+        
+        # Проверяем дату сброса
+        user = await conn.fetchrow(
+            "SELECT posts_reset_date FROM users WHERE id = $1",
+            user_id
+        )
+        
+        if user and user['posts_reset_date'] < datetime.now(MOSCOW_TZ).date():
+            # Сбрасываем счетчик если дата устарела
+            await conn.execute('''
+                UPDATE users 
+                SET posts_today = 1, posts_reset_date = CURRENT_DATE 
+                WHERE id = $1
+            ''', user_id)
+        else:
+            # Увеличиваем счетчик
+            await conn.execute('''
+                UPDATE users 
+                SET posts_today = posts_today + 1 
+                WHERE id = $1
+            ''', user_id)
+        
+        await conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка увеличения счетчика постов: {e}")
+        return False
+
+async def get_user_posts_today(user_id: int) -> int:
+    """Получает количество постов пользователя за сегодня"""
+    try:
+        conn = await get_db_connection()
+        
+        # Проверяем дату сброса
+        user = await conn.fetchrow(
+            "SELECT posts_today, posts_reset_date FROM users WHERE id = $1",
+            user_id
+        )
+        
+        await conn.close()
+        
+        if not user:
+            return 0
+            
+        # Если дата устарела, возвращаем 0
+        if user['posts_reset_date'] < datetime.now(MOSCOW_TZ).date():
+            return 0
+            
+        return user['posts_today'] or 0
+    except Exception as e:
+        logger.error(f"Ошибка получения счетчика постов: {e}")
+        return 0
 
 async def check_user_access(user_id: int) -> bool:
     """Проверяет доступ пользователя к боту"""
@@ -186,6 +380,9 @@ async def add_user_channel(user_id: int, channel_id: int, channel_name: str) -> 
 async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, scheduled_time: datetime) -> Optional[int]:
     """Сохраняет запланированный пост в БД"""
     try:
+        # Конвертируем время в UTC для хранения в БД
+        scheduled_time_utc = scheduled_time.astimezone(pytz.UTC)
+        
         conn = await get_db_connection()
         
         post_id = await conn.fetchval('''
@@ -200,7 +397,7 @@ async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, sc
         post_data.get('message_text'),
         post_data.get('media_file_id'),
         post_data.get('media_caption'),
-        scheduled_time
+        scheduled_time_utc
         )
         
         await conn.close()
@@ -252,7 +449,9 @@ async def get_total_stats() -> Dict:
         conn = await get_db_connection()
         
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users") or 0
-        active_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_active = TRUE") or 0
+        mini_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE tariff = 'mini'") or 0
+        standard_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE tariff = 'standard'") or 0
+        vip_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE tariff = 'vip'") or 0
         
         total_posts = await conn.fetchval("SELECT COUNT(*) FROM scheduled_posts") or 0
         active_posts = await conn.fetchval("SELECT COUNT(*) FROM scheduled_posts WHERE is_sent = FALSE") or 0
@@ -264,7 +463,9 @@ async def get_total_stats() -> Dict:
         
         return {
             'total_users': total_users,
-            'active_users': active_users,
+            'mini_users': mini_users,
+            'standard_users': standard_users,
+            'vip_users': vip_users,
             'total_posts': total_posts,
             'active_posts': active_posts,
             'sent_posts': sent_posts,
@@ -319,20 +520,22 @@ def parse_datetime(date_str: str, time_str: str) -> Optional[datetime]:
             time_obj.time()
         )
         
+        # Добавляем московскую таймзону
         return MOSCOW_TZ.localize(combined)
     except Exception:
         return None
 
 # ========== KEYBOARDS ==========
 def get_main_menu(user_id: int, is_admin: bool = False) -> InlineKeyboardMarkup:
-    """Главное меню - ТОЛЬКО обычные функции"""
+    """Главное меню"""
     buttons = [
         [InlineKeyboardButton(text="📅 Запланировать пост", callback_data="schedule_post")],
         [InlineKeyboardButton(text="📊 Моя статистика", callback_data="my_stats")],
         [InlineKeyboardButton(text="📢 Мои каналы", callback_data="my_channels")],
+        [InlineKeyboardButton(text="💎 Тарифы", callback_data="tariffs")],
+        [InlineKeyboardButton(text="🆘 Техподдержка", url=f"https://t.me/{SUPPORT_BOT_USERNAME}")],
     ]
     
-    # ТОЛЬКО админ видит админ-панель
     if is_admin:
         buttons.append([InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_panel")])
     
@@ -370,12 +573,51 @@ def get_confirmation_keyboard() -> InlineKeyboardMarkup:
         ]
     ])
 
+def get_tariffs_keyboard(user_tariff: str = 'mini') -> InlineKeyboardMarkup:
+    """Клавиатура с тарифами"""
+    buttons = []
+    
+    for tariff_id, tariff_info in TARIFFS.items():
+        if tariff_id == 'admin':  # Пропускаем админский тариф
+            continue
+            
+        name = tariff_info['name']
+        price = tariff_info['price']
+        currency = tariff_info['currency']
+        
+        if tariff_id == user_tariff:
+            button_text = f"✅ {name} (текущий)"
+        else:
+            if price == 0:
+                button_text = f"{name} - Бесплатно"
+            else:
+                button_text = f"{name} - {price} {currency}/месяц"
+        
+        buttons.append([InlineKeyboardButton(
+            text=button_text,
+            callback_data=f"tariff_info_{tariff_id}"
+        )])
+    
+    buttons.append([InlineKeyboardButton(text="💬 Заказать тариф", url=f"https://t.me/{ADMIN_CONTACT.replace('@', '')}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 def get_admin_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура админ-панели (ТОЛЬКО ДЛЯ АДМИНА)"""
+    """Клавиатура админ-панели"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Общая статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="👥 Управление пользователями", callback_data="admin_users")],
         [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
+    ])
+
+def get_admin_users_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура управления пользователями"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Найти пользователя по ID", callback_data="admin_find_user")],
+        [InlineKeyboardButton(text="💎 Изменить тариф пользователя", callback_data="admin_change_tariff")],
+        [InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin_panel")]
     ])
 
 # ========== STATES ==========
@@ -386,6 +628,11 @@ class PostStates(StatesGroup):
     waiting_for_time = State()
     waiting_for_confirmation = State()
 
+class AdminStates(StatesGroup):
+    waiting_for_user_id = State()
+    waiting_for_tariff = State()
+    waiting_for_broadcast = State()
+
 # ========== HANDLERS ==========
 @router.message(CommandStart())
 async def cmd_start(message: Message):
@@ -394,7 +641,6 @@ async def cmd_start(message: Message):
     username = message.from_user.username or ""
     first_name = message.from_user.first_name or "Пользователь"
     
-    # Проверяем, является ли пользователь админом
     is_admin = user_id == ADMIN_ID
     
     # Регистрируем пользователя
@@ -410,18 +656,22 @@ async def cmd_start(message: Message):
     except Exception as e:
         logger.error(f"Ошибка регистрации пользователя: {e}")
     
-    # Простое приветствие без HTML разметки
+    # Получаем текущий тариф
+    current_tariff = await get_user_tariff(user_id)
+    tariff_info = TARIFFS.get(current_tariff, TARIFFS['mini'])
+    
     welcome_text = (
-        "👋 Привет, {name}!\n\n"
-        "🤖 Я — бот для планирования постов в Telegram каналах.\n\n"
-        "✨ Что я умею:\n"
-        "• 📅 Запланировать пост с текстом, фото, видео или документом\n"
-        "• 📊 Показать вашу статистику\n"
-        "• 📢 Управлять вашими каналами\n"
-        "• ⏰ Автоматически публиковать в нужное время\n\n"
-        "📍 Время указывается по Москве\n\n"
-        "👇 Выберите действие:"
-    ).format(name=first_name)
+        f"👋 Привет, {first_name}!\n\n"
+        f"🤖 Я — бот для планирования постов в Telegram каналах.\n\n"
+        f"💎 Ваш текущий тариф: {tariff_info['name']}\n\n"
+        f"✨ Возможности:\n"
+        f"• 📅 Запланировать пост с текстом, фото, видео или документом\n"
+        f"• 📊 Показать вашу статистику\n"
+        f"• 📢 Управлять вашими каналами\n"
+        f"• ⏰ Автоматически публиковать в нужное время\n\n"
+        f"📍 Время указывается по Москве\n\n"
+        f"👇 Выберите действие:"
+    )
     
     await message.answer(
         welcome_text,
@@ -446,12 +696,13 @@ async def cmd_help(message: Message):
         "5. Укажите время в формате ЧЧ:ММ\n"
         "6. Подтвердите публикацию\n\n"
         
-        "💡 Советы:\n"
-        "• Вы можете запланировать пост на несколько месяцев вперед\n"
-        "• Посты публикуются автоматически\n"
-        "• Вы можете добавить несколько каналов\n\n"
+        "💎 Тарифы:\n"
+        "• Mini (бесплатно) - 1 канал, 2 поста в день\n"
+        "• Standard ($4/мес) - 2 канала, 6 постов в день\n"
+        "• VIP ($7/мес) - 3 канала, 12 постов в день\n\n"
         
-        "📞 Поддержка: @ваш_username_для_поддержки"
+        "🆘 Поддержка: @ваш_support_bot\n"
+        "💬 Вопросы по оплате: @ваш_admin"
     )
     
     await message.answer(help_text)
@@ -480,6 +731,89 @@ async def cancel_action(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_main_menu(callback.from_user.id, is_admin)
     )
 
+# ========== TARIFFS ==========
+@router.callback_query(F.data == "tariffs")
+async def show_tariffs(callback: CallbackQuery):
+    """Показ тарифов"""
+    user_id = callback.from_user.id
+    current_tariff = await get_user_tariff(user_id)
+    
+    tariffs_text = (
+        "💎 Доступные тарифы:\n\n"
+        "🚀 Mini (Бесплатно):\n"
+        "• 1 канал\n"
+        "• 2 поста в день\n"
+        "• Базовые функции\n\n"
+        "⭐ Standard ($4/месяц):\n"
+        "• 2 канала\n"
+        "• 6 постов в день\n"
+        "• Все функции Mini\n\n"
+        "👑 VIP ($7/месяц):\n"
+        "• 3 канала\n"
+        "• 12 постов в день\n"
+        "• Приоритетная поддержка\n"
+        "• Все функции Standard\n\n"
+        f"💎 Ваш текущий тариф: {TARIFFS.get(current_tariff, TARIFFS['mini'])['name']}\n\n"
+        "👇 Выберите тариф для подробной информации:"
+    )
+    
+    await callback.message.edit_text(
+        tariffs_text,
+        reply_markup=get_tariffs_keyboard(current_tariff)
+    )
+
+@router.callback_query(F.data.startswith("tariff_info_"))
+async def tariff_info(callback: CallbackQuery):
+    """Информация о тарифе"""
+    tariff_id = callback.data.split("_")[2]
+    tariff_info = TARIFFS.get(tariff_id)
+    
+    if not tariff_info:
+        await callback.answer("Тариф не найден!", show_alert=True)
+        return
+    
+    user_id = callback.from_user.id
+    current_tariff = await get_user_tariff(user_id)
+    
+    info_text = (
+        f"{tariff_info['name']}\n\n"
+        f"📊 Лимиты:\n"
+        f"• Каналов: {tariff_info['channels_limit']}\n"
+        f"• Постов в день: {tariff_info['daily_posts_limit']}\n\n"
+        f"💵 Стоимость: "
+    )
+    
+    if tariff_info['price'] == 0:
+        info_text += "Бесплатно\n\n"
+    else:
+        info_text += f"{tariff_info['price']} {tariff_info['currency']} в месяц\n\n"
+    
+    info_text += f"📝 {tariff_info['description']}\n\n"
+    
+    if tariff_id == current_tariff:
+        info_text += "✅ Это ваш текущий тариф"
+    elif tariff_info['price'] == 0:
+        info_text += "🔄 Нажмите кнопку ниже, чтобы перейти на этот тариф"
+    else:
+        info_text += (
+            "💳 Для покупки тарифа:\n"
+            "1. Напишите @ваш_admin\n"
+            "2. Укажите ваш Telegram ID\n"
+            "3. Оплатите тариф через CryptoBot\n"
+            "4. Пришлите скриншот оплаты\n\n"
+            f"Ваш ID: {user_id}"
+        )
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Заказать тариф", url=f"https://t.me/{ADMIN_CONTACT.replace('@', '')}")],
+        [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="tariffs")]
+    ])
+    
+    await callback.message.edit_text(
+        info_text,
+        reply_markup=keyboard
+    )
+
 # ========== POST SCHEDULING ==========
 @router.callback_query(F.data == "schedule_post")
 async def start_scheduling(callback: CallbackQuery, state: FSMContext):
@@ -488,6 +822,20 @@ async def start_scheduling(callback: CallbackQuery, state: FSMContext):
     
     if not await check_user_access(user_id):
         await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    # Проверяем лимит постов за сегодня
+    posts_today = await get_user_posts_today(user_id)
+    _, daily_limit = await get_tariff_limits(user_id)
+    
+    if posts_today >= daily_limit:
+        await callback.message.edit_text(
+            f"❌ Достигнут дневной лимит постов!\n\n"
+            f"Сегодня вы запланировали: {posts_today} постов\n"
+            f"Ваш лимит: {daily_limit} постов в день\n\n"
+            "💎 Чтобы увеличить лимит, выберите другой тариф.",
+            reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
+        )
         return
     
     channels = await get_user_channels(user_id)
@@ -538,6 +886,22 @@ async def select_channel(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "add_channel")
 async def add_channel_start(callback: CallbackQuery, state: FSMContext):
     """Добавление нового канала"""
+    user_id = callback.from_user.id
+    
+    # Проверяем лимит каналов
+    channels_count = await get_user_channels_count(user_id)
+    channels_limit, _ = await get_tariff_limits(user_id)
+    
+    if channels_count >= channels_limit:
+        await callback.message.edit_text(
+            f"❌ Достигнут лимит каналов!\n\n"
+            f"У вас подключено: {channels_count} каналов\n"
+            f"Ваш лимит: {channels_limit} каналов\n\n"
+            "💎 Чтобы увеличить лимит, выберите другой тариф.",
+            reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
+        )
+        return
+    
     await state.set_state(PostStates.waiting_for_channel)
     await callback.message.edit_text(
         "📢 Добавление канала\n\n"
@@ -554,6 +918,8 @@ async def add_channel_start(callback: CallbackQuery, state: FSMContext):
 @router.message(PostStates.waiting_for_channel)
 async def process_channel_input(message: Message, state: FSMContext):
     """Обработка ввода канала"""
+    user_id = message.from_user.id
+    
     channel_id = None
     channel_name = "Неизвестный канал"
     
@@ -581,7 +947,7 @@ async def process_channel_input(message: Message, state: FSMContext):
         return
     
     # Сохраняем канал
-    success = await add_user_channel(message.from_user.id, channel_id, channel_name)
+    success = await add_user_channel(user_id, channel_id, channel_name)
     
     if not success:
         await message.answer(
@@ -790,7 +1156,6 @@ async def show_post_preview(message: Message, data: Dict):
     
     preview_text += "\n\n✅ Все верно?"
     
-    # Отправляем превью
     await message.answer(
         preview_text,
         reply_markup=get_confirmation_keyboard()
@@ -802,18 +1167,8 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     user_id = callback.from_user.id
     
-    # Проверяем лимиты
-    stats = await get_user_stats(user_id)
-    if stats['active_posts'] >= MAX_POSTS_PER_USER:
-        await callback.message.edit_text(
-            f"❌ Достигнут лимит постов!\n\n"
-            f"У вас уже {stats['active_posts']} активных постов.\n"
-            f"Максимум: {MAX_POSTS_PER_USER} постов одновременно.\n\n"
-            "Дождитесь публикации некоторых постов.",
-            reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
-        )
-        await state.clear()
-        return
+    # Увеличиваем счетчик постов
+    await increment_user_posts(user_id)
     
     # Сохраняем пост
     post_id = await save_scheduled_post(
@@ -832,23 +1187,27 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         return
     
-    # Планируем отправку
+    # Планируем отправку (конвертируем в UTC для планировщика)
+    scheduled_time_utc = data['scheduled_time'].astimezone(pytz.UTC)
     scheduler.add_job(
         send_scheduled_post,
-        trigger=DateTrigger(run_date=data['scheduled_time']),
+        trigger=DateTrigger(run_date=scheduled_time_utc),
         args=(data['channel_id'], data, post_id),
         id=f"post_{post_id}",
         replace_existing=True
     )
     
-    # Отправляем подтверждение
+    # Получаем обновленную статистику
+    posts_today = await get_user_posts_today(user_id)
+    _, daily_limit = await get_tariff_limits(user_id)
+    
     await callback.message.edit_text(
         f"✅ Пост успешно запланирован!\n\n"
         f"Канал: {data['channel_name']}\n"
         f"Время: {format_datetime(data['scheduled_time'])}\n"
         f"ID поста: {post_id}\n\n"
-        f"📍 Пост будет автоматически опубликован в указанное время.\n\n"
-        "👇 Что дальше?",
+        f"📊 Сегодня: {posts_today}/{daily_limit} постов\n\n"
+        f"📍 Пост будет автоматически опубликован в указанное время.",
         reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
     )
     
@@ -919,15 +1278,21 @@ async def show_my_stats(callback: CallbackQuery):
     """Показ статистики пользователя"""
     user_id = callback.from_user.id
     stats = await get_user_stats(user_id)
+    current_tariff = await get_user_tariff(user_id)
+    tariff_info = TARIFFS.get(current_tariff, TARIFFS['mini'])
+    posts_today = await get_user_posts_today(user_id)
     
     stats_text = (
         f"📊 Ваша статистика\n\n"
-        f"Пользователь: {callback.from_user.first_name}\n"
-        f"Всего постов: {stats['total_posts']}\n"
-        f"Опубликовано: {stats['sent_posts']}\n"
-        f"Ожидает публикации: {stats['active_posts']}\n"
-        f"Каналов: {stats['channels']}\n\n"
-        f"Обновлено: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
+        f"👤 Пользователь: {callback.from_user.first_name}\n"
+        f"💎 Тариф: {tariff_info['name']}\n\n"
+        f"📅 Всего постов: {stats['total_posts']}\n"
+        f"✅ Опубликовано: {stats['sent_posts']}\n"
+        f"⏳ Ожидает публикации: {stats['active_posts']}\n"
+        f"📢 Каналов: {stats['channels']}\n\n"
+        f"📊 Сегодня: {posts_today}/{tariff_info['daily_posts_limit']} постов\n"
+        f"🔧 Лимит каналов: {tariff_info['channels_limit']}\n\n"
+        f"🕐 Обновлено: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
     )
     
     is_admin = user_id == ADMIN_ID
@@ -941,10 +1306,13 @@ async def show_my_channels(callback: CallbackQuery):
     """Показ каналов пользователя"""
     user_id = callback.from_user.id
     channels = await get_user_channels(user_id)
+    current_tariff = await get_user_tariff(user_id)
+    tariff_info = TARIFFS.get(current_tariff, TARIFFS['mini'])
     
     if not channels:
         await callback.message.edit_text(
-            "📢 У вас нет добавленных каналов\n\n"
+            f"📢 У вас нет добавленных каналов\n\n"
+            f"💎 Ваш тариф позволяет добавить: {tariff_info['channels_limit']} канала(ов)\n\n"
             "Добавьте канал, чтобы начать планировать посты.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➕ Добавить канал", callback_data="add_channel")],
@@ -953,11 +1321,11 @@ async def show_my_channels(callback: CallbackQuery):
         )
         return
     
-    channels_text = "📢 Ваши каналы:\n\n"
+    channels_text = f"📢 Ваши каналы ({len(channels)}/{tariff_info['channels_limit']}):\n\n"
     for i, channel in enumerate(channels, 1):
         channels_text += f"{i}. {channel['channel_name']}\n"
     
-    channels_text += f"\nВсего: {len(channels)} каналов"
+    channels_text += f"\n💎 Тариф: {tariff_info['name']}"
     
     is_admin = user_id == ADMIN_ID
     await callback.message.edit_text(
@@ -968,7 +1336,7 @@ async def show_my_channels(callback: CallbackQuery):
 # ========== ADMIN FUNCTIONS ==========
 @router.callback_query(F.data == "admin_panel")
 async def admin_panel(callback: CallbackQuery):
-    """Админ-панель - ТОЛЬКО ДЛЯ АДМИНА"""
+    """Админ-панель"""
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("⛔ Только для администратора!", show_alert=True)
         return
@@ -997,15 +1365,16 @@ async def admin_stats(callback: CallbackQuery):
     
     stats_text = (
         f"📊 Общая статистика бота\n\n"
-        f"👥 Пользователи:\n"
-        f"   • Всего: {stats['total_users']}\n"
-        f"   • Активных: {stats['active_users']}\n\n"
+        f"👥 Пользователи (всего: {stats['total_users']}):\n"
+        f"   • Mini: {stats['mini_users']}\n"
+        f"   • Standard: {stats['standard_users']}\n"
+        f"   • VIP: {stats['vip_users']}\n\n"
         f"📅 Посты:\n"
         f"   • Всего: {stats['total_posts']}\n"
         f"   • Ожидает: {stats['active_posts']}\n"
         f"   • Опубликовано: {stats['sent_posts']}\n\n"
         f"📢 Каналы: {stats['total_channels']}\n\n"
-        f"Обновлено: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
+        f"🕐 Обновлено: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
     )
     
     await callback.message.edit_text(
@@ -1013,36 +1382,242 @@ async def admin_stats(callback: CallbackQuery):
         reply_markup=get_admin_keyboard()
     )
 
-@router.callback_query(F.data == "admin_broadcast")
-async def admin_broadcast_start(callback: CallbackQuery):
-    """Начало рассылки - ТОЛЬКО ДЛЯ АДМИНА"""
+@router.callback_query(F.data == "admin_users")
+async def admin_users_panel(callback: CallbackQuery):
+    """Управление пользователями"""
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("⛔ Только для администратора!", show_alert=True)
         return
     
     await callback.message.edit_text(
-        "📢 Рассылка сообщений\n\n"
-        "Используйте команду:\n"
-        "/broadcast Ваше сообщение здесь\n\n"
-        "Чтобы отправить рассылку всем пользователям.",
-        reply_markup=get_admin_keyboard()
+        "👥 Управление пользователями\n\n"
+        "👇 Выберите действие:",
+        reply_markup=get_admin_users_keyboard()
     )
 
-@router.message(Command("broadcast"))
-async def cmd_broadcast(message: Message):
-    """Команда рассылки - ТОЛЬКО ДЛЯ АДМИНА"""
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ У вас нет прав для этой команды.")
+@router.callback_query(F.data == "admin_find_user")
+async def admin_find_user(callback: CallbackQuery, state: FSMContext):
+    """Поиск пользователя по ID"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Только для администратора!", show_alert=True)
         return
     
-    if len(message.text) < 12:  # /broadcast + пробел
-        await message.answer(
-            "❌ Не указано сообщение!\n"
-            "Используйте: /broadcast Ваше сообщение"
+    await state.set_state(AdminStates.waiting_for_user_id)
+    await callback.message.edit_text(
+        "🔍 Поиск пользователя\n\n"
+        "Отправьте Telegram ID пользователя:\n"
+        "(ID можно получить через @userinfobot)",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_users")]
+        ])
+    )
+
+@router.message(AdminStates.waiting_for_user_id)
+async def process_user_id(message: Message, state: FSMContext):
+    """Обработка ID пользователя"""
+    try:
+        user_id = int(message.text.strip())
+        
+        conn = await get_db_connection()
+        user = await conn.fetchrow('''
+            SELECT id, username, first_name, tariff, posts_today, 
+                   posts_reset_date, is_active, created_at
+            FROM users WHERE id = $1
+        ''', user_id)
+        await conn.close()
+        
+        if not user:
+            await message.answer(
+                f"❌ Пользователь с ID {user_id} не найден.\n\n"
+                "Попробуйте еще раз:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_users")]
+                ])
+            )
+            return
+        
+        tariff_info = TARIFFS.get(user['tariff'], TARIFFS['mini'])
+        
+        user_info = (
+            f"👤 Информация о пользователе\n\n"
+            f"🆔 ID: {user['id']}\n"
+            f"👤 Имя: {user['first_name'] or 'Не указано'}\n"
+            f"📱 Username: @{user['username'] or 'Не указан'}\n"
+            f"💎 Тариф: {tariff_info['name']}\n"
+            f"📊 Постов сегодня: {user['posts_today'] or 0}\n"
+            f"✅ Активен: {'Да' if user['is_active'] else 'Нет'}\n"
+            f"📅 Дата регистрации: {user['created_at'].strftime('%d.%m.%Y %H:%M')}\n\n"
+            f"👇 Действия:"
         )
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💎 Изменить тариф", callback_data=f"admin_change_{user_id}")],
+            [
+                InlineKeyboardButton(text="✅ Активировать", callback_data=f"admin_activate_{user_id}"),
+                InlineKeyboardButton(text="❌ Деактивировать", callback_data=f"admin_deactivate_{user_id}")
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_users")]
+        ])
+        
+        await message.answer(user_info, reply_markup=keyboard)
+        await state.clear()
+        
+    except ValueError:
+        await message.answer(
+            "❌ Неверный формат ID!\n\n"
+            "ID должен быть числом. Попробуйте еще раз:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_users")]
+            ])
+        )
+
+@router.callback_query(F.data.startswith("admin_change_"))
+async def admin_change_tariff_start(callback: CallbackQuery, state: FSMContext):
+    """Начало изменения тарифа"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Только для администратора!", show_alert=True)
         return
     
-    broadcast_text = message.text[11:]  # Убираем "/broadcast "
+    user_id = int(callback.data.split("_")[2])
+    await state.update_data(target_user_id=user_id)
+    await state.set_state(AdminStates.waiting_for_tariff)
+    
+    await callback.message.edit_text(
+        f"💎 Изменение тарифа для пользователя {user_id}\n\n"
+        "Выберите новый тариф:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Mini (бесплатно)", callback_data="set_tariff_mini")],
+            [InlineKeyboardButton(text="⭐ Standard ($4/мес)", callback_data="set_tariff_standard")],
+            [InlineKeyboardButton(text="👑 VIP ($7/мес)", callback_data="set_tariff_vip")],
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin_users")]
+        ])
+    )
+
+@router.callback_query(F.data.startswith("set_tariff_"))
+async def admin_set_tariff(callback: CallbackQuery, state: FSMContext):
+    """Установка тарифа"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Только для администратора!", show_alert=True)
+        return
+    
+    tariff = callback.data.split("_")[2]
+    data = await state.get_data()
+    target_user_id = data.get('target_user_id')
+    
+    if not target_user_id:
+        await callback.answer("❌ Ошибка: пользователь не найден", show_alert=True)
+        return
+    
+    success = await update_user_tariff(target_user_id, tariff)
+    
+    if success:
+        tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
+        
+        # Уведомляем пользователя
+        try:
+            await bot.send_message(
+                target_user_id,
+                f"🎉 Ваш тариф изменен!\n\n"
+                f"💎 Новый тариф: {tariff_info['name']}\n"
+                f"📊 Лимиты:\n"
+                f"• Каналов: {tariff_info['channels_limit']}\n"
+                f"• Постов в день: {tariff_info['daily_posts_limit']}\n\n"
+                f"Спасибо за использование нашего сервиса! 🤖"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось уведомить пользователя {target_user_id}: {e}")
+        
+        await callback.message.edit_text(
+            f"✅ Тариф пользователя {target_user_id} изменен на {tariff_info['name']}",
+            reply_markup=get_admin_users_keyboard()
+        )
+    else:
+        await callback.message.edit_text(
+            f"❌ Ошибка при изменении тарифа",
+            reply_markup=get_admin_users_keyboard()
+        )
+    
+    await state.clear()
+
+@router.callback_query(F.data.startswith("admin_activate_"))
+async def admin_activate_user(callback: CallbackQuery):
+    """Активация пользователя"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Только для администратора!", show_alert=True)
+        return
+    
+    user_id = int(callback.data.split("_")[2])
+    
+    try:
+        conn = await get_db_connection()
+        await conn.execute('''
+            UPDATE users SET is_active = TRUE WHERE id = $1
+        ''', user_id)
+        await conn.close()
+        
+        await callback.answer("✅ Пользователь активирован", show_alert=True)
+        
+        # Обновляем сообщение
+        await callback.message.edit_text(
+            f"✅ Пользователь {user_id} активирован",
+            reply_markup=get_admin_users_keyboard()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка активации пользователя: {e}")
+        await callback.answer("❌ Ошибка активации", show_alert=True)
+
+@router.callback_query(F.data.startswith("admin_deactivate_"))
+async def admin_deactivate_user(callback: CallbackQuery):
+    """Деактивация пользователя"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Только для администратора!", show_alert=True)
+        return
+    
+    user_id = int(callback.data.split("_")[2])
+    
+    try:
+        conn = await get_db_connection()
+        await conn.execute('''
+            UPDATE users SET is_active = FALSE WHERE id = $1
+        ''', user_id)
+        await conn.close()
+        
+        await callback.answer("✅ Пользователь деактивирован", show_alert=True)
+        
+        # Обновляем сообщение
+        await callback.message.edit_text(
+            f"✅ Пользователь {user_id} деактивирован",
+            reply_markup=get_admin_users_keyboard()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка деактивации пользователя: {e}")
+        await callback.answer("❌ Ошибка деактивации", show_alert=True)
+
+@router.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    """Начало рассылки"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Только для администратора!", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.waiting_for_broadcast)
+    await callback.message.edit_text(
+        "📢 Рассылка сообщений\n\n"
+        "Отправьте сообщение для рассылки всем пользователям:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin_panel")]
+        ])
+    )
+
+@router.message(AdminStates.waiting_for_broadcast)
+async def process_broadcast(message: Message, state: FSMContext):
+    """Обработка рассылки"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    broadcast_text = message.text
     
     try:
         conn = await get_db_connection()
@@ -1051,6 +1626,7 @@ async def cmd_broadcast(message: Message):
     except Exception as e:
         logger.error(f"Ошибка получения пользователей: {e}")
         await message.answer(f"❌ Ошибка: {e}")
+        await state.clear()
         return
     
     total = len(users)
@@ -1067,11 +1643,10 @@ async def cmd_broadcast(message: Message):
             )
             success += 1
             
-            # Обновляем статус каждые 10 сообщений
             if (i + 1) % 10 == 0:
                 await status_msg.edit_text(f"📢 Рассылка: {i + 1}/{total} отправлено...")
             
-            await asyncio.sleep(0.1)  # Задержка против ограничений Telegram
+            await asyncio.sleep(0.1)
             
         except Exception as e:
             failed += 1
@@ -1083,6 +1658,8 @@ async def cmd_broadcast(message: Message):
         f"• Успешно отправлено: {success}\n"
         f"• Не удалось отправить: {failed}"
     )
+    
+    await state.clear()
 
 # ========== RESTORE JOBS ==========
 async def restore_scheduled_jobs():
@@ -1108,9 +1685,12 @@ async def restore_scheduled_jobs():
                     'media_caption': post['media_caption']
                 }
                 
+                # Конвертируем время из UTC обратно в локальное для планировщика
+                scheduled_time = post['scheduled_time'].replace(tzinfo=pytz.UTC)
+                
                 scheduler.add_job(
                     send_scheduled_post,
-                    trigger=DateTrigger(run_date=post['scheduled_time']),
+                    trigger=DateTrigger(run_date=scheduled_time),
                     args=(post['channel_id'], post_data, post['id']),
                     id=f"post_{post['id']}",
                     replace_existing=True
@@ -1123,6 +1703,11 @@ async def restore_scheduled_jobs():
         
     except Exception as e:
         logger.error(f"❌ Ошибка при восстановлении постов: {e}")
+
+# ========== SCHEDULED TASKS ==========
+async def scheduled_reset_posts():
+    """Ежедневный сброс счетчиков постов"""
+    await reset_daily_posts()
 
 # ========== STARTUP/SHUTDOWN ==========
 async def on_startup():
@@ -1141,6 +1726,15 @@ async def on_startup():
         scheduler.start()
         logger.info("✅ Планировщик запущен")
         
+        # Добавляем ежедневный сброс счетчиков (в 00:01 по Москве)
+        scheduler.add_job(
+            scheduled_reset_posts,
+            trigger='cron',
+            hour=0,
+            minute=1,
+            timezone=MOSCOW_TZ
+        )
+        
         # Проверяем, что бот работает
         me = await bot.get_me()
         logger.info(f"✅ Бот @{me.username} запущен")
@@ -1152,7 +1746,7 @@ async def on_startup():
                     ADMIN_ID,
                     f"🤖 Бот @{me.username} успешно запущен!\n"
                     f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}\n"
-                    f"📍 Готов к работе!"
+                    f"📍 Готов к работе с тарифной системой!"
                 )
                 logger.info(f"✅ Уведомление отправлено админу {ADMIN_ID}")
             except Exception as e:
