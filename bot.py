@@ -43,25 +43,20 @@ if GEMINI_API_KEYS:
         GEMINI_API_KEYS = json.loads(GEMINI_API_KEYS)
     except:
         GEMINI_API_KEYS = [
-            "AIzaSyAI_vkc2IFhOPKELbxpu1QODKCd5h-bEOI",
-            "AIzaSyBy_aoWhZ5ZKm4yyhw7mNzP-8U-t4pXWMI",
-            "AIzaSyA4jtchIEaTWrHnr_yQcRGTsZIWTAstXNA",
-            "AIzaSyANoeHQtBBxInIYCfNHHO_JGE6DWmhQ2Rg",
-            "AIzaSyAI_vkc2IFhOPKELbxpu1QODKCd5h-bEOI_2",
-            "AIzaSyBy_aoWhZ5ZKm4yyhw7mNzP-8U-t4pXWMI_2",
-            "AIzaSyA4jtchIEaTWrHnr_yQcRGTsZIWTAstXNA_2",
-            "AIzaSyANoeHQtBBxInIYCfNHHO_JGE6DWmhQ2Rg_2"
+            "AIzaSyA2j48JnmiuQKf6uAfzHSg0vAW1gkN7ISc",
+            "AIzaSyCsq2YBVbc0mxoaQcjnGnd3qasoVZaucQk"
+            "AIzaSyCkvLqyIoX4M_dvyG4Tyy1ujpuK_ia-BtQ",
+            "AIzaSyBB1KdR3pKOziItOEsCr5QHEGAf2ZED8lo",
+            "AIzaSyCJoEWTJfBUhuIPZoIh62KrUqV8IEiPnOo"
         ]
 else:
     GEMINI_API_KEYS = [
-        "AIzaSyAI_vkc2IFhOPKELbxpu1QODKCd5h-bEOI",
-        "AIzaSyBy_aoWhZ5ZKm4yyhw7mNzP-8U-t4pXWMI",
-        "AIzaSyA4jtchIEaTWrHnr_yQcRGTsZIWTAstXNA",
-        "AIzaSyANoeHQtBBxInIYCfNHHO_JGE6DWmhQ2Rg",
-        "AIzaSyAI_vkc2IFhOPKELbxpu1QODKCd5h-bEOI_2",
-        "AIzaSyBy_aoWhZ5ZKm4yyhw7mNzP-8U-t4pXWMI_2",
-        "AIzaSyA4jtchIEaTWrHnr_yQcRGTsZIWTAstXNA_2",
-        "AIzaSyANoeHQtBBxInIYCfNHHO_JGE6DWmhQ2Rg_2"
+        "AIzaSyA2j48JnmiuQKf6uAfzHSg0vAW1gkN7ISc",
+        "AIzaSyCsq2YBVbc0mxoaQcjnGnd3qasoVZaucQk"
+        "AIzaSyCkvLqyIoX4M_dvyG4Tyy1ujpuK_ia-BtQ",
+        "AIzaSyBB1KdR3pKOziItOEsCr5QHEGAf2ZED8lo",
+        "AIzaSyCJoEWTJfBUhuIPZoIh62KrUqV8IEiPnOo"
+
     ]
 
 # Модель из переменных окружения
