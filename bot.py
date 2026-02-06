@@ -3,10 +3,10 @@ import asyncio
 import logging
 import sys
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Dict, List, Tuple
 from enum import Enum
 import json
-import re
+import random
 
 import pytz
 from aiogram import Bot, Dispatcher, types, Router, F
@@ -21,7 +21,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 import google.generativeai as genai
 
-# ========== КОНФИГУРАЦИЯ ==========
+# ========== CONFIG ==========
 API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
     print("❌ ОШИБКА: Не указан BOT_TOKEN в переменных окружения")
@@ -35,140 +35,121 @@ if not DATABASE_URL:
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SUPPORT_BOT_USERNAME = os.getenv("SUPPORT_BOT_USERNAME", "support_bot")
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
-HELP_URL = os.getenv("HELP_URL", "https://telegra.ph/")
-EXAMPLES_URL = os.getenv("EXAMPLES_URL", "https://telegra.ph/")
-PRIVACY_URL = os.getenv("PRIVACY_URL", "https://telegra.ph/")
+SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://railway.app")
+TRIAL_CHANNEL_LINK = os.getenv("TRIAL_CHANNEL_LINK", "https://t.me/example_channel")
+TRIAL_CHANNEL_USERNAME = os.getenv("TRIAL_CHANNEL_USERNAME", "@example_channel")
 
-# ========== КОНФИГУРАЦИЯ AI ==========
-# Загружаем API ключи из переменных окружения
-GEMINI_API_KEYS_STR = os.getenv("GEMINI_API_KEYS", "")
-if GEMINI_API_KEYS_STR:
+# ========== AI CONFIG ==========
+# Загружаем API ключи из переменных окружения или конфига
+GEMINI_API_KEYS = os.getenv("GEMINI_API_KEYS", "")
+if GEMINI_API_KEYS:
     try:
-        GEMINI_API_KEYS = json.loads(GEMINI_API_KEYS_STR)
-    except json.JSONDecodeError:
-        # Пробуем разбить по запятым
-        keys = [k.strip() for k in GEMINI_API_KEYS_STR.split(',') if k.strip()]
-        GEMINI_API_KEYS = keys if keys else []
+        GEMINI_API_KEYS = json.loads(GEMINI_API_KEYS)
+    except:
+        GEMINI_API_KEYS = [
+            "AIzaSyA2j48JnmiuQKf6uAfzHSg0vAW1gkN7ISc",
+            "AIzaSyCsq2YBVbc0mxoaQcjnGnd3qasoVZaucQk",
+            "AIzaSyCkvLqyIoX4M_dvyG4Tyy1ujpuK_ia-BtQ",
+            "AIzaSyBB1KdR3pKOziItOEsCr5QHEGAf2ZED8lo",
+            "AIzaSyCJoEWTJfBUhuIPZoIh62KrUqV8IEiPnOo"
+        ]
 else:
-    GEMINI_API_KEYS = []
-
-if not GEMINI_API_KEYS:
-    print("⚠️  ВНИМАНИЕ: Нет API ключей Gemini в переменных окружения")
-    print("🔄 Использую тестовые ключи (в продакшене добавьте реальные ключи)")
     GEMINI_API_KEYS = [
         "AIzaSyA2j48JnmiuQKf6uAfzHSg0vAW1gkN7ISc",
         "AIzaSyCsq2YBVbc0mxoaQcjnGnd3qasoVZaucQk",
-        "AIzaSyCkvLqyIoX4M_dvyG4Tyy1ujpuK_ia-BtQ"
+        "AIzaSyCkvLqyIoX4M_dvyG4Tyy1ujpuK_ia-BtQ",
+        "AIzaSyBB1KdR3pKOziItOEsCr5QHEGAf2ZED8lo",
+        "AIzaSyCJoEWTJfBUhuIPZoIh62KrUqV8IEiPnOo"
     ]
 
 # Модель из переменных окружения
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Альтернативные модели на случай ошибок
 ALTERNATIVE_MODELS = [
     "gemini-2.5-flash",
-    "gemini-1.5-pro",
-    "gemini-1.0-pro"
+    "gemini-1.5-flash",
+    "gemini-1.5-pro"
 ]
 
-# Настройки ротации
-MAX_RETRIES_PER_REQUEST = 3  # Максимум 3 попытки на запрос пользователя
+# Настройки ротации - 3 попытки перед ошибкой
 REQUESTS_PER_KEY = int(os.getenv("REQUESTS_PER_KEY", "3"))
-REQUEST_COOLDOWN = int(os.getenv("REQUEST_COOLDOWN", "30"))
+REQUEST_COOLDOWN = int(os.getenv("REQUEST_COOLDOWN", "60"))
 KEY_COOLDOWN = int(os.getenv("KEY_COOLDOWN", "300"))
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 POST_CHARACTER_LIMIT = 4000
 
-# ========== ТАРИФНАЯ СИСТЕМА ==========
+# ========== TARIFF SYSTEM ==========
 class Tariff(Enum):
     MINI = "mini"
     STANDARD = "standard"
     VIP = "vip"
     ADMIN = "admin"
+    STANDARD_TRIAL = "standard_trial"
 
 TARIFFS = {
     Tariff.MINI.value: {
         "name": "🚀 Mini",
-        "icon": "🚀",
         "price": 0,
         "currency": "USD",
         "channels_limit": 1,
         "daily_posts_limit": 2,
         "ai_copies_limit": 1,
         "ai_ideas_limit": 10,
-        "color": "#3498db",
-        "description": "Бесплатный стартовый тариф",
-        "features": [
-            "1 подключенный канал",
-            "2 поста в день",
-            "1 AI-копирайтинг в день",
-            "10 AI-идей в день",
-            "Базовые функции"
-        ]
+        "description": "Бесплатный тариф для начала работы",
+        "trial": False
     },
     Tariff.STANDARD.value: {
         "name": "⭐ Standard",
-        "icon": "⭐",
         "price": 4,
         "currency": "USD",
         "channels_limit": 2,
         "daily_posts_limit": 6,
         "ai_copies_limit": 3,
         "ai_ideas_limit": 30,
-        "color": "#9b59b6",
         "description": "Для активных пользователей",
-        "features": [
-            "2 подключенных канала",
-            "6 постов в день",
-            "3 AI-копирайтинга в день",
-            "30 AI-идей в день",
-            "Приоритетная очередь"
-        ]
+        "trial": False
     },
     Tariff.VIP.value: {
         "name": "👑 VIP",
-        "icon": "👑",
         "price": 7,
         "currency": "USD",
         "channels_limit": 3,
         "daily_posts_limit": 12,
         "ai_copies_limit": 7,
         "ai_ideas_limit": 50,
-        "color": "#f39c12",
         "description": "Максимальные возможности",
-        "features": [
-            "3 подключенных канала",
-            "12 постов в день",
-            "7 AI-копирайтингов в день",
-            "50 AI-идей в день",
-            "Экспресс-поддержка",
-            "Расширенная статистика"
-        ]
+        "trial": False
     },
     Tariff.ADMIN.value: {
         "name": "⚡ Admin",
-        "icon": "⚡",
         "price": 0,
         "currency": "USD",
         "channels_limit": 999,
         "daily_posts_limit": 999,
         "ai_copies_limit": 999,
         "ai_ideas_limit": 999,
-        "color": "#e74c3c",
         "description": "Безлимитный доступ",
-        "features": [
-            "Неограниченно каналов",
-            "Неограниченно постов",
-            "Неограниченно AI-запросов",
-            "Все функции VIP",
-            "Админ-панель"
-        ]
+        "trial": False
+    },
+    Tariff.STANDARD_TRIAL.value: {
+        "name": "⭐ Standard (3 дня пробный)",
+        "price": 0,
+        "currency": "USD",
+        "channels_limit": 2,
+        "daily_posts_limit": 6,
+        "ai_copies_limit": 3,
+        "ai_ideas_limit": 30,
+        "description": "Пробный период на 3 дня",
+        "trial": True,
+        "trial_days": 3
     }
 }
 
-# ========== НАСТРОЙКА ==========
+# ========== SETUP ==========
 logging.basicConfig(
     level=logging.INFO,
-    format='\033[94m%(asctime)s\033[0m - \033[92m%(name)s\033[0m - \033[93m%(levelname)s\033[0m - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
@@ -180,138 +161,226 @@ router = Router()
 dp.include_router(router)
 scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
 
-# ========== МЕНЕДЖЕР СЕССИЙ AI С УЛУЧШЕННОЙ РОТАЦИЕЙ ==========
+# ========== УЛУЧШЕННЫЙ AI SESSION MANAGER С ИНТЕЛЛЕКТУАЛЬНОЙ РОТАЦИЕЙ ==========
 class AISessionManager:
     def __init__(self):
         self.sessions: Dict[int, Dict] = {}
-        self.key_stats = {key: {"requests": 0, "errors": 0, "blocked_until": None, "error_403": 0, "error_429": 0, "error_500": 0} for key in GEMINI_API_KEYS}
+        self.key_stats = {key: {
+            "requests": 0, 
+            "errors": 0, 
+            "blocked_until": None, 
+            "403_errors": 0,
+            "last_used": None,
+            "success_rate": 100,
+            "avg_response_time": 0
+        } for key in GEMINI_API_KEYS}
         self.last_request_time: Dict[int, datetime] = {}
         self.current_model_index = 0
-        self.models = [GEMINI_MODEL] + [m for m in ALTERNATIVE_MODELS if m != GEMINI_MODEL]
+        self.models = [GEMINI_MODEL] + ALTERNATIVE_MODELS
+        self.user_retry_counts: Dict[int, Dict] = {}
+        self.key_rotation_log = []
         
     def get_session(self, user_id: int) -> Dict:
         """Получает или создает сессию пользователя"""
         if user_id not in self.sessions:
             self.sessions[user_id] = {
                 'history': [],
-                'current_key_index': 0,
+                'current_key_index': random.randint(0, len(GEMINI_API_KEYS)-1),
                 'request_count': 0,
                 'total_requests': 0,
                 'copies_used': 0,
                 'ideas_used': 0,
                 'last_reset': datetime.now(MOSCOW_TZ).date(),
-                'current_request_retries': 0,
+                'retry_count': 0,
                 'last_successful_key': None,
                 'word_count': 200,
-                'last_error': None
+                'current_request_retries': 0,
+                'preferred_model': GEMINI_MODEL,
+                'failed_keys': set(),
+                'key_performance': {}
             }
         return self.sessions[user_id]
     
     def get_available_key(self, user_id: int) -> Tuple[Optional[str], int, str]:
-        """Получает доступный API ключ с интеллектуальной ротацией"""
+        """Интеллектуальный выбор ключа с учетом статистики"""
         session = self.get_session(user_id)
         
-        # Если есть успешный ключ - пробуем его сначала
+        # 1. Попробовать последний успешный ключ
         if session['last_successful_key'] and session['last_successful_key'] in self.key_stats:
             key_info = self.key_stats[session['last_successful_key']]
-            if not key_info['blocked_until'] or key_info['blocked_until'] < datetime.now(MOSCOW_TZ):
-                if key_info['error_403'] < REQUESTS_PER_KEY:
-                    return session['last_successful_key'], GEMINI_API_KEYS.index(session['last_successful_key']), self.get_current_model()
+            if self._is_key_available(key_info):
+                return session['last_successful_key'], GEMINI_API_KEYS.index(session['last_successful_key']), session.get('preferred_model', self.get_current_model())
         
-        # Ищем доступные ключи
+        # 2. Случайный выбор из доступных ключей (распределение нагрузки)
         available_keys = []
+        current_time = datetime.now(MOSCOW_TZ)
+        
         for key_index, key in enumerate(GEMINI_API_KEYS):
             key_info = self.key_stats[key]
             
-            # Пропускаем заблокированные ключи
-            if key_info['blocked_until'] and key_info['blocked_until'] > datetime.now(MOSCOW_TZ):
+            if not self._is_key_available(key_info):
                 continue
             
-            # Пропускаем ключи с 3+ ошибками 403
-            if key_info['error_403'] >= REQUESTS_PER_KEY:
-                continue
-            
-            # Вычисляем приоритет (меньше ошибок - выше приоритет)
-            priority = key_info['error_403'] * 100 + key_info['error_429'] * 10 + key_info['error_500']
-            
+            # Рассчитываем приоритет ключа
+            priority = self._calculate_key_priority(key_info, session)
             available_keys.append({
                 'key': key,
                 'index': key_index,
                 'priority': priority,
                 'errors': key_info['errors'],
-                'requests': key_info['requests']
+                'last_used': key_info['last_used']
             })
         
-        if not available_keys:
-            # Если все ключи заблокированы, сбрасываем счетчики через 5 минут
-            for key in self.key_stats:
-                if self.key_stats[key]['blocked_until'] and self.key_stats[key]['blocked_until'] < datetime.now(MOSCOW_TZ) + timedelta(minutes=5):
-                    self.key_stats[key]['error_403'] = 0
-                    self.key_stats[key]['blocked_until'] = None
+        if available_keys:
+            # Выбираем ключ с наивысшим приоритетом
+            available_keys.sort(key=lambda x: (-x['priority'], x['errors']))
+            best_key = available_keys[0]
             
-            # Пробуем первый ключ
-            if GEMINI_API_KEYS:
-                key = GEMINI_API_KEYS[0]
-                return key, 0, self.get_current_model()
-            return None, -1, self.get_current_model()
+            session['current_key_index'] = best_key['index']
+            session['request_count'] += 1
+            self.key_stats[best_key['key']]['requests'] += 1
+            self.key_stats[best_key['key']]['last_used'] = current_time
+            
+            return best_key['key'], best_key['index'], session.get('preferred_model', self.get_current_model())
         
-        # Выбираем ключ с наивысшим приоритетом (меньше ошибок)
-        best_key = min(available_keys, key=lambda x: x['priority'])
+        # 3. Если все ключи недоступны, сбросить блокировки и попробовать самый стабильный
+        logger.warning(f"Все ключи недоступны для user_{user_id}, сбрасываю блокировки")
+        self._reset_all_key_blocks()
         
-        session['current_key_index'] = best_key['index']
+        # Пробуем первый ключ с минимальными ошибками
+        sorted_keys = sorted(self.key_stats.items(), key=lambda x: x[1]['errors'])
+        key, key_info = sorted_keys[0]
+        
+        session['current_key_index'] = GEMINI_API_KEYS.index(key)
         session['request_count'] += 1
-        self.key_stats[best_key['key']]['requests'] += 1
+        key_info['requests'] += 1
+        key_info['last_used'] = current_time
         
-        return best_key['key'], best_key['index'], self.get_current_model()
+        return key, GEMINI_API_KEYS.index(key), session.get('preferred_model', self.get_current_model())
     
-    def mark_key_error(self, key: str, error_type: str = "generic"):
-        """Отмечает ошибку для ключа"""
-        if key in self.key_stats:
-            self.key_stats[key]['errors'] += 1
+    def _is_key_available(self, key_info: Dict) -> bool:
+        """Проверяет доступность ключа"""
+        now = datetime.now(MOSCOW_TZ)
+        
+        if key_info['blocked_until'] and key_info['blocked_until'] > now:
+            return False
+        
+        if key_info['403_errors'] >= REQUESTS_PER_KEY:
+            return False
+        
+        # Проверка успешности ключа
+        if key_info['requests'] > 10 and key_info['success_rate'] < 30:
+            return False
             
-            if error_type == "403":
-                self.key_stats[key]['error_403'] += 1
-                logger.warning(f"🔑 Ключ {key[:15]}... получил 403 ошибку. Всего: {self.key_stats[key]['error_403']}/{REQUESTS_PER_KEY}")
-                
-                if self.key_stats[key]['error_403'] >= REQUESTS_PER_KEY:
-                    self.key_stats[key]['blocked_until'] = datetime.now(MOSCOW_TZ) + timedelta(seconds=KEY_COOLDOWN)
-                    logger.error(f"🔒 Ключ {key[:15]}... заблокирован на {KEY_COOLDOWN} сек (3 ошибки 403)")
-                    
-            elif error_type == "429":
-                self.key_stats[key]['error_429'] += 1
-                logger.warning(f"🔑 Ключ {key[:15]}... получил 429 ошибку (лимит)")
-                
-            elif error_type == "500":
-                self.key_stats[key]['error_500'] += 1
-                logger.warning(f"🔑 Ключ {key[:15]}... получил 500 ошибку")
+        return True
     
-    def mark_key_successful(self, key: str, user_id: int):
-        """Отмечает ключ как успешный для пользователя"""
+    def _calculate_key_priority(self, key_info: Dict, session: Dict) -> float:
+        """Рассчитывает приоритет ключа"""
+        priority = 100
+        
+        # Наказываем за ошибки
+        priority -= key_info['errors'] * 10
+        
+        # Наказываем за недавние 403 ошибки
+        priority -= key_info['403_errors'] * 20
+        
+        # Поощряем ключи с высокой успешностью
+        priority += key_info['success_rate'] / 2
+        
+        # Предпочитаем ключи, которые давно не использовались (балансировка нагрузки)
+        if key_info['last_used']:
+            time_since_last_use = (datetime.now(MOSCOW_TZ) - key_info['last_used']).total_seconds()
+            priority += min(time_since_last_use / 300, 20)  # до 20 баллов за 5 минут простоя
+        
+        # Штрафуем за низкую скорость ответа
+        if key_info['avg_response_time'] > 5:
+            priority -= (key_info['avg_response_time'] - 5) * 2
+        
+        return max(priority, 1)
+    
+    def _reset_all_key_blocks(self):
+        """Сбрасывает все блокировки ключей"""
+        for key in self.key_stats:
+            self.key_stats[key]['blocked_until'] = None
+            self.key_stats[key]['403_errors'] = 0
+    
+    def mark_key_403_error(self, key: str, response_time: float = 0):
+        """Отмечает ошибку 403 для ключа с учетом времени ответа"""
         if key in self.key_stats:
-            # Частично сбрасываем счетчики при успехе
-            self.key_stats[key]['error_403'] = max(0, self.key_stats[key]['error_403'] - 1)
+            self.key_stats[key]['403_errors'] += 1
+            self.key_stats[key]['errors'] += 1
+            self.key_stats[key]['avg_response_time'] = (
+                self.key_stats[key]['avg_response_time'] * 0.8 + response_time * 0.2
+            )
+            
+            # Обновляем успешность
+            total_reqs = self.key_stats[key]['requests']
+            if total_reqs > 0:
+                self.key_stats[key]['success_rate'] = (
+                    (total_reqs - self.key_stats[key]['errors']) / total_reqs * 100
+                )
+            
+            logger.warning(f"Ключ {key[:15]}... получил 403. Всего: {self.key_stats[key]['403_errors']}/{REQUESTS_PER_KEY}")
+            
+            if self.key_stats[key]['403_errors'] >= REQUESTS_PER_KEY:
+                block_time = KEY_COOLDOWN * (self.key_stats[key]['403_errors'] - REQUESTS_PER_KEY + 1)
+                self.key_stats[key]['blocked_until'] = datetime.now(MOSCOW_TZ) + timedelta(seconds=block_time)
+                logger.warning(f"Ключ {key[:15]}... заблокирован на {block_time} секунд")
+                
+                # Логируем ротацию
+                self.key_rotation_log.append({
+                    'timestamp': datetime.now(MOSCOW_TZ),
+                    'key': key[:15] + "...",
+                    'reason': '403_error',
+                    'block_time': block_time
+                })
+    
+    def mark_key_successful(self, key: str, user_id: int, response_time: float):
+        """Отмечает ключ как успешный"""
+        if key in self.key_stats:
             session = self.get_session(user_id)
             session['last_successful_key'] = key
+            session['retry_count'] = 0
             session['current_request_retries'] = 0
-            session['last_error'] = None
+            
+            # Обновляем статистику ключа
+            self.key_stats[key]['avg_response_time'] = (
+                self.key_stats[key]['avg_response_time'] * 0.9 + response_time * 0.1
+            )
+            
+            # Сбрасываем счетчики ошибок при успехе
+            if response_time < 3:  # Быстрый успешный ответ
+                self.key_stats[key]['403_errors'] = max(0, self.key_stats[key]['403_errors'] - 1)
+                self.key_stats[key]['errors'] = max(0, self.key_stats[key]['errors'] - 0.5)
+            
+            # Обновляем успешность
+            total_reqs = self.key_stats[key]['requests']
+            if total_reqs > 0:
+                self.key_stats[key]['success_rate'] = (
+                    (total_reqs - self.key_stats[key]['errors']) / total_reqs * 100
+                )
     
-    def increment_request_retry(self, user_id: int):
-        """Увеличивает счетчик попыток для текущего запроса"""
+    def rotate_to_next_key(self, current_key: str) -> Optional[str]:
+        """Ротация на следующий ключ"""
+        if not GEMINI_API_KEYS:
+            return None
+        
+        try:
+            current_index = GEMINI_API_KEYS.index(current_key)
+            next_index = (current_index + 1) % len(GEMINI_API_KEYS)
+            return GEMINI_API_KEYS[next_index]
+        except ValueError:
+            return GEMINI_API_KEYS[0] if GEMINI_API_KEYS else None
+    
+    def increment_user_retry(self, user_id: int):
+        """Увеличивает счетчик попыток для пользователя"""
         session = self.get_session(user_id)
         session['current_request_retries'] += 1
         return session['current_request_retries']
     
-    def get_request_retries(self, user_id: int) -> int:
-        """Получает количество попыток для текущего запроса"""
+    def get_user_retry_count(self, user_id: int) -> int:
+        """Получает количество попыток для пользователя"""
         return self.get_session(user_id)['current_request_retries']
-    
-    def set_last_error(self, user_id: int, error: str):
-        """Сохраняет последнюю ошибку"""
-        self.get_session(user_id)['last_error'] = error
-    
-    def get_last_error(self, user_id: int) -> Optional[str]:
-        """Получает последнюю ошибку"""
-        return self.get_session(user_id)['last_error']
     
     def get_current_model(self) -> str:
         """Возвращает текущую модель"""
@@ -320,7 +389,15 @@ class AISessionManager:
     def rotate_model(self):
         """Переключает на следующую модель"""
         self.current_model_index += 1
-        logger.info(f"🔄 Переключили модель на: {self.get_current_model()}")
+        new_model = self.get_current_model()
+        logger.info(f"🔄 Ротация модели на: {new_model}")
+        
+        # Логируем ротацию модели
+        self.key_rotation_log.append({
+            'timestamp': datetime.now(MOSCOW_TZ),
+            'model': new_model,
+            'reason': 'model_rotation'
+        })
     
     def can_make_request(self, user_id: int) -> Tuple[bool, Optional[str]]:
         """Проверяет, может ли пользователь сделать запрос"""
@@ -343,8 +420,8 @@ class AISessionManager:
                 session['copies_used'] = 0
                 session['ideas_used'] = 0
                 session['last_reset'] = today
+                session['retry_count'] = 0
                 session['current_request_retries'] = 0
-                session['last_error'] = None
     
     def set_word_count(self, user_id: int, word_count: int):
         """Устанавливает количество слов для генерации"""
@@ -355,207 +432,315 @@ class AISessionManager:
         """Получает количество слов для генерации"""
         return self.get_session(user_id)['word_count']
     
-    def get_stats_summary(self) -> Dict[str, Any]:
-        """Возвращает статистику по ключам"""
-        total_requests = sum(stat['requests'] for stat in self.key_stats.values())
-        total_errors = sum(stat['errors'] for stat in self.key_stats.values())
-        blocked_keys = sum(1 for stat in self.key_stats.values() if stat['blocked_until'] and stat['blocked_until'] > datetime.now(MOSCOW_TZ))
+    def get_rotation_stats(self) -> Dict:
+        """Возвращает статистику ротации"""
+        total_keys = len(GEMINI_API_KEYS)
+        active_keys = sum(1 for key_info in self.key_stats.values() 
+                         if self._is_key_available(key_info))
+        blocked_keys = total_keys - active_keys
         
         return {
-            'total_keys': len(GEMINI_API_KEYS),
-            'total_requests': total_requests,
-            'total_errors': total_errors,
+            'total_keys': total_keys,
+            'active_keys': active_keys,
             'blocked_keys': blocked_keys,
-            'active_sessions': len(self.sessions),
-            'current_model': self.get_current_model()
+            'total_requests': sum(key_info['requests'] for key_info in self.key_stats.values()),
+            'total_errors': sum(key_info['errors'] for key_info in self.key_stats.values()),
+            'rotation_log': self.key_rotation_log[-10:]  # Последние 10 записей
         }
 
 ai_manager = AISessionManager()
 
-# ========== ПРОМПТЫ ДЛЯ AI ==========
+# ========== ОБНОВЛЕННЫЙ COPYWRITER_PROMPT ==========
 COPYWRITER_PROMPT = """Ты профессиональный копирайтер для Telegram-каналов. Создай продающий текст на основе следующих данных:
 
 🎯 ТЕМА: {topic}
 🎨 СТИЛЬ: {style}
-📚 ПРИМЕРЫ: {examples}
-📝 ОБЪЕМ: {word_count} слов
+📚 ПРИМЕРЫ РАБОТ: {examples}
+📝 КОЛИЧЕСТВО СЛОВ: {word_count} слов
 
-📌 ТРЕБОВАНИЯ:
+📋 ТРЕБОВАНИЯ:
 1. Текст должен быть цепляющим и вовлекающим
-2. Используй эмодзи уместно (2-3 на абзац)
-3. Структура: Заголовок → Проблема → Решение → Призыв к действию
+2. Используй эмодзи уместно (но не переборщи)
+3. Структура: заголовок → проблема → решение → призыв к действию
 4. ТОЧНО {word_count} слов (±10%)
 5. Пиши как для живых людей, без воды
 6. Учитывай примеры, но не копируй их
 
-📅 ДОПОЛНИТЕЛЬНО:
+✨ ДОПОЛНИТЕЛЬНО:
 - Текущая дата: {current_date}
 - Не упоминай что ты ИИ
 - Пиши в настоящем времени
-- Сделай текст готовым к публикации
+- Убедись что текст содержит примерно {word_count} слов
 
-🎪 Верни ТОЛЬКО готовый текст, без пояснений и обрамления."""
+🚀 Верни ТОЛЬКО готовый текст, без пояснений."""
 
 IDEAS_PROMPT = """Ты эксперт по контенту для Telegram. Сгенерируй {count} идей для постов на тему:
 
 🎯 ТЕМА: {topic}
 
-📌 ТРЕБОВАНИЯ К ИДЕЯМ:
+📋 ТРЕБОВАНИЯ К ИДЕЯМ:
 1. Каждая идея должна быть конкретной и реализуемой
-2. Формат: [Тип контента] Название идеи - Краткое описание (1-2 предложения)
-3. Укажи тип контента: 📝 Текст, 📷 Фото, 🎥 Видео, 📊 Опрос, 🎭 Квиз
-4. Идеи должны быть разнообразными и вовлекающими
+2. Формат: краткое описание (1-2 предложения)
+3. Укажи возможный тип контента (текст, фото, видео, опрос)
+4. Идеи должны быть разнообразными
 
-✨ ПРИМЕР ФОРМАТА:
-1. [📝 Текст] 5 ошибок новичков - Расскажи про частые ошибки с примерами
-2. [📷 Фото] До/После - Покажи результат работы на фото
-3. [🎥 Видео] Обзор инструмента - Сними короткий обзор полезного сервиса
+📝 ПРИМЕР ФОРМАТА:
+1. [Тип] Название идеи - Краткое описание
+2. [Тип] Название идеи - Краткое описание
 
-📅 АКТУАЛЬНОСТЬ:
+✨ ДОПОЛНИТЕЛЬНО:
 - Учитывай тренды {current_date}
-- Идеи должны быть актуальными для Telegram
-- Не повторяйся, будь креативным
+- Идеи должны вовлекать аудиторию
+- Не повторяйся
 
-📋 Верни список идей с нумерацией, каждый с новой строки. Только список, без вступлений и заключений."""
+🚀 Верни список идей с нумерацией, каждый с новой строки."""
 
-# ========== ФУНКЦИЯ ГЕНЕРАЦИИ С РОТАЦИЕЙ КЛЮЧЕЙ ==========
-async def generate_with_gemini(prompt: str, user_id: int) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Генерирует текст через Gemini API с ротацией ключей"""
+# ========== УЛУЧШЕННАЯ ФУНКЦИЯ ГЕНЕРАЦИИ С РОТАЦИЕЙ ==========
+async def generate_with_gemini(prompt: str, user_id: int, max_retries: int = 3) -> Optional[str]:
+    """Генерирует текст через Gemini API с интеллектуальной ротацией"""
     
+    start_time = datetime.now(MOSCOW_TZ)
     session = ai_manager.get_session(user_id)
-    session['current_request_retries'] = 0
-    session['last_error'] = None
     
-    metadata = {
-        'attempts': 0,
-        'keys_tried': [],
-        'models_tried': [],
-        'errors': [],
-        'success': False
-    }
-    
-    for attempt in range(MAX_RETRIES_PER_REQUEST):
+    for retry in range(max_retries):
         try:
-            metadata['attempts'] += 1
-            
             # Получаем доступный ключ
             key, key_index, model_name = ai_manager.get_available_key(user_id)
             
             if not key:
-                error_msg = "❌ Нет доступных API ключей"
-                ai_manager.set_last_error(user_id, error_msg)
-                metadata['errors'].append(error_msg)
-                return None, metadata
+                logger.error(f"❌ Нет доступных ключей для user_{user_id}")
+                return None
             
-            # Проверяем, не использовали ли уже этот ключ в этой попытке
-            if key in metadata['keys_tried']:
-                # Все ключи уже перепробованы в этой попытке
-                if len(metadata['keys_tried']) >= len(GEMINI_API_KEYS):
-                    error_msg = "❌ Все ключи перепробованы"
-                    ai_manager.set_last_error(user_id, error_msg)
-                    metadata['errors'].append(error_msg)
-                    return None, metadata
-                # Пробуем другой ключ
-                continue
-            
-            metadata['keys_tried'].append(key)
-            metadata['models_tried'].append(model_name)
-            
-            # Настраиваем Gemini
+            # Настраиваем API
             genai.configure(api_key=key)
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                generation_config={
-                    "temperature": 0.8,
-                    "top_p": 0.95,
-                    "top_k": 40,
-                    "max_output_tokens": 4000,
-                }
+            model = genai.GenerativeModel(model_name)
+            
+            # Отправляем запрос с таймаутом
+            response = await asyncio.wait_for(
+                model.generate_content(
+                    prompt,
+                    generation_config={
+                        "temperature": 0.8,
+                        "top_p": 0.95,
+                        "top_k": 40,
+                        "max_output_tokens": 4000,
+                    }
+                ),
+                timeout=30
             )
             
-            logger.info(f"🔑 Попытка {attempt+1}: ключ {key_index}, модель {model_name}")
+            # Рассчитываем время ответа
+            response_time = (datetime.now(MOSCOW_TZ) - start_time).total_seconds()
             
-            # Отправляем запрос
-            response = model.generate_content(prompt)
+            # Отмечаем успех
+            ai_manager.mark_key_successful(key, user_id, response_time)
             
-            # Если успешно
-            ai_manager.mark_key_successful(key, user_id)
-            metadata['success'] = True
-            metadata['final_key'] = key
-            metadata['final_model'] = model_name
-            metadata['final_attempt'] = attempt + 1
+            # Логируем успешный запрос
+            logger.info(f"✅ AI запрос | user_{user_id} | key_{key_index} | модель: {model_name} | "
+                       f"попытка: {retry+1}/{max_retries} | время: {response_time:.2f}с")
             
-            logger.info(f"✅ Успех после {attempt+1} попыток: user_{user_id}, ключ {key_index}")
-            return response.text.strip(), metadata
+            return response.text.strip()
+            
+        except asyncio.TimeoutError:
+            logger.warning(f"⏱ Таймаут при попытке {retry+1}/{max_retries} для user_{user_id}")
+            if key:
+                ai_manager.mark_key_403_error(key, 30)  # Таймаут считается как медленный ответ
             
         except Exception as e:
-            error_str = str(e)
-            metadata['errors'].append(f"Попытка {attempt+1}: {error_str}")
+            error_msg = str(e).lower()
+            error_code = str(e)
+            response_time = (datetime.now(MOSCOW_TZ) - start_time).total_seconds()
             
-            # Определяем тип ошибки
-            error_type = "generic"
-            if "429" in error_str or "quota" in error_str.lower() or "resource exhausted" in error_str.lower():
-                error_type = "429"
-                logger.warning(f"🔄 Попытка {attempt+1}: Лимит ключа для user_{user_id}")
-            elif "403" in error_str or "permission denied" in error_str.lower():
-                error_type = "403"
-                logger.warning(f"🔄 Попытка {attempt+1}: Ошибка 403 для user_{user_id}")
-            elif "500" in error_str or "503" in error_str or "unavailable" in error_str.lower():
-                error_type = "500"
-                logger.warning(f"🔄 Попытка {attempt+1}: Ошибка сервера для user_{user_id}")
+            # Логируем ошибку
+            logger.error(f"❌ Ошибка при попытке {retry+1}/{max_retries} для user_{user_id}: {error_msg[:100]}")
+            
+            # Определяем тип ошибки и принимаем меры
+            if "429" in error_code or "quota" in error_msg or "resource exhausted" in error_msg:
+                logger.warning(f"🔄 Лимит ключа, ротирую...")
+                if key:
+                    ai_manager.mark_key_403_error(key, response_time)
+                    # Пробуем следующий ключ
+                    next_key = ai_manager.rotate_to_next_key(key)
+                    if next_key and retry + 1 < max_retries:
+                        logger.info(f"🔄 Переключаюсь на ключ {next_key[:15]}...")
+                
+            elif "403" in error_code or "permission denied" in error_msg:
+                logger.warning(f"🔒 Ошибка доступа 403")
+                if key:
+                    ai_manager.mark_key_403_error(key, response_time)
+                
+            elif "503" in error_code or "unavailable" in error_msg:
+                logger.warning(f"🌐 Сервис недоступен, ротирую модель...")
+                ai_manager.rotate_model()
+                
+            elif "500" in error_code or "internal" in error_msg:
+                logger.warning(f"⚡ Внутренняя ошибка сервера")
+                if key and retry + 1 < max_retries:
+                    await asyncio.sleep(2 ** retry)  # Экспоненциальная задержка
+                
             else:
-                logger.error(f"❌ Попытка {attempt+1}: Неизвестная ошибка для user_{user_id}: {e}")
-            
-            # Отмечаем ошибку для ключа
-            if 'key' in locals():
-                ai_manager.mark_key_error(key, error_type)
-            
-            # Сохраняем ошибку в сессии
-            ai_manager.set_last_error(user_id, f"{error_type}: {error_str[:100]}")
+                logger.error(f"⚠️ Неизвестная ошибка: {error_msg[:100]}")
             
             # Увеличиваем счетчик попыток
-            ai_manager.increment_request_retry(user_id)
+            ai_manager.increment_user_retry(user_id)
             
-            # Если это не последняя попытка - ждем и продолжаем
-            if attempt < MAX_RETRIES_PER_REQUEST - 1:
-                wait_time = 1 * (attempt + 1)  # Увеличиваем задержку
-                logger.info(f"⏳ Жду {wait_time} сек перед следующей попыткой...")
+            # Если это не последняя попытка - ждем и пробуем снова
+            if retry + 1 < max_retries:
+                wait_time = (retry + 1) * 2  # Экспоненциальная задержка
+                logger.info(f"⏳ Жду {wait_time} секунд перед следующей попыткой...")
                 await asyncio.sleep(wait_time)
-                
-                # Ротируем модель на следующей попытке
-                if attempt % 2 == 0:
-                    ai_manager.rotate_model()
-            else:
-                logger.error(f"❌ Все {MAX_RETRIES_PER_REQUEST} попыток исчерпаны для user_{user_id}")
     
-    return None, metadata
+    # Все попытки исчерпаны
+    logger.error(f"💥 Все {max_retries} попыток исчерпаны для user_{user_id}")
+    return None
 
-# ========== ФУНКЦИИ БАЗЫ ДАННЫХ ==========
-async def get_db_connection():
-    """Создает подключение к базе данных"""
+# ========== ДОБАВЛЕНИЕ НОВЫХ ФУНКЦИЙ ДЛЯ ПРОБНОГО ПЕРИОДА ==========
+async def check_channel_subscription(user_id: int, channel_username: str = None) -> bool:
+    """Проверяет подписку пользователя на канал"""
+    if not channel_username:
+        channel_username = TRIAL_CHANNEL_USERNAME
+    
     try:
-        if DATABASE_URL.startswith("postgres://"):
-            conn_string = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-        else:
-            conn_string = DATABASE_URL
+        # Убираем @ если есть
+        if channel_username.startswith('@'):
+            channel_username = channel_username[1:]
         
-        if "sslmode" not in conn_string:
-            if "?" in conn_string:
-                conn_string += "&sslmode=require"
-            else:
-                conn_string += "?sslmode=require"
+        # Получаем chat_id канала
+        chat_id = f"@{channel_username}"
         
-        return await asyncpg.connect(conn_string, timeout=30)
+        # Проверяем статус участника
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        
+        # Статусы, которые считаются подпиской
+        valid_statuses = ['member', 'administrator', 'creator']
+        
+        return member.status in valid_statuses
+        
     except Exception as e:
-        logger.error(f"❌ Ошибка подключения к БД: {e}")
-        raise
+        logger.error(f"Ошибка проверки подписки для user_{user_id}: {e}")
+        return False
 
-async def init_db():
-    """Инициализирует таблицы базы данных"""
+async def activate_trial_period(user_id: int, tariff_id: str = "standard_trial") -> Tuple[bool, str]:
+    """Активирует пробный период на 3 дня"""
     try:
         conn = await get_db_connection()
         
-        # Таблица пользователей
+        # Проверяем, не использовал ли уже пользователь пробный период
+        user = await conn.fetchrow(
+            "SELECT trial_used, trial_end_date FROM users WHERE id = $1", 
+            user_id
+        )
+        
+        if user and user['trial_used']:
+            if user['trial_end_date'] and user['trial_end_date'] > datetime.now(MOSCOW_TZ):
+                return False, "❌ Вы уже используете пробный период!"
+            else:
+                return False, "❌ Вы уже использовали пробный период ранее!"
+        
+        # Проверяем подписку на канал
+        is_subscribed = await check_channel_subscription(user_id)
+        if not is_subscribed:
+            return False, f"📢 Для активации пробного периода необходимо подписаться на канал: {TRIAL_CHANNEL_LINK}"
+        
+        # Активируем пробный период
+        trial_end_date = datetime.now(MOSCOW_TZ) + timedelta(days=3)
+        
+        await conn.execute('''
+            UPDATE users 
+            SET tariff = $1, 
+                trial_used = TRUE,
+                trial_end_date = $2,
+                trial_start_date = $3
+            WHERE id = $4
+        ''', tariff_id, trial_end_date, datetime.now(MOSCOW_TZ), user_id)
+        
+        await conn.close()
+        
+        # Отправляем уведомление админу
+        if ADMIN_ID:
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"🎉 АКТИВИРОВАН ПРОБНЫЙ ПЕРИОД!\n\n"
+                    f"👤 Пользователь: {user_id}\n"
+                    f"💎 Тариф: Standard (3 дня пробный)\n"
+                    f"📅 Действует до: {trial_end_date.strftime('%d.%m.%Y %H:%M')}\n"
+                    f"🕐 Время активации: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
+                )
+            except Exception as e:
+                logger.error(f"Не удалось уведомить админа: {e}")
+        
+        return True, (
+            f"🎉 Пробный период активирован!\n\n"
+            f"⭐ Теперь у вас тариф Standard на 3 дня!\n\n"
+            f"📊 Ваши новые возможности:\n"
+            f"• 2 канала вместо 1\n"
+            f"• 6 постов в день вместо 2\n"
+            f"• 3 AI-копирайтинга вместо 1\n"
+            f"• 30 идей в день вместо 10\n\n"
+            f"📅 Действует до: {trial_end_date.strftime('%d.%m.%Y %H:%M')}\n\n"
+            f"💡 После окончания пробного периода:\n"
+            f"• Тариф вернется к Mini\n"
+            f"• Вы сможете оплатить полную версию"
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка активации пробного периода: {e}")
+        return False, f"❌ Ошибка при активации пробного периода: {str(e)}"
+
+async def check_trial_expiry():
+    """Проверяет истечение пробных периодов"""
+    try:
+        conn = await get_db_connection()
+        
+        # Находим пользователей с истекшим пробным периодом
+        users = await conn.fetch('''
+            SELECT id, username, trial_end_date 
+            FROM users 
+            WHERE trial_used = TRUE 
+            AND trial_end_date < $1
+            AND tariff = 'standard_trial'
+        ''', datetime.now(MOSCOW_TZ))
+        
+        for user in users:
+            # Возвращаем на тариф mini
+            await conn.execute('''
+                UPDATE users 
+                SET tariff = 'mini'
+                WHERE id = $1
+            ''', user['id'])
+            
+            # Отправляем уведомление пользователю
+            try:
+                await bot.send_message(
+                    user['id'],
+                    f"📢 Ваш пробный период тарифа Standard завершен!\n\n"
+                    f"⭐ Спасибо, что попробовали все возможности бота!\n\n"
+                    f"🔙 Ваш тариф возвращен к Mini.\n\n"
+                    f"💎 Чтобы продолжить использовать расширенные возможности:\n"
+                    f"1. Перейдите в раздел 'Тарифы'\n"
+                    f"2. Выберите Standard или VIP\n"
+                    f"3. Оплатите через менеджера\n\n"
+                    f"📊 Что изменилось:\n"
+                    f"• Каналов: 2 → 1\n"
+                    f"• Постов в день: 6 → 2\n"
+                    f"• AI-копирайтингов: 3 → 1\n"
+                    f"• Идей в день: 30 → 10"
+                )
+            except Exception as e:
+                logger.error(f"Не удалось уведомить пользователя {user['id']}: {e}")
+        
+        await conn.close()
+        logger.info(f"✅ Проверено истечение пробных периодов: {len(users)} пользователей")
+        
+    except Exception as e:
+        logger.error(f"Ошибка проверки пробных периодов: {e}")
+
+# ========== ОБНОВЛЕННЫЕ DATABASE FUNCTIONS ==========
+async def init_db():
+    try:
+        conn = await get_db_connection()
+        
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id BIGINT PRIMARY KEY,
@@ -569,11 +754,13 @@ async def init_db():
                 ai_last_used TIMESTAMP,
                 is_active BOOLEAN DEFAULT TRUE,
                 is_admin BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT NOW()
+                created_at TIMESTAMP DEFAULT NOW(),
+                trial_used BOOLEAN DEFAULT FALSE,
+                trial_end_date TIMESTAMP,
+                trial_start_date TIMESTAMP
             )
         ''')
         
-        # Таблица каналов
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS channels (
                 id BIGSERIAL PRIMARY KEY,
@@ -585,7 +772,6 @@ async def init_db():
             )
         ''')
         
-        # Таблица запланированных постов
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS scheduled_posts (
                 id BIGSERIAL PRIMARY KEY,
@@ -601,7 +787,6 @@ async def init_db():
             )
         ''')
         
-        # Таблица заказов тарифов
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS tariff_orders (
                 id BIGSERIAL PRIMARY KEY,
@@ -614,807 +799,636 @@ async def init_db():
             )
         ''')
         
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS ai_rotation_logs (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT,
+                key_index INTEGER,
+                model TEXT,
+                success BOOLEAN,
+                error_type TEXT,
+                response_time FLOAT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        
         await conn.close()
         logger.info("✅ Таблицы БД созданы/проверены")
     except Exception as e:
         logger.error(f"❌ Ошибка инициализации БД: {e}")
         raise
 
-# ... (остальные функции базы данных остаются такими же, как в исходном коде)
-# Для экономии места я оставлю только основные изменения
+async def migrate_db():
+    try:
+        conn = await get_db_connection()
+        
+        migrations = [
+            ('users', 'trial_used', 'BOOLEAN DEFAULT FALSE'),
+            ('users', 'trial_end_date', 'TIMESTAMP'),
+            ('users', 'trial_start_date', 'TIMESTAMP'),
+        ]
+        
+        for table, column, definition in migrations:
+            try:
+                exists = await conn.fetchval(f'''
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.columns 
+                        WHERE table_name = $1 AND column_name = $2
+                    )
+                ''', table, column)
+                
+                if not exists:
+                    await conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+            except Exception as e:
+                logger.error(f"Ошибка при добавлении колонки {column}: {e}")
+        
+        if ADMIN_ID > 0:
+            await conn.execute('''
+                UPDATE users 
+                SET is_admin = TRUE, tariff = 'admin' 
+                WHERE id = $1
+            ''', ADMIN_ID)
+        
+        await conn.close()
+        logger.info("✅ Миграции БД завершены")
+    except Exception as e:
+        logger.error(f"❌ Ошибка миграции БД: {e}")
 
-# ========== УЛУЧШЕННЫЕ КЛАВИАТУРЫ С ЭМОДЗИ ==========
-def format_tariff_card(tariff_id: str, is_current: bool = False) -> str:
-    """Форматирует карточку тарифа"""
-    tariff = TARIFFS.get(tariff_id)
-    if not tariff:
-        return ""
-    
-    card = ""
-    if is_current:
-        card += f"✅ {tariff['icon']} <b>{tariff['name']}</b> (Ваш тариф)\n\n"
-    else:
-        card += f"{tariff['icon']} <b>{tariff['name']}</b>\n"
-    
-    if tariff['price'] == 0:
-        card += "💰 <b>Бесплатно</b>\n\n"
-    else:
-        card += f"💰 <b>{tariff['price']} {tariff['currency']}/месяц</b>\n\n"
-    
-    card += "📊 <b>Лимиты:</b>\n"
-    card += f"• Каналов: {tariff['channels_limit']}\n"
-    card += f"• Постов/день: {tariff['daily_posts_limit']}\n"
-    card += f"• AI-копирайтингов: {tariff['ai_copies_limit']}\n"
-    card += f"• AI-идей: {tariff['ai_ideas_limit']}\n\n"
-    
-    if tariff['description']:
-        card += f"📝 {tariff['description']}\n"
-    
-    return card
+async def get_user_tariff(user_id: int) -> str:
+    """Получает текущий тариф пользователя с учетом пробного периода"""
+    try:
+        conn = await get_db_connection()
+        user = await conn.fetchrow(
+            "SELECT tariff, is_admin, trial_used, trial_end_date FROM users WHERE id = $1", 
+            user_id
+        )
+        await conn.close()
+        
+        if not user:
+            conn = await get_db_connection()
+            await conn.execute('''
+                INSERT INTO users (id, tariff) VALUES ($1, 'mini')
+            ''', user_id)
+            await conn.close()
+            return 'mini'
+        
+        if user.get('is_admin'):
+            return 'admin'
+        
+        # Проверяем пробный период
+        if user.get('tariff') == 'standard_trial' and user.get('trial_end_date'):
+            if user['trial_end_date'] > datetime.now(MOSCOW_TZ):
+                return 'standard_trial'
+            else:
+                # Пробный период истек, возвращаем на mini
+                await update_user_tariff(user_id, 'mini')
+                return 'mini'
+        
+        return user.get('tariff', 'mini')
+    except Exception as e:
+        logger.error(f"Ошибка получения тарифа: {e}")
+        return 'mini'
 
+# ========== ОБНОВЛЕННЫЕ KEYBOARDS ==========
 def get_main_menu(user_id: int, is_admin: bool = False) -> InlineKeyboardMarkup:
-    """Главное меню с улучшенным дизайном"""
     buttons = [
         [InlineKeyboardButton(text="🤖 ИИ-сервисы", callback_data="ai_services")],
-        [InlineKeyboardButton(text="📅 Планировщик постов", callback_data="schedule_post")],
+        [InlineKeyboardButton(text="📅 Запланировать пост", callback_data="schedule_post")],
         [InlineKeyboardButton(text="📊 Моя статистика", callback_data="my_stats")],
         [InlineKeyboardButton(text="📢 Мои каналы", callback_data="my_channels")],
-        [InlineKeyboardButton(text="💎 Тарифы и оплата", callback_data="tariffs")],
-        [
-            InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_BOT_USERNAME}"),
-            InlineKeyboardButton(text="📚 Помощь", callback_data="help_command")
-        ]
+        [InlineKeyboardButton(text="💎 Тарифы", callback_data="tariffs")],
+        [InlineKeyboardButton(text="🎁 Пробный период", callback_data="trial_period")],
+        [InlineKeyboardButton(text="🆘 Техподдержка", url=f"https://t.me/{SUPPORT_BOT_USERNAME}")],
     ]
     
     if is_admin:
         buttons.append([InlineKeyboardButton(text="👑 Админ-панель", callback_data="admin_panel")])
     
+    # Добавляем кнопку с поддержкой если что-то не работает
+    buttons.append([
+        InlineKeyboardButton(
+            text="⚠️ Если не работает - пишите", 
+            url=SUPPORT_LINK
+        )
+    ])
+    
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_tariffs_keyboard(user_tariff: str = 'mini') -> InlineKeyboardMarkup:
-    """Клавиатура тарифов с визуальным оформлением"""
     buttons = []
     
-    for tariff_id in ['mini', 'standard', 'vip']:
-        tariff_info = TARIFFS.get(tariff_id)
-        if not tariff_info:
+    for tariff_id, tariff_info in TARIFFS.items():
+        if tariff_id == 'admin' or tariff_id == 'standard_trial':
             continue
             
         name = tariff_info['name']
+        price = tariff_info['price']
         
-        if tariff_id == user_tariff:
+        if tariff_id == user_tariff or (user_tariff == 'standard_trial' and tariff_id == 'standard'):
             button_text = f"✅ {name} (текущий)"
         else:
-            if tariff_info['price'] == 0:
-                button_text = f"{tariff_info['icon']} {name} - Бесплатно"
+            if price == 0:
+                button_text = f"{name} - Бесплатно"
             else:
-                button_text = f"{tariff_info['icon']} {name} - {tariff_info['price']} {tariff_info['currency']}"
+                button_text = f"{name} - {price} USD/месяц"
         
         buttons.append([InlineKeyboardButton(
             text=button_text,
             callback_data=f"tariff_info_{tariff_id}"
         )])
     
-    buttons.append([
-        InlineKeyboardButton(text="🕐 Время по МСК", callback_data="check_time"),
-        InlineKeyboardButton(text="💬 Консультация", url=f"https://t.me/{ADMIN_CONTACT.replace('@', '')}")
-    ])
+    # Кнопка пробного периода
+    buttons.append([InlineKeyboardButton(
+        text="🎁 3 дня Standard БЕСПЛАТНО",
+        callback_data="trial_info"
+    )])
+    
+    buttons.append([InlineKeyboardButton(text="⏰ Проверить время", callback_data="check_time")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")])
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_ai_main_menu(user_tariff: str) -> InlineKeyboardMarkup:
-    """Главное меню AI-сервисов"""
-    buttons = [
-        [InlineKeyboardButton(text="📝 ИИ-копирайтер", callback_data="ai_copywriter")],
-        [InlineKeyboardButton(text="💡 Генератор идей", callback_data="ai_ideas")],
-        [InlineKeyboardButton(text="📊 Мои AI-лимиты", callback_data="ai_limits")],
-        [InlineKeyboardButton(text="📚 Примеры работ", callback_data="ai_examples")],
-        [
-            InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_BOT_USERNAME}"),
-            InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")
+def get_trial_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Подписаться на канал", url=TRIAL_CHANNEL_LINK)],
+        [InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_subscription")],
+        [InlineKeyboardButton(text="🎁 Активировать пробный период", callback_data="activate_trial")],
+        [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="tariffs")]
+    ])
+
+def get_tariff_order_keyboard(tariff_id: str, has_trial: bool = False) -> InlineKeyboardMarkup:
+    tariff_info = TARIFFS.get(tariff_id)
+    
+    if not tariff_info:
+        return get_tariffs_keyboard()
+    
+    if tariff_id == 'standard' and not has_trial:
+        buttons = [
+            [InlineKeyboardButton(text="🎁 Получить 3 дня БЕСПЛАТНО", callback_data="trial_info")],
+            [InlineKeyboardButton(text="💳 Заказать тариф", callback_data=f"order_{tariff_id}")],
+            [InlineKeyboardButton(text="💬 Связаться с менеджером", url=f"https://t.me/{ADMIN_CONTACT.replace('@', '')}")],
+            [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="tariffs")]
         ]
-    ]
+    elif tariff_info['price'] == 0:
+        buttons = [
+            [InlineKeyboardButton(text="🆓 Активировать бесплатный тариф", callback_data=f"activate_{tariff_id}")],
+            [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="tariffs")]
+        ]
+    else:
+        buttons = [
+            [InlineKeyboardButton(text="💳 Заказать тариф", callback_data=f"order_{tariff_id}")],
+            [InlineKeyboardButton(text="💬 Связаться с менеджером", url=f"https://t.me/{ADMIN_CONTACT.replace('@', '')}")],
+            [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="tariffs")]
+        ]
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_retry_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура для повторной попытки"""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="ai_copywriter")],
-        [InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_BOT_USERNAME}")],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
-    ])
+# ========== ОБНОВЛЕННЫЕ STATES ==========
+class TrialStates(StatesGroup):
+    waiting_for_subscription_check = State()
 
-# ========== STATES ==========
-class PostStates(StatesGroup):
-    waiting_for_channel = State()
-    waiting_for_content = State()
-    waiting_for_date = State()
-    waiting_for_time = State()
-    waiting_for_confirmation = State()
-
-class AIStates(StatesGroup):
-    waiting_for_topic = State()
-    waiting_for_examples = State()
-    waiting_for_style = State()
-    waiting_for_word_count = State()
-    waiting_for_idea_topic = State()
-
-class AdminStates(StatesGroup):
-    waiting_for_broadcast = State()
-    waiting_for_order_note = State()
-    waiting_for_user_id = State()
-    waiting_for_confirm_assign = State()
-
-# ========== ОСНОВНЫЕ ОБРАБОТЧИКИ ==========
+# ========== ОБНОВЛЕННЫЕ BASIC HANDLERS ==========
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    """Обработчик команды /start"""
     user_id = message.from_user.id
     username = message.from_user.username or ""
     first_name = message.from_user.first_name or "Пользователь"
     is_admin = user_id == ADMIN_ID
     
-    # Регистрируем пользователя
     try:
         conn = await get_db_connection()
         await conn.execute('''
             INSERT INTO users (id, username, first_name, is_admin, tariff)
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (id) DO UPDATE 
-            SET username = EXCLUDED.username, first_name = EXCLUDED.first_name
+            SET username = EXCLUDED.username, first_name = EXCLUDED.first_name,
+                is_admin = EXCLUDED.is_admin
         ''', user_id, username, first_name, is_admin, 'mini' if not is_admin else 'admin')
         await conn.close()
     except Exception as e:
-        logger.error(f"❌ Ошибка регистрации пользователя {user_id}: {e}")
+        logger.error(f"Ошибка регистрации пользователя {user_id}: {e}")
     
-    # Получаем тариф
     current_tariff = await get_user_tariff(user_id)
     tariff_info = TARIFFS.get(current_tariff, TARIFFS['mini'])
     
-    # Красивый текст приветствия
     welcome_text = (
-        f"✨ <b>Добро пожаловать, {first_name}!</b>\n\n"
-        f"🚀 <b>KOLES-TECH AI Bot</b> — ваш помощник в создании и планировании контента\n\n"
-        
-        f"🎯 <b>Что я умею:</b>\n"
-        f"• 🤖 <b>AI-копирайтер</b> — пишу продающие тексты\n"
-        f"• 💡 <b>Генератор идей</b> — создаю темы для постов\n"
-        f"• 📅 <b>Планировщик</b> — публикую посты автоматически\n"
-        f"• 📊 <b>Аналитика</b> — показываю статистику\n\n"
-        
-        f"💎 <b>Ваш тариф:</b> {tariff_info['icon']} {tariff_info['name']}\n\n"
-        
-        f"📍 <b>Время публикации:</b> Указывается по Москве\n\n"
-        
-        f"👇 <b>Выберите действие:</b>"
+        f"👋 Привет, {first_name}!\n\n"
+        f"🤖 Я — бот KOLES-TECH для планирования постов и AI-контента.\n\n"
+        f"💎 Ваш текущий тариф: {tariff_info['name']}\n\n"
+        f"✨ Возможности:\n"
+        f"• 🤖 AI-копирайтер и генератор идей\n"
+        f"• 📅 Запланировать пост с любым контентом\n"
+        f"• 📊 Детальная статистика\n"
+        f"• 📢 Управление каналами\n"
+        f"• ⏰ Автопубликация в нужное время\n"
+        f"• 🎁 3 дня Standard БЕСПЛАТНО\n\n"
+        f"📍 Время указывается по Москве\n\n"
+        f"⚠️ Если что-то не работает - пишите: {SUPPORT_LINK}\n\n"
+        f"👇 Выберите действие:"
     )
     
-    await message.answer(welcome_text, parse_mode='HTML', reply_markup=get_main_menu(user_id, is_admin))
+    await message.answer(welcome_text, reply_markup=get_main_menu(user_id, is_admin))
 
-@router.message(Command("help"))
-@router.callback_query(F.data == "help_command")
-async def show_help(message_or_callback: Message | CallbackQuery):
-    """Показывает помощь"""
-    help_text = (
-        f"📚 <b>Помощь по использованию бота</b>\n\n"
-        
-        f"🤖 <b>AI-сервисы:</b>\n"
-        f"• <b>Копирайтер</b> — создает текст по вашей теме\n"
-        f"• <b>Генератор идей</b> — предлагает идеи для постов\n"
-        f"• <b>Лимиты</b> обновляются ежедневно в 00:00\n\n"
-        
-        f"📅 <b>Планирование поста:</b>\n"
-        f"1. Выберите «Планировщик постов»\n"
-        f"2. Выберите канал\n"
-        f"3. Отправьте контент\n"
-        f"4. Укажите дату и время\n"
-        f"5. Подтвердите публикацию\n\n"
-        
-        f"💎 <b>Тарифы:</b>\n"
-        f"• 🚀 <b>Mini</b> — 1 копирайт, 10 идей, 1 канал, 2 поста\n"
-        f"• ⭐ <b>Standard</b> — 3 копирайта, 30 идей, 2 канала, 6 постов\n"
-        f"• 👑 <b>VIP</b> — 7 копирайтов, 50 идей, 3 канала, 12 постов\n\n"
-        
-        f"🔄 <b>Система ротации ключей:</b>\n"
-        f"• При ошибке 403/429/500 ключ меняется автоматически\n"
-        f"• Максимум 3 попытки на запрос\n"
-        f"• Ключи восстанавливаются через 5 минут\n\n"
-        
-        f"🔗 <b>Ссылки:</b>\n"
-        f"• 📚 <a href='{HELP_URL}'>Полная документация</a>\n"
-        f"• 📝 <a href='{EXAMPLES_URL}'>Примеры работ</a>\n"
-        f"• 🔒 <a href='{PRIVACY_URL}'>Политика конфиденциальности</a>\n\n"
-        
-        f"🆘 <b>Поддержка:</b> @{SUPPORT_BOT_USERNAME}\n"
-        f"💬 <b>По оплате:</b> @{ADMIN_CONTACT.replace('@', '')}"
-    )
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🆘 Техподдержка", url=f"https://t.me/{SUPPORT_BOT_USERNAME}")],
-        [InlineKeyboardButton(text="📚 Примеры работ", url=EXAMPLES_URL)],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
-    ])
-    
-    if isinstance(message_or_callback, Message):
-        await message_or_callback.answer(help_text, parse_mode='HTML', reply_markup=keyboard, disable_web_page_preview=True)
-    else:
-        await message_or_callback.message.edit_text(help_text, parse_mode='HTML', reply_markup=keyboard, disable_web_page_preview=True)
-
-# ========== AI ОБРАБОТЧИКИ С УЛУЧШЕННОЙ ОБРАБОТКОЙ ОШИБОК ==========
-@router.callback_query(F.data == "ai_copywriter")
-async def start_copywriter(callback: CallbackQuery, state: FSMContext):
-    """Начинает процесс создания текста"""
+# ========== НОВЫЕ HANDLERS ДЛЯ ПРОБНОГО ПЕРИОДА ==========
+@router.callback_query(F.data == "trial_period")
+async def trial_period_info(callback: CallbackQuery):
     user_id = callback.from_user.id
     
-    # Проверка лимитов
-    tariff = await get_user_tariff(user_id)
-    tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
-    session = ai_manager.get_session(user_id)
-    
-    if session['copies_used'] >= tariff_info['ai_copies_limit']:
-        await callback.message.edit_text(
-            f"❌ <b>Достигнут дневной лимит!</b>\n\n"
-            f"📝 Копирайтинг: {session['copies_used']}/{tariff_info['ai_copies_limit']}\n\n"
-            f"🔄 Лимиты обновятся в 00:00 по Москве",
-            parse_mode='HTML',
-            reply_markup=get_ai_main_menu(tariff)
-        )
-        return
-    
-    # Проверка времени
-    can_request, wait_message = ai_manager.can_make_request(user_id)
-    if not can_request:
-        await callback.answer(wait_message, show_alert=True)
-        return
-    
-    await state.set_state(AIStates.waiting_for_topic)
-    
-    await callback.message.edit_text(
-        f"🤖 <b>ИИ-копирайтер</b>\n\n"
-        f"✅ <b>Доступно:</b> {tariff_info['ai_copies_limit'] - session['copies_used']}/{tariff_info['ai_copies_limit']} текстов сегодня\n\n"
-        
-        f"📌 <b>Шаг 1/4: Тема</b>\n"
-        f"Введите тему для поста:\n\n"
-        
-        f"✨ <b>Примеры хороших тем:</b>\n"
-        f"• Запуск нового курса по маркетингу\n"
-        f"• Анонс вебинара по трейдингу\n"
-        f"• Продажа SEO-услуг для малого бизнеса\n"
-        f"• Обзор нового приложения для планирования\n\n"
-        
-        f"📍 <b>Чем конкретнее тема, тем лучше результат!</b>",
-        parse_mode='HTML',
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
-        ])
+    # Проверяем текущий статус
+    conn = await get_db_connection()
+    user = await conn.fetchrow(
+        "SELECT trial_used, trial_end_date, tariff FROM users WHERE id = $1", 
+        user_id
     )
-
-@router.message(AIStates.waiting_for_topic)
-async def process_topic(message: Message, state: FSMContext):
-    """Обрабатывает тему"""
-    if len(message.text) < 5:
-        await message.answer(
-            "❌ <b>Тема слишком короткая!</b>\nМинимум 5 символов.\n\nВведите тему еще раз:",
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
-            ])
-        )
-        return
+    await conn.close()
     
-    await state.update_data(topic=message.text)
-    await state.set_state(AIStates.waiting_for_examples)
-    
-    await message.answer(
-        "📌 <b>Шаг 2/4: Примеры</b>\n\n"
-        "Пришлите примеры работ или ссылки (по желанию):\n\n"
-        "📋 <b>Можно:</b>\n"
-        "• Прислать тексты постов\n"
-        "• Ссылки на каналы\n"
-        "• Ключевые фразы\n"
-        "• Стилистические примеры\n\n"
-        "📍 <b>Или напишите</b> «пропустить», если примеров нет:",
-        parse_mode='HTML',
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
-        ])
-    )
-
-@router.message(AIStates.waiting_for_examples)
-async def process_examples(message: Message, state: FSMContext):
-    """Обрабатывает примеры"""
-    examples = message.text if message.text.lower() != 'пропустить' else "Примеры не предоставлены"
-    
-    await state.update_data(examples=examples)
-    await state.set_state(AIStates.waiting_for_style)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📱 Продающий", callback_data="style_selling"),
-            InlineKeyboardButton(text="📝 Информационный", callback_data="style_info")
-        ],
-        [
-            InlineKeyboardButton(text="🎭 Креативный", callback_data="style_creative"),
-            InlineKeyboardButton(text="🎯 Целевой", callback_data="style_targeted")
-        ],
-        [
-            InlineKeyboardButton(text="🚀 Для соцсетей", callback_data="style_social"),
-            InlineKeyboardButton(text="📰 Новостной", callback_data="style_news")
-        ],
-        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
-    ])
-    
-    await message.answer(
-        "📌 <b>Шаг 3/4: Стиль</b>\n\n"
-        "Выберите стиль текста:\n\n"
-        "📱 <b>Продающий</b> — для продаж и конверсии\n"
-        "📝 <b>Информационный</b> — полезный контент\n"
-        "🎭 <b>Креативный</b> — нестандартный подход\n"
-        "🎯 <b>Целевой</b> — для конкретной аудитории\n"
-        "🚀 <b>Для соцсетей</b> — виральный контент\n"
-        "📰 <b>Новостной</b> — анонсы и новости",
-        parse_mode='HTML',
-        reply_markup=keyboard
-    )
-
-@router.callback_query(F.data.startswith("style_"))
-async def process_style(callback: CallbackQuery, state: FSMContext):
-    """Обрабатывает выбор стиля"""
-    style_map = {
-        "style_selling": "продающий",
-        "style_info": "информационный",
-        "style_creative": "креативный",
-        "style_targeted": "целевой",
-        "style_social": "для соцсетей",
-        "style_news": "новостной"
-    }
-    
-    style_key = callback.data
-    style_name = style_map.get(style_key, "продающий")
-    
-    await state.update_data(style=style_name)
-    await state.set_state(AIStates.waiting_for_word_count)
-    
-    current_word_count = ai_manager.get_word_count(callback.from_user.id)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="50 слов", callback_data="words_50"),
-            InlineKeyboardButton(text="100 слов", callback_data="words_100"),
-            InlineKeyboardButton(text="150 слов", callback_data="words_150")
-        ],
-        [
-            InlineKeyboardButton(text="200 слов", callback_data="words_200"),
-            InlineKeyboardButton(text="250 слов", callback_data="words_250"),
-            InlineKeyboardButton(text="300 слов", callback_data="words_300")
-        ],
-        [
-            InlineKeyboardButton(text="📝 Свое значение", callback_data="words_custom"),
-            InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")
-        ]
-    ])
-    
-    await callback.message.edit_text(
-        f"📌 <b>Шаг 4/4: Объем текста</b>\n\n"
-        f"Выберите количество слов для текста:\n\n"
-        f"📊 <b>Рекомендации:</b>\n"
-        f"• 50-100 слов — короткие анонсы\n"
-        f"• 150-200 слов — стандартные посты\n"
-        f"• 250-300 слов — подробные статьи\n\n"
-        f"📍 <b>Текущая настройка:</b> {current_word_count} слов",
-        parse_mode='HTML',
-        reply_markup=keyboard
-    )
-
-@router.callback_query(F.data.startswith("words_"))
-async def process_word_count(callback: CallbackQuery, state: FSMContext):
-    """Обрабатывает выбор количества слов"""
-    if callback.data == "words_custom":
-        await callback.message.edit_text(
-            "📝 <b>Свое количество слов</b>\n\n"
-            "Введите нужное количество слов (от 50 до 1000):\n\n"
-            "✨ <b>Примеры:</b>\n"
-            "• 80 — короткий анонс\n"
-            "• 150 — стандартный пост\n"
-            "• 400 — подробная статья\n"
-            "• 600 — длинный обзор",
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
-            ])
-        )
-        return
-    
-    try:
-        word_count = int(callback.data.split("_")[1])
-        await generate_ai_text(callback, state, word_count)
-    except ValueError:
-        await callback.answer("❌ Ошибка в количестве слов", show_alert=True)
-
-@router.message(AIStates.waiting_for_word_count)
-async def process_custom_word_count(message: Message, state: FSMContext):
-    """Обрабатывает кастомное количество слов"""
-    try:
-        word_count = int(message.text.strip())
-        if word_count < 50 or word_count > 1000:
-            await message.answer(
-                "❌ <b>Количество слов должно быть от 50 до 1000!</b>\n\n"
-                "Попробуйте еще раз:",
-                parse_mode='HTML',
+    if user and user['trial_used']:
+        if user['trial_end_date'] and user['trial_end_date'] > datetime.now(MOSCOW_TZ):
+            # Активный пробный период
+            time_left = user['trial_end_date'] - datetime.now(MOSCOW_TZ)
+            days = time_left.days
+            hours = time_left.seconds // 3600
+            
+            await callback.message.edit_text(
+                f"🎁 У вас активен пробный период!\n\n"
+                f"⭐ Тариф: Standard (пробный)\n"
+                f"⏳ Осталось: {days} дней {hours} часов\n"
+                f"📅 Заканчивается: {user['trial_end_date'].strftime('%d.%m.%Y %H:%M')}\n\n"
+                f"📊 Ваши возможности:\n"
+                f"• 2 канала\n"
+                f"• 6 постов в день\n"
+                f"• 3 AI-копирайтинга\n"
+                f"• 30 идей в день\n\n"
+                f"💡 После окончания пробного периода:\n"
+                f"• Тариф вернется к Mini\n"
+                f"• Вы сможете оплатить полную версию",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
+                    [InlineKeyboardButton(text="💎 Посмотреть тарифы", callback_data="tariffs")],
+                    [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
                 ])
             )
             return
+        else:
+            # Пробный период уже использован
+            await callback.message.edit_text(
+                f"❌ Вы уже использовали пробный период.\n\n"
+                f"⭐ Вы можете оформить полную подписку на тариф Standard:\n\n"
+                f"📊 Возможности Standard:\n"
+                f"• 2 канала\n"
+                f"• 6 постов в день\n"
+                f"• 3 AI-копирайтинга\n"
+                f"• 30 идей в день\n"
+                f"• Полная поддержка\n\n"
+                f"💵 Стоимость: 4 USD/месяц",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💎 Оформить Standard", callback_data="tariff_info_standard")],
+                    [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_main")]
+                ])
+            )
+            return
+    
+    # Предложение пробного периода
+    trial_text = (
+        f"🎁 ПОЛУЧИТЕ 3 ДНЯ STANDARD БЕСПЛАТНО!\n\n"
+        f"⭐ Что входит в пробный период:\n"
+        f"• Полный доступ к тарифу Standard\n"
+        f"• 2 канала для публикаций\n"
+        f"• 6 постов в день\n"
+        f"• 3 AI-копирайтинга в день\n"
+        f"• 30 идей в день\n"
+        f"• Все функции бота\n\n"
+        f"📋 Условия получения:\n"
+        f"1. Подпишитесь на наш канал: {TRIAL_CHANNEL_LINK}\n"
+        f"2. Нажмите 'Проверить подписку'\n"
+        f"3. Активируйте пробный период\n\n"
+        f"⏳ Срок действия: 3 дня с момента активации\n\n"
+        f"💡 После пробного периода:\n"
+        f"• Тариф автоматически вернется к Mini\n"
+        f"• Вы сможете оформить полную подписку"
+    )
+    
+    await callback.message.edit_text(
+        trial_text,
+        reply_markup=get_trial_keyboard()
+    )
+
+@router.callback_query(F.data == "trial_info")
+async def trial_info_detailed(callback: CallbackQuery):
+    await trial_period_info(callback)
+
+@router.callback_query(F.data == "check_subscription")
+async def check_subscription_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    await callback.answer("⏳ Проверяю подписку...", show_alert=False)
+    
+    is_subscribed = await check_channel_subscription(user_id)
+    
+    if is_subscribed:
+        await callback.answer("✅ Вы подписаны на канал!", show_alert=True)
         
-        user_id = message.from_user.id
-        ai_manager.set_word_count(user_id, word_count)
-        
-        data = await state.get_data()
-        await generate_ai_text_from_message(message, data, word_count)
-        
-    except ValueError:
-        await message.answer(
-            "❌ <b>Введите число!</b>\n\nПример: 150, 200, 300",
-            parse_mode='HTML',
+        # Предлагаем активировать пробный период
+        await callback.message.edit_text(
+            f"✅ Отлично! Вы подписаны на канал!\n\n"
+            f"🎁 Теперь вы можете активировать пробный период на 3 дня.\n\n"
+            f"⭐ Что вы получите:\n"
+            f"• Полный доступ к тарифу Standard\n"
+            f"• Все расширенные функции\n"
+            f"• 3 дня бесплатного использования\n\n"
+            f"👇 Нажмите кнопку ниже для активации:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
+                [InlineKeyboardButton(text="🎁 Активировать пробный период", callback_data="activate_trial")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="trial_period")]
             ])
         )
-
-async def generate_ai_text(callback: CallbackQuery, state: FSMContext, word_count: int):
-    """Генерирует текст AI"""
-    user_id = callback.from_user.id
-    ai_manager.set_word_count(user_id, word_count)
-    
-    data = await state.get_data()
-    
-    # Показываем превью запроса
-    preview_text = (
-        f"🎯 <b>Ваш запрос:</b>\n\n"
-        f"📌 <b>Тема:</b> {data['topic']}\n"
-        f"🎨 <b>Стиль:</b> {data['style']}\n"
-        f"📝 <b>Слов:</b> {word_count}\n"
-        f"📚 <b>Примеры:</b> {data['examples'][:100]}...\n\n"
-        f"🔄 <b>Генерирую текст...</b>\n"
-        f"Пробую разные ключи (макс. 3 попытки)"
-    )
-    
-    await callback.message.edit_text(preview_text, parse_mode='HTML')
-    
-    # Генерируем текст
-    current_date = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
-    prompt = COPYWRITER_PROMPT.format(
-        topic=data['topic'],
-        style=data['style'],
-        examples=data['examples'],
-        word_count=word_count,
-        current_date=current_date
-    )
-    
-    # Показываем процесс
-    status_msg = await callback.message.answer("🔄 <b>Попытка 1/3:</b> Ищу доступный ключ...", parse_mode='HTML')
-    
-    generated_text, metadata = await generate_with_gemini(prompt, user_id)
-    
-    # Удаляем статус сообщение
-    await status_msg.delete()
-    
-    if not generated_text:
-        # Показываем ошибку с деталями
-        error_details = ai_manager.get_last_error(user_id) or "Неизвестная ошибка"
-        attempts = ai_manager.get_request_retries(user_id)
-        
-        error_text = (
-            f"❌ <b>Не удалось сгенерировать текст!</b>\n\n"
-            f"📊 <b>Детали:</b>\n"
-            f"• Попыток: {attempts}/{MAX_RETRIES_PER_REQUEST}\n"
-            f"• Ошибка: {error_details}\n\n"
-            f"🔧 <b>Возможные причины:</b>\n"
-            f"• Все ключи API временно недоступны\n"
-            f"• Закончились лимиты на всех ключах\n"
-            f"• Проблемы с сетью или сервером\n\n"
-            f"💡 <b>Что делать:</b>\n"
-            f"• Попробуйте позже (ключи восстанавливаются через 5 минут)\n"
-            f"• Обратитесь в поддержку\n"
-            f"• Проверьте ваш интернет"
-        )
-        
-        await callback.message.answer(error_text, parse_mode='HTML', reply_markup=get_retry_keyboard())
-        await state.clear()
-        return
-    
-    # Обновляем статистику
-    session = ai_manager.get_session(user_id)
-    tariff = await get_user_tariff(user_id)
-    tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
-    
-    session['copies_used'] += 1
-    await update_ai_usage(user_id, 'copy')
-    
-    word_count_actual = len(generated_text.split())
-    
-    # Форматируем результат
-    result_text = (
-        f"✅ <b>Текст готов!</b>\n"
-        f"📊 <b>Попытка:</b> {metadata.get('final_attempt', 1)}/3\n\n"
-        
-        f"📈 <b>Статистика:</b>\n"
-        f"• Запрошено слов: {word_count}\n"
-        f"• Получено слов: {word_count_actual}\n"
-        f"• Символов: {len(generated_text)}\n"
-        f"• Использовано: {session['copies_used']}/{tariff_info['ai_copies_limit']}\n\n"
-        
-        f"📝 <b>Результат:</b>\n\n"
-        f"{generated_text}\n\n"
-        
-        f"📍 <b>Использованный ключ:</b> {metadata.get('final_key', 'Неизвестно')[:15]}..."
-    )
-    
-    # Отправляем результат
-    if len(result_text) > 4000:
-        # Разбиваем на части
-        parts = []
-        current_part = ""
-        
-        for line in result_text.split('\n'):
-            if len(current_part + line + '\n') > 4000:
-                parts.append(current_part)
-                current_part = line + '\n'
-            else:
-                current_part += line + '\n'
-        
-        if current_part:
-            parts.append(current_part)
-        
-        for i, part in enumerate(parts):
-            if i == 0:
-                await callback.message.edit_text(part, parse_mode='HTML')
-            else:
-                await callback.message.answer(part, parse_mode='HTML')
     else:
-        await callback.message.edit_text(result_text, parse_mode='HTML')
-    
-    # Клавиатура действий
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📱 Отправить в чат", callback_data="send_to_chat"),
-            InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_text")
-        ],
-        [
-            InlineKeyboardButton(text="🔄 Новый текст", callback_data="ai_copywriter"),
-            InlineKeyboardButton(text="📋 Сохранить", callback_data="save_text")
-        ],
-        [
-            InlineKeyboardButton(text="📅 Запланировать", callback_data="schedule_post"),
-            InlineKeyboardButton(text="⬅️ В меню AI", callback_data="ai_services")
-        ]
-    ])
-    
-    await state.update_data(generated_text=generated_text)
-    await callback.message.answer(
-        "👇 <b>Что сделать с текстом?</b>",
-        parse_mode='HTML',
-        reply_markup=keyboard
-    )
-
-async def generate_ai_text_from_message(message: Message, data: Dict, word_count: int):
-    """Альтернативная функция генерации для сообщений"""
-    user_id = message.from_user.id
-    
-    preview_text = (
-        f"🎯 <b>Ваш запрос:</b>\n\n"
-        f"📌 <b>Тема:</b> {data['topic']}\n"
-        f"🎨 <b>Стиль:</b> {data['style']}\n"
-        f"📝 <b>Слов:</b> {word_count}\n\n"
-        f"🔄 <b>Генерирую текст...</b>"
-    )
-    
-    await message.answer(preview_text, parse_mode='HTML')
-    
-    current_date = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
-    prompt = COPYWRITER_PROMPT.format(
-        topic=data['topic'],
-        style=data['style'],
-        examples=data['examples'],
-        word_count=word_count,
-        current_date=current_date
-    )
-    
-    status_msg = await message.answer("🔄 <b>Попытка 1/3:</b> Ищу доступный ключ...", parse_mode='HTML')
-    
-    generated_text, metadata = await generate_with_gemini(prompt, user_id)
-    
-    await status_msg.delete()
-    
-    if not generated_text:
-        error_details = ai_manager.get_last_error(user_id) or "Неизвестная ошибка"
-        attempts = ai_manager.get_request_retries(user_id)
+        await callback.answer("❌ Вы не подписаны на канал", show_alert=True)
         
-        error_text = (
-            f"❌ <b>Не удалось сгенерировать текст!</b>\n\n"
-            f"📊 <b>Детали:</b>\n"
-            f"• Попыток: {attempts}/{MAX_RETRIES_PER_REQUEST}\n"
-            f"• Ошибка: {error_details}\n\n"
-            f"💡 <b>Что делать:</b>\n"
-            f"• Попробуйте позже\n"
-            f"• Обратитесь в поддержку: @{SUPPORT_BOT_USERNAME}"
+        await callback.message.edit_text(
+            f"❌ Вы не подписаны на наш канал.\n\n"
+            f"📢 Для получения пробного периода необходимо подписаться:\n"
+            f"{TRIAL_CHANNEL_LINK}\n\n"
+            f"📋 Инструкция:\n"
+            f"1. Перейдите по ссылке выше\n"
+            f"2. Нажмите 'Присоединиться' в канале\n"
+            f"3. Вернитесь сюда и нажмите 'Проверить подписку'\n\n"
+            f"📍 После подписки вы получите 3 дня Standard БЕСПЛАТНО!",
+            reply_markup=get_trial_keyboard()
         )
-        
-        await message.answer(error_text, parse_mode='HTML', reply_markup=get_retry_keyboard())
+
+@router.callback_query(F.data == "activate_trial")
+async def activate_trial_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    await callback.answer("⏳ Активирую пробный период...", show_alert=False)
+    
+    # Проверяем подписку еще раз
+    is_subscribed = await check_channel_subscription(user_id)
+    if not is_subscribed:
+        await callback.answer("❌ Сначала подпишитесь на канал", show_alert=True)
+        await callback.message.edit_text(
+            f"❌ Вы не подписаны на канал!\n\n"
+            f"📢 Подпишитесь по ссылке: {TRIAL_CHANNEL_LINK}\n"
+            f"📍 Затем нажмите 'Проверить подписку'",
+            reply_markup=get_trial_keyboard()
+        )
         return
     
-    session = ai_manager.get_session(user_id)
-    tariff = await get_user_tariff(user_id)
-    tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
+    # Активируем пробный период
+    success, message = await activate_trial_period(user_id)
     
-    session['copies_used'] += 1
-    await update_ai_usage(user_id, 'copy')
-    
-    word_count_actual = len(generated_text.split())
-    
-    result_text = (
-        f"✅ <b>Текст готов!</b> (Попытка {metadata.get('final_attempt', 1)}/3)\n\n"
-        f"📊 <b>Статистика:</b>\n"
-        f"• Слов: {word_count_actual} (запрошено {word_count})\n"
-        f"• Использовано: {session['copies_used']}/{tariff_info['ai_copies_limit']}\n\n"
-        f"📝 <b>Результат:</b>\n\n"
-        f"{generated_text}"
-    )
-    
-    if len(result_text) > 4000:
-        parts = []
-        current_part = ""
-        
-        for line in result_text.split('\n'):
-            if len(current_part + line + '\n') > 4000:
-                parts.append(current_part)
-                current_part = line + '\n'
-            else:
-                current_part += line + '\n'
-        
-        if current_part:
-            parts.append(current_part)
-        
-        for i, part in enumerate(parts):
-            if i == 0:
-                await message.answer(part, parse_mode='HTML')
-            else:
-                await message.answer(part, parse_mode='HTML')
+    if success:
+        await callback.message.edit_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🚀 Начать использовать", callback_data="ai_services")],
+                [InlineKeyboardButton(text="📊 Моя статистика", callback_data="my_stats")],
+                [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+            ])
+        )
     else:
-        await message.answer(result_text, parse_mode='HTML')
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📱 Отправить в чат", callback_data="send_to_chat"),
-            InlineKeyboardButton(text="🔄 Новый текст", callback_data="ai_copywriter")
-        ],
-        [
-            InlineKeyboardButton(text="📅 Запланировать", callback_data="schedule_post"),
-            InlineKeyboardButton(text="⬅️ В меню", callback_data="back_to_main")
-        ]
-    ])
-    
-    await message.answer(
-        "👇 <b>Что сделать с текстом?</b>",
-        parse_mode='HTML',
-        reply_markup=keyboard
-    )
-
-# ========== ОБРАБОТЧИК ОШИБОК И ПОВТОРНЫХ ПОПЫТОК ==========
-@router.callback_query(F.data == "retry_ai")
-async def retry_ai_request(callback: CallbackQuery):
-    """Повторная попытка AI-запроса"""
-    user_id = callback.from_user.id
-    
-    # Проверяем последнюю ошибку
-    last_error = ai_manager.get_last_error(user_id)
-    attempts = ai_manager.get_request_retries(user_id)
-    
-    if attempts >= MAX_RETRIES_PER_REQUEST:
-        await callback.answer(
-            f"❌ Достигнут лимит попыток ({MAX_RETRIES_PER_REQUEST}). Попробуйте позже.",
-            show_alert=True
+        await callback.message.edit_text(
+            message,
+            reply_markup=get_trial_keyboard()
         )
+
+# ========== ОБНОВЛЕННЫЙ TARIFF INFO HANDLER ==========
+@router.callback_query(F.data.startswith("tariff_info_"))
+async def tariff_info(callback: CallbackQuery):
+    tariff_id = callback.data.split("_")[2]
+    tariff_info = TARIFFS.get(tariff_id)
+    
+    if not tariff_info:
+        await callback.answer("Тариф не найден!", show_alert=True)
         return
     
-    # Показываем статистику ротации
-    stats = ai_manager.get_stats_summary()
-    
-    status_text = (
-        f"🔄 <b>Повторная попытка</b>\n\n"
-        f"📊 <b>Статистика ротации:</b>\n"
-        f"• Всего ключей: {stats['total_keys']}\n"
-        f"• Заблокировано: {stats['blocked_keys']}\n"
-        f"• Текущая модель: {stats['current_model']}\n"
-        f"• Ваши попытки: {attempts}/{MAX_RETRIES_PER_REQUEST}\n\n"
-        f"📝 <b>Последняя ошибка:</b>\n{last_error[:200] if last_error else 'Неизвестно'}"
-    )
-    
-    await callback.message.edit_text(status_text, parse_mode='HTML')
-    
-    # Возвращаем в меню AI
-    tariff = await get_user_tariff(user_id)
-    await asyncio.sleep(2)
-    await callback.message.edit_text(
-        "🤖 <b>ИИ-сервисы</b>\n\nВыберите действие:",
-        parse_mode='HTML',
-        reply_markup=get_ai_main_menu(tariff)
-    )
-
-# ========== ОСТАЛЬНЫЕ ОБРАБОТЧИКИ ==========
-# (Остальные обработчики — статистика, каналы, планирование постов, 
-# тарифы, админ-панель — остаются аналогичными исходному коду,
-# но с добавленным визуальным оформлением)
-
-# Для экономии места я покажу только измененные части:
-
-@router.callback_query(F.data == "my_stats")
-async def show_my_stats(callback: CallbackQuery):
-    """Показывает статистику пользователя"""
     user_id = callback.from_user.id
-    stats = await get_user_stats(user_id)
     current_tariff = await get_user_tariff(user_id)
-    tariff_info = TARIFFS.get(current_tariff, TARIFFS['mini'])
-    posts_today = await get_user_posts_today(user_id)
     
-    session = ai_manager.get_session(user_id)
-    ai_stats = await get_ai_usage_stats(user_id)
+    # Проверяем, использовал ли уже пробный период
+    conn = await get_db_connection()
+    user = await conn.fetchrow(
+        "SELECT trial_used FROM users WHERE id = $1", 
+        user_id
+    )
+    has_trial_used = user['trial_used'] if user else False
+    await conn.close()
     
-    today = datetime.now(MOSCOW_TZ).date()
-    reset_time = datetime.combine(today + timedelta(days=1), datetime.min.time())
-    reset_time = MOSCOW_TZ.localize(reset_time)
-    time_left = reset_time - datetime.now(MOSCOW_TZ)
-    hours = int(time_left.total_seconds() // 3600)
-    minutes = int((time_left.total_seconds() % 3600) // 60)
+    info_text = (
+        f"💎 {tariff_info['name']}\n\n"
+        f"📊 Лимиты:\n"
+        f"• 📢 Каналов: {tariff_info['channels_limit']}\n"
+        f"• 📅 Постов в день: {tariff_info['daily_posts_limit']}\n"
+        f"• 🤖 AI-копирайтингов: {tariff_info['ai_copies_limit']}\n"
+        f"• 💡 AI-идей: {tariff_info['ai_ideas_limit']}\n\n"
+        f"💵 Стоимость: "
+    )
+    
+    if tariff_info['price'] == 0:
+        info_text += "🆓 Бесплатно\n\n"
+    else:
+        info_text += f"💳 {tariff_info['price']} {tariff_info['currency']} в месяц\n\n"
+    
+    info_text += f"📝 {tariff_info['description']}\n\n"
+    
+    if tariff_id == 'mini':
+        info_text += "🆓 Это бесплатный тариф, вы можете активировать его сразу"
+    elif tariff_id == current_tariff or (current_tariff == 'standard_trial' and tariff_id == 'standard'):
+        info_text += "✅ Это ваш текущий тариф"
+    elif tariff_id == 'standard' and not has_trial_used:
+        info_text += (
+            f"🎁 Специальное предложение!\n"
+            f"Получите 3 дня БЕСПЛАТНО за подписку на канал!\n\n"
+            f"📋 Ваш ID для заказа: {user_id}"
+        )
+    else:
+        info_text += (
+            f"💳 Для заказа тарифа нажмите кнопку ниже\n\n"
+            f"📋 Ваш ID для заказа: {user_id}"
+        )
+    
+    await callback.message.edit_text(
+        info_text,
+        reply_markup=get_tariff_order_keyboard(tariff_id, has_trial_used)
+    )
+
+# ========== ОБНОВЛЕННЫЕ ADMIN HANDLERS С РОТАЦИЕЙ ==========
+@router.callback_query(F.data == "admin_panel")
+async def admin_panel(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    # Получаем статистику ротации
+    rotation_stats = ai_manager.get_rotation_stats()
+    
+    admin_text = (
+        f"👑 Админ-панель KOLES-TECH\n\n"
+        f"🔑 Статус ротации ключей:\n"
+        f"• Всего ключей: {rotation_stats['total_keys']}\n"
+        f"• Активных: {rotation_stats['active_keys']}\n"
+        f"• Заблокировано: {rotation_stats['blocked_keys']}\n"
+        f"• Всего запросов: {rotation_stats['total_requests']}\n"
+        f"• Ошибок: {rotation_stats['total_errors']}\n\n"
+        f"👇 Выберите действие:"
+    )
+    
+    await callback.message.edit_text(
+        admin_text,
+        reply_markup=get_admin_keyboard()
+    )
+
+@router.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    stats = await get_total_stats()
+    
+    total_copies_used = sum(s['copies_used'] for s in ai_manager.sessions.values())
+    total_ideas_used = sum(s['ideas_used'] for s in ai_manager.sessions.values())
+    total_ai_requests = sum(s['total_requests'] for s in ai_manager.sessions.values())
+    
+    rotation_stats = ai_manager.get_rotation_stats()
+    
+    # Статистика пробных периодов
+    conn = await get_db_connection()
+    trial_users = await conn.fetchval(
+        "SELECT COUNT(*) FROM users WHERE trial_used = TRUE AND trial_end_date > $1",
+        datetime.now(MOSCOW_TZ)
+    ) or 0
+    expired_trials = await conn.fetchval(
+        "SELECT COUNT(*) FROM users WHERE trial_used = TRUE AND trial_end_date <= $1",
+        datetime.now(MOSCOW_TZ)
+    ) or 0
+    await conn.close()
     
     stats_text = (
-        f"📊 <b>Ваша статистика</b>\n\n"
-        
-        f"💎 <b>Тариф:</b> {tariff_info['icon']} {tariff_info['name']}\n\n"
-        
-        f"📅 <b>Посты:</b>\n"
-        f"• Всего запланировано: {stats['total_posts']}\n"
-        f"• Активных постов: {stats['active_posts']}\n"
-        f"• Отправлено постов: {stats['sent_posts']}\n"
-        f"• Постов сегодня: {posts_today}/{tariff_info['daily_posts_limit']}\n\n"
-        
-        f"📢 <b>Каналы:</b>\n"
-        f"• Подключено: {stats['channels']}/{tariff_info['channels_limit']}\n\n"
-        
-        f"🤖 <b>AI-сервисы:</b>\n"
-        f"• Копирайтер: {session['copies_used']}/{tariff_info['ai_copies_limit']}\n"
-        f"• Идеи: {session['ideas_used']}/{tariff_info['ai_ideas_limit']}\n"
-        f"• Всего AI запросов: {session['total_requests']}\n\n"
-        
-        f"🔄 <b>Обновление лимитов через:</b> {hours}ч {minutes}м\n\n"
-        
-        f"📍 <b>Время по Москве:</b> {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
+        "📊 📈 ОБЩАЯ СТАТИСТИКА:\n\n"
+        f"👥 ПОЛЬЗОВАТЕЛИ: {stats.get('total_users', 0)}\n"
+        f"   • 🚀 Mini: {stats.get('mini_users', 0)}\n"
+        f"   • ⭐ Standard: {stats.get('standard_users', 0)}\n"
+        f"   • 👑 VIP: {stats.get('vip_users', 0)}\n"
+        f"   • 🎁 Пробный период: {trial_users}\n"
+        f"   • ⌛ Завершенных пробных: {expired_trials}\n\n"
+        f"📅 ПОСТЫ:\n"
+        f"   • 📊 Всего: {stats.get('total_posts', 0)}\n"
+        f"   • ⏳ Активные: {stats.get('active_posts', 0)}\n"
+        f"   • ✅ Отправлено: {stats.get('sent_posts', 0)}\n\n"
+        f"📢 КАНАЛЫ: {stats.get('total_channels', 0)}\n\n"
+        f"🤖 AI-СЕРВИСЫ:\n"
+        f"   • 📝 Копирайтингов: {total_copies_used}\n"
+        f"   • 💡 Идей сгенерировано: {total_ideas_used}\n"
+        f"   • 🔄 Всего AI запросов: {total_ai_requests}\n\n"
+        f"🔑 РОТАЦИЯ КЛЮЧЕЙ:\n"
+        f"   • 🟢 Активных: {rotation_stats['active_keys']}/{rotation_stats['total_keys']}\n"
+        f"   • 🔴 Заблокировано: {rotation_stats['blocked_keys']}\n"
+        f"   • 📊 Успешность: {100 - (rotation_stats['total_errors'] / max(rotation_stats['total_requests'], 1) * 100):.1f}%\n\n"
+        f"🛒 ЗАКАЗЫ:\n"
+        f"   • ⏳ Ожидают: {stats.get('pending_orders', 0)}\n"
+        f"   • ✅ Выполнены: {stats.get('completed_orders', 0)}\n\n"
+        f"📍 ВРЕМЯ: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M')}"
     )
     
-    await callback.message.edit_text(stats_text, parse_mode='HTML', reply_markup=get_main_menu(user_id, user_id == ADMIN_ID))
+    await callback.message.edit_text(
+        stats_text,
+        reply_markup=get_admin_keyboard()
+    )
 
-# ========== ЗАПУСК ==========
+# ========== НОВЫЕ ФУНКЦИИ ДЛЯ АДМИНА ==========
+@router.callback_query(F.data == "admin_rotation")
+async def admin_rotation_stats(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    rotation_stats = ai_manager.get_rotation_stats()
+    
+    stats_text = "🔑 📊 ДЕТАЛЬНАЯ СТАТИСТИКА РОТАЦИИ:\n\n"
+    
+    for i, (key, key_info) in enumerate(ai_manager.key_stats.items(), 1):
+        status = "🟢" if ai_manager._is_key_available(key_info) else "🔴"
+        blocked_until = ""
+        
+        if key_info['blocked_until']:
+            if key_info['blocked_until'] > datetime.now(MOSCOW_TZ):
+                time_left = key_info['blocked_until'] - datetime.now(MOSCOW_TZ)
+                blocked_until = f"⏳ {int(time_left.total_seconds() // 60)}мин"
+            else:
+                blocked_until = "🟢 Доступен"
+        
+        stats_text += (
+            f"{i}. {status} {key[:15]}...\n"
+            f"   • 📊 Запросов: {key_info['requests']}\n"
+            f"   • ❌ Ошибок: {key_info['errors']}\n"
+            f"   • 🔒 403 ошибок: {key_info['403_errors']}\n"
+            f"   • 📈 Успешность: {key_info['success_rate']:.1f}%\n"
+            f"   • ⚡ Время ответа: {key_info['avg_response_time']:.2f}с\n"
+            f"   • {blocked_until}\n\n"
+        )
+    
+    # Последние ротации
+    stats_text += "🔄 ПОСЛЕДНИЕ РОТАЦИИ:\n"
+    for log in rotation_stats['rotation_log']:
+        if 'key' in log:
+            stats_text += f"• {log['timestamp'].strftime('%H:%M:%S')} - {log['key']} - {log['reason']}\n"
+        elif 'model' in log:
+            stats_text += f"• {log['timestamp'].strftime('%H:%M:%S')} - Модель: {log['model']}\n"
+    
+    buttons = [
+        [InlineKeyboardButton(text="🔄 Сбросить блокировки", callback_data="reset_key_blocks")],
+        [InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin_panel")]
+    ]
+    
+    await callback.message.edit_text(
+        stats_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+@router.callback_query(F.data == "reset_key_blocks")
+async def reset_key_blocks_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("⛔ Доступ запрещен!", show_alert=True)
+        return
+    
+    ai_manager._reset_all_key_blocks()
+    
+    await callback.answer("✅ Все блокировки ключей сброшены!", show_alert=True)
+    await admin_rotation_stats(callback)
+
+# ========== SCHEDULED TASKS ДЛЯ ПРОБНОГО ПЕРИОДА ==========
+async def scheduled_check_trials():
+    """Проверка истечения пробных периодов по расписанию"""
+    await check_trial_expiry()
+
+# ========== ОБНОВЛЕННЫЙ STARTUP ==========
 async def on_startup():
-    """Запуск бота"""
     logger.info("=" * 60)
     logger.info(f"🚀 ЗАПУСК БОТА KOLES-TECH")
     logger.info(f"🤖 AI сервисы: ВКЛЮЧЕНЫ")
     logger.info(f"🔑 Gemini ключей: {len(GEMINI_API_KEYS)}")
-    logger.info(f"🎯 Максимум попыток: {MAX_RETRIES_PER_REQUEST}")
+    logger.info(f"🎁 Пробный период: ВКЛЮЧЕН")
+    logger.info(f"📢 Канал для подписки: {TRIAL_CHANNEL_LINK}")
     logger.info(f"👑 Admin ID: {ADMIN_ID}")
-    logger.info(f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}")
     logger.info("=" * 60)
     
     try:
         await init_db()
+        await migrate_db()
         await restore_scheduled_jobs()
         
         scheduler.start()
         
-        # Ежедневный сброс лимитов
+        # Существующие задачи
         scheduler.add_job(
             scheduled_reset_posts,
             trigger='cron',
@@ -1424,7 +1438,6 @@ async def on_startup():
             id='reset_posts'
         )
         
-        # Ежедневный сброс AI лимитов
         scheduler.add_job(
             reset_ai_limits_daily,
             trigger='cron',
@@ -1434,14 +1447,24 @@ async def on_startup():
             id='reset_ai_limits'
         )
         
-        # Ежечасная статистика
+        # Новая задача для проверки пробных периодов
         scheduler.add_job(
-            log_ai_stats,
+            scheduled_check_trials,
             trigger='cron',
-            hour='*',
+            hour=3,
             minute=0,
             timezone=MOSCOW_TZ,
-            id='log_ai_stats'
+            id='check_trials'
+        )
+        
+        # Задача для сброса статистики ротации
+        scheduler.add_job(
+            ai_manager._reset_all_key_blocks,
+            trigger='cron',
+            hour=6,
+            minute=0,
+            timezone=MOSCOW_TZ,
+            id='reset_key_stats'
         )
         
         me = await bot.get_me()
@@ -1449,25 +1472,21 @@ async def on_startup():
         
         if ADMIN_ID:
             try:
-                stats = ai_manager.get_stats_summary()
                 await bot.send_message(
                     ADMIN_ID,
-                    f"🤖 <b>Бот запущен!</b>\n\n"
-                    f"🔗 @{me.username}\n"
-                    f"🆔 {me.id}\n\n"
-                    f"📊 <b>AI статистика:</b>\n"
-                    f"• Ключей: {stats['total_keys']}\n"
-                    f"• Заблокировано: {stats['blocked_keys']}\n"
-                    f"• Модель: {stats['current_model']}\n"
-                    f"• Сессии: {stats['active_sessions']}\n\n"
-                    f"🕐 {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}",
-                    parse_mode='HTML'
+                    f"🤖 Бот @{me.username} успешно запущен!\n"
+                    f"🆔 ID: {me.id}\n"
+                    f"🤖 AI сервисы: ВКЛЮЧЕНЫ\n"
+                    f"🔑 Gemini ключей: {len(GEMINI_API_KEYS)}\n"
+                    f"🎁 Пробный период: АКТИВЕН\n"
+                    f"📢 Канал: {TRIAL_CHANNEL_LINK}\n"
+                    f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}"
                 )
             except Exception as e:
-                logger.error(f"Не удалось отправить уведомление админу: {e}")
+                logger.error(f"Не удалось уведомить админа: {e}")
         
         logger.info("=" * 60)
-        logger.info("🎉 БОТ УСПЕШНО ЗАПУЩЕН!")
+        logger.info("🎉 БОТ УСПЕШНО ЗАПУЩЕН СО ВСЕМИ ФУНКЦИЯМИ!")
         logger.info("=" * 60)
         return True
         
@@ -1475,77 +1494,8 @@ async def on_startup():
         logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ: {e}")
         return False
 
-async def log_ai_stats():
-    """Логирует статистику AI"""
-    stats = ai_manager.get_stats_summary()
-    logger.info(
-        f"📊 AI статистика | "
-        f"Ключей: {stats['total_keys']} | "
-        f"Заблокировано: {stats['blocked_keys']} | "
-        f"Запросов: {stats['total_requests']} | "
-        f"Ошибок: {stats['total_errors']}"
-    )
-
-async def reset_ai_limits_daily():
-    """Сбрасывает дневные лимиты AI"""
-    ai_manager.reset_daily_limits()
-    logger.info("✅ AI лимиты сброшены")
-
-async def scheduled_reset_posts():
-    """Сбрасывает дневные счетчики постов"""
-    await reset_daily_posts()
-
-async def restore_scheduled_jobs():
-    """Восстанавливает запланированные посты"""
-    try:
-        conn = await get_db_connection()
-        posts = await conn.fetch('''
-            SELECT id, channel_id, message_type, message_text, 
-                   media_file_id, media_caption, scheduled_time
-            FROM scheduled_posts
-            WHERE is_sent = FALSE AND scheduled_time > NOW()
-        ''')
-        await conn.close()
-        
-        restored = 0
-        for post in posts:
-            try:
-                post_data = {
-                    'message_type': post['message_type'],
-                    'message_text': post['message_text'],
-                    'media_file_id': post['media_file_id'],
-                    'media_caption': post['media_caption']
-                }
-                
-                scheduled_time = post['scheduled_time']
-                if scheduled_time.tzinfo is None:
-                    scheduled_time = pytz.UTC.localize(scheduled_time)
-                
-                scheduler.add_job(
-                    send_scheduled_post,
-                    trigger=DateTrigger(run_date=scheduled_time),
-                    args=(post['channel_id'], post_data, post['id']),
-                    id=f"post_{post['id']}",
-                    replace_existing=True
-                )
-                restored += 1
-            except Exception as e:
-                logger.error(f"❌ Ошибка восстановления поста {post['id']}: {e}")
-        
-        logger.info(f"✅ Восстановлено {restored} запланированных постов")
-    except Exception as e:
-        logger.error(f"❌ Ошибка при восстановлении постов: {e}")
-
-async def on_shutdown():
-    """Выключение бота"""
-    logger.info("🛑 Выключение бота...")
-    if scheduler.running:
-        scheduler.shutdown()
-    await bot.session.close()
-    logger.info("👋 Бот выключен")
-
+# ========== MAIN ==========
 async def main():
-    """Основная функция"""
     if not API_TOKEN or not DATABASE_URL:
         logger.error("❌ Отсутствуют обязательные переменные")
         return
@@ -1560,6 +1510,17 @@ async def main():
         logger.info("⚠️ Получен сигнал прерывания")
     except Exception as e:
         logger.error(f"💥 КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        # Отправляем сообщение админу об ошибке
+        if ADMIN_ID:
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"💥 БОТ УПАЛ С ОШИБКОЙ!\n\n"
+                    f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}\n"
+                    f"❌ Ошибка: {str(e)[:500]}"
+                )
+            except:
+                pass
     finally:
         await on_shutdown()
 
