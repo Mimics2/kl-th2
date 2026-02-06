@@ -1,11 +1,63 @@
 {
   "$schema": "https://railway.app/railway.schema.json",
   "build": {
-    "builder": "NIXPACKS"
+    "builder": "NIXPACKS",
+    "buildCommand": "pip install -r requirements.txt"
   },
   "deploy": {
     "startCommand": "python bot.py",
     "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 10
+    "restartPolicyMaxRetries": 10,
+    "healthcheckPath": "/",
+    "healthcheckTimeout": 30
+  },
+  "env": {
+    "BOT_TOKEN": {
+      "description": "Токен бота от @BotFather",
+      "required": true
+    },
+    "DATABASE_URL": {
+      "description": "URL PostgreSQL базы данных",
+      "required": true
+    },
+    "ADMIN_ID": {
+      "description": "ID администратора бота",
+      "required": false,
+      "value": "0"
+    },
+    "SUPPORT_BOT_USERNAME": {
+      "description": "Юзернейм бота поддержки",
+      "required": false,
+      "value": "support_bot"
+    },
+    "ADMIN_CONTACT": {
+      "description": "Контакт администратора (@username)",
+      "required": false,
+      "value": "@admin"
+    },
+    "GEMINI_API_KEYS": {
+      "description": "Ключи Gemini API через запятую",
+      "required": true
+    },
+    "GEMINI_MODEL": {
+      "description": "Модель Gemini (по умолчанию gemini-2.5-flash)",
+      "required": false,
+      "value": "gemini-2.5-flash"
+    },
+    "HELP_URL": {
+      "description": "Ссылка на документацию",
+      "required": false,
+      "value": "https://telegra.ph/"
+    },
+    "EXAMPLES_URL": {
+      "description": "Ссылка на примеры работ",
+      "required": false,
+      "value": "https://telegra.ph/"
+    },
+    "PRIVACY_URL": {
+      "description": "Ссылка на политику конфиденциальности",
+      "required": false,
+      "value": "https://telegra.ph/"
+    }
   }
 }
