@@ -45,7 +45,7 @@ if GEMINI_API_KEYS:
     except:
         GEMINI_API_KEYS = [
             "AIzaSyBVX6wcwviTFLXZumpApEzogCddy4SHQaQ",
-            "AIzaSyCJyiYNk2PDd0eEF-l_deLl638wtY4vcgQ"
+            "AIzaSyCJyiYNk2PDd0eEF-l_deLl638wtY4vcgQ",  # Исправлено: добавлена запятая
             "AIzaSyASat89t1UUD7BXHxlXf9Oela6AsCzjOXc",
             "AIzaSyATKIJVRLb35J8K0HS1G_ql7IS9cJJm4Ys",
             "AIzaSyDJNu3lzF-VYrKpmw6Bzjm5JToasfhm8sU",
@@ -59,11 +59,12 @@ if GEMINI_API_KEYS:
 else:
     GEMINI_API_KEYS = [
         "AIzaSyBVX6wcwviTFLXZumpApEzogCddy4SHQaQ",
-        "AIzaSyCJyiYNk2PDd0eEF-l_deLl638wtY4vcgQ"
+        "AIzaSyCJyiYNk2PDd0eEF-l_deLl638wtY4vcgQ",  # Исправлено: добавлена запятая
         "AIzaSyASat89t1UUD7BXHxlXf9Oela6AsCzjOXc",
         "AIzaSyATKIJVRLb35J8K0HS1G_ql7IS9cJJm4Ys",
         "AIzaSyDJNu3lzF-VYrKpmw6Bzjm5JToasfhm8sU",
         "AIzaSyBudSc-lz-ypF_2pigH5_7DfLGxF0COJYQ",
+        "AIzaSyA9iL90r62KthqSkdcon3wcLKeMaXOsBfM",
         "AIzaSyBZkVAruHt6zPCJF1gf67kVbk6fHY-eelo",
         "AIzaSyB9VqHVXudqHHN3_b_BWM9nNEEvNn-geKw",
         "AIzaSyCeME8Lvm3p5QYBjJh5FucEyJ4J22E1NOY",
@@ -254,47 +255,46 @@ class AdvancedAISessionManager:
                 key_index = GEMINI_API_KEYS.index(key)
                 session['current_key_index'] = key_index
                 self._update_key_stats_on_use(key)
-                return key, key_index, self.get_current_model()
+                return key, key_index, self.models[self.current_model_index % len(self.models)]
         
         # Ищем ключ с наивысшим приоритетом
         available_keys = []
-        for key in GEMINI_API_KEYS:
+        for i, key in enumerate(GEMINI_API_KEYS):
             if self._is_key_available(key) and key not in session['failed_keys']:
                 stats = self.key_stats[key]
-                available_keys.append((stats['priority'], key))
+                available_keys.append((stats['priority'], i, key))
         
         # Если все ключи в failed_keys, очищаем список
         if not available_keys and session['failed_keys']:
             logger.warning(f"Все ключи в failed_keys для user_{user_id}, очищаю список")
             session['failed_keys'].clear()
             # Повторяем поиск
-            for key in GEMINI_API_KEYS:
+            for i, key in enumerate(GEMINI_API_KEYS):
                 if self._is_key_available(key):
                     stats = self.key_stats[key]
-                    available_keys.append((stats['priority'], key))
+                    available_keys.append((stats['priority'], i, key))
         
         # Если нет доступных ключей, пробуем самый старый в блокировке
         if not available_keys:
-            for key in GEMINI_API_KEYS:
+            for i, key in enumerate(GEMINI_API_KEYS):
                 stats = self.key_stats[key]
                 if stats['blocked_until'] and stats['blocked_until'] < datetime.now(MOSCOW_TZ) + timedelta(minutes=5):
                     stats['403_errors'] = 0
                     stats['blocked_until'] = None
                     stats['priority'] = 50  # Средний приоритет
-                    key_index = GEMINI_API_KEYS.index(key)
-                    session['current_key_index'] = key_index
+                    session['current_key_index'] = i
                     self._update_key_stats_on_use(key)
-                    return key, key_index, self.get_current_model()
+                    return key, i, self.models[self.current_model_index % len(self.models)]
             
             # Все ключи заблокированы, пробуем первый с лучшим приоритетом
-            for key in GEMINI_API_KEYS:
+            for i, key in enumerate(GEMINI_API_KEYS):
                 if self.key_stats[key]['priority'] < 90:  # Исключаем полностью заблокированные
-                    key_index = GEMINI_API_KEYS.index(key)
+                    key_index = i
                     self.key_stats[key]['403_errors'] = 0
                     self.key_stats[key]['blocked_until'] = None
                     session['current_key_index'] = key_index
                     self._update_key_stats_on_use(key)
-                    return key, key_index, self.get_current_model()
+                    return key, key_index, self.models[self.current_model_index % len(self.models)]
             
             # Последний вариант - первый ключ
             key = GEMINI_API_KEYS[0]
@@ -303,18 +303,18 @@ class AdvancedAISessionManager:
             key_index = 0
             session['current_key_index'] = key_index
             self._update_key_stats_on_use(key)
-            return key, key_index, self.get_current_model()
+            return key, key_index, self.models[self.current_model_index % len(self.models)]
         
         # Выбираем ключ с наилучшим приоритетом
         available_keys.sort(key=lambda x: x[0])
-        best_key = available_keys[0][1]
-        key_index = GEMINI_API_KEYS.index(best_key)
+        best_key = available_keys[0][2]
+        key_index = available_keys[0][1]
         
         # Обновляем статистику
         session['current_key_index'] = key_index
         self._update_key_stats_on_use(best_key)
         
-        return best_key, key_index, self.get_current_model()
+        return best_key, key_index, self.models[self.current_model_index % len(self.models)]
     
     def _update_key_stats_on_use(self, key: str):
         """Обновляет статистику при использовании ключа"""
