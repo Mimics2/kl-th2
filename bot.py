@@ -44,31 +44,25 @@ if GEMINI_API_KEYS:
         GEMINI_API_KEYS = json.loads(GEMINI_API_KEYS)
     except:
         GEMINI_API_KEYS = [
-            "AIzaSyBVX6wcwviTFLXZumpApEzogCddy4SHQaQ",
-            "AIzaSyCJyiYNk2PDd0eEF-l_deLl638wtY4vcgQ"
-            "AIzaSyASat89t1UUD7BXHxlXf9Oela6AsCzjOXc",
-            "AIzaSyATKIJVRLb35J8K0HS1G_ql7IS9cJJm4Ys",
-            "AIzaSyDJNu3lzF-VYrKpmw6Bzjm5JToasfhm8sU",
-            "AIzaSyBudSc-lz-ypF_2pigH5_7DfLGxF0COJYQ",
-            "AIzaSyA9iL90r62KthqSkdcon3wcLKeMaXOsBfM",
-            "AIzaSyBZkVAruHt6zPCJF1gf67kVbk6fHY-eelo",
-            "AIzaSyB9VqHVXudqHHN3_b_BWM9nNEEvNn-geKw",
-            "AIzaSyCeME8Lvm3p5QYBjJh5FucEyJ4J22E1NOY",
-            "AIzaSyDtcHsN6daIR9WQ1psELkArzRrJH1IHu70"
+            "AIzaSyA2j48JnmiuQKf6uAfzHSg0vAW1gkN7ISc",
+            "AIzaSyCsq2YBVbc0mxoaQcjnGnd3qasoVZaucQk",
+            "AIzaSyCkvLqyIoX4M_dvyG4Tyy1ujpuK_ia-BtQ",
+            "AIzaSyBB1KdR3pKOziItOEsCr5QHEGAf2ZED8lo",
+            "AIzaSyCJoEWTJfBUhuIPZoIh62KrUqV8IEiPnOo",
+            "AIzaSyAI_vkc2IFhOPKELbxpu1QODKCd5h-bEOI",
+            "AIzaSyBy_aoWhZ5ZKm4yyhw7mNzP-8U-t4pXWMI",
+            "AIzaSyA4jtchIEaTWrHnr_yQcRGTsZIWTAstXNA"
         ]
 else:
     GEMINI_API_KEYS = [
-        "AIzaSyBVX6wcwviTFLXZumpApEzogCddy4SHQaQ",
-        "AIzaSyCJyiYNk2PDd0eEF-l_deLl638wtY4vcgQ"
-        "AIzaSyASat89t1UUD7BXHxlXf9Oela6AsCzjOXc",
-        "AIzaSyATKIJVRLb35J8K0HS1G_ql7IS9cJJm4Ys",
-        "AIzaSyDJNu3lzF-VYrKpmw6Bzjm5JToasfhm8sU",
-        "AIzaSyBudSc-lz-ypF_2pigH5_7DfLGxF0COJYQ",
-        "AIzaSyA9iL90r62KthqSkdcon3wcLKeMaXOsBfM",
-        "AIzaSyBZkVAruHt6zPCJF1gf67kVbk6fHY-eelo",
-        "AIzaSyB9VqHVXudqHHN3_b_BWM9nNEEvNn-geKw",
-        "AIzaSyCeME8Lvm3p5QYBjJh5FucEyJ4J22E1NOY",
-        "AIzaSyDtcHsN6daIR9WQ1psELkArzRrJH1IHu70"
+        "AIzaSyA2j48JnmiuQKf6uAfzHSg0vAW1gkN7ISc",
+        "AIzaSyCsq2YBVbc0mxoaQcjnGnd3qasoVZaucQk",
+        "AIzaSyCkvLqyIoX4M_dvyG4Tyy1ujpuK_ia-BtQ",
+        "AIzaSyBB1KdR3pKOziItOEsCr5QHEGAf2ZED8lo",
+        "AIzaSyCJoEWTJfBUhuIPZoIh62KrUqV8IEiPnOo",
+        "AIzaSyAI_vkc2IFhOPKELbxpu1QODKCd5h-bEOI",
+        "AIzaSyBy_aoWhZ5ZKm4yyhw7mNzP-8U-t4pXWMI",
+        "AIzaSyA4jtchIEaTWrHnr_yQcRGTsZIWTAstXNA"
     ]
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -143,9 +137,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=API_TOKEN, parse_mode="HTML")
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
@@ -297,7 +290,7 @@ class AdvancedAISessionManager:
         if stats['blocked_until'] and stats['blocked_until'] > datetime.now(MOSCOW_TZ):
             return False
         
-        # Проверяем количество ошибок 403
+        # Проверяем количество ошибки 403
         if stats['403_errors'] >= MAX_403_RETRIES:
             return False
         
@@ -562,10 +555,16 @@ async def init_database():
             is_active BOOLEAN DEFAULT TRUE,
             is_admin BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ DEFAULT NOW(),
-            last_seen TIMESTAMPTZ DEFAULT NOW(),
-            INDEX idx_users_tariff (tariff),
-            INDEX idx_users_created (created_at DESC)
+            last_seen TIMESTAMPTZ DEFAULT NOW()
         )
+        ''',
+        
+        # Индексы для таблицы users
+        '''
+        CREATE INDEX IF NOT EXISTS idx_users_tariff ON users(tariff)
+        ''',
+        '''
+        CREATE INDEX IF NOT EXISTS idx_users_created ON users(created_at)
         ''',
         
         # Таблица каналов
@@ -577,10 +576,16 @@ async def init_database():
             channel_name TEXT NOT NULL,
             is_active BOOLEAN DEFAULT TRUE,
             created_at TIMESTAMPTZ DEFAULT NOW(),
-            UNIQUE(user_id, channel_id),
-            INDEX idx_channels_user (user_id),
-            INDEX idx_channels_active (is_active)
+            UNIQUE(user_id, channel_id)
         )
+        ''',
+        
+        # Индексы для таблицы channels
+        '''
+        CREATE INDEX IF NOT EXISTS idx_channels_user ON channels(user_id)
+        ''',
+        '''
+        CREATE INDEX IF NOT EXISTS idx_channels_active ON channels(is_active)
         ''',
         
         # Таблица запланированных постов
@@ -595,11 +600,19 @@ async def init_database():
             media_caption TEXT,
             scheduled_time TIMESTAMPTZ NOT NULL,
             is_sent BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            INDEX idx_scheduled_time (scheduled_time),
-            INDEX idx_user_scheduled (user_id, scheduled_time),
-            INDEX idx_sent_status (is_sent)
+            created_at TIMESTAMPTZ DEFAULT NOW()
         )
+        ''',
+        
+        # Индексы для таблицы scheduled_posts
+        '''
+        CREATE INDEX IF NOT EXISTS idx_scheduled_time ON scheduled_posts(scheduled_time)
+        ''',
+        '''
+        CREATE INDEX IF NOT EXISTS idx_user_scheduled ON scheduled_posts(user_id, scheduled_time)
+        ''',
+        '''
+        CREATE INDEX IF NOT EXISTS idx_sent_status ON scheduled_posts(is_sent)
         ''',
         
         # Таблица заказов тарифов
@@ -611,11 +624,19 @@ async def init_database():
             status TEXT DEFAULT 'pending',
             order_date TIMESTAMPTZ DEFAULT NOW(),
             processed_date TIMESTAMPTZ,
-            admin_notes TEXT,
-            INDEX idx_orders_status (status),
-            INDEX idx_orders_user (user_id),
-            INDEX idx_orders_date (order_date DESC)
+            admin_notes TEXT
         )
+        ''',
+        
+        # Индексы для таблицы tariff_orders
+        '''
+        CREATE INDEX IF NOT EXISTS idx_orders_status ON tariff_orders(status)
+        ''',
+        '''
+        CREATE INDEX IF NOT EXISTS idx_orders_user ON tariff_orders(user_id)
+        ''',
+        '''
+        CREATE INDEX IF NOT EXISTS idx_orders_date ON tariff_orders(order_date)
         ''',
         
         # Таблица логов AI запросов
@@ -630,11 +651,19 @@ async def init_database():
             error_message TEXT,
             api_key_index INTEGER,
             model_name TEXT,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            INDEX idx_logs_user_date (user_id, created_at DESC),
-            INDEX idx_logs_success (success),
-            INDEX idx_logs_service (service_type)
+            created_at TIMESTAMPTZ DEFAULT NOW()
         )
+        ''',
+        
+        # Индексы для таблицы ai_request_logs
+        '''
+        CREATE INDEX IF NOT EXISTS idx_logs_user_date ON ai_request_logs(user_id, created_at)
+        ''',
+        '''
+        CREATE INDEX IF NOT EXISTS idx_logs_success ON ai_request_logs(success)
+        ''',
+        '''
+        CREATE INDEX IF NOT EXISTS idx_logs_service ON ai_request_logs(service_type)
         '''
     ]
     
@@ -650,9 +679,9 @@ async def migrate_database():
     """Миграция базы данных"""
     try:
         columns_to_add = [
-            ('users', 'last_seen', 'TIMESTAMPTZ DEFAULT NOW()'),
+            ('users', 'last_seen', 'TIMESTAMPTZ'),
             ('users', 'ai_last_used', 'TIMESTAMPTZ'),
-            ('scheduled_posts', 'message_type', 'TEXT NOT NULL DEFAULT \'text\'')
+            ('scheduled_posts', 'message_type', 'TEXT')
         ]
         
         for table, column, definition in columns_to_add:
@@ -1408,14 +1437,14 @@ async def cmd_start(message: Message):
         f"• 🤖 AI-копирайтер и генератор идей\n"
         f"• 📅 Запланировать пост с любым контентом\n"
         f"• 📊 Детальная статистика\n"
-        f"• 📢 Управление каналами\n"
+        f"• 📢 Управление каналов\n"
         f"• ⏰ Автопубликация в нужное время\n"
         f"{support_text}\n\n"
         f"📍 Время указывается по Москве\n\n"
         f"👇 Выберите действие:"
     )
     
-    await message.answer(welcome_text, reply_markup=get_main_menu(user_id, is_admin))
+    await message.answer(welcome_text, reply_markup=get_main_menu(user_id, is_admin), parse_mode="HTML")
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
@@ -1438,7 +1467,7 @@ async def cmd_help(message: Message):
         "💎 Тарифы:\n"
         "• Mini - 1 копирайт, 10 идей, 1 канал, 2 постов\n"
         "• Standard ($4) - 3 копирайта, 30 идей, 2 канала, 6 постов\n"
-        "• VIP ($7) - 7 копирайтов, 50 идей, 3 канала, 12 постов\n\n"
+        "• VIP ($7) - 7 копирайтов, 50 идей, 3 канал, 12 постов\n\n"
         
         f"🆘 Поддержка: {SUPPORT_URL}\n"
         f"💬 Вопросы по оплате: @{ADMIN_CONTACT.replace('@', '')}"
