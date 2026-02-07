@@ -22,5 +22,9 @@ COPY . .
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
+# Создаем пользователя без привилегий root для безопасности
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
 # Запускаем бота
 CMD ["python", "bot.py"]
