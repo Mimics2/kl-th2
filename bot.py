@@ -1,4 +1,4 @@
-import os
+mport os
 import asyncio
 import logging
 import sys
@@ -44,25 +44,31 @@ if GEMINI_API_KEYS:
         GEMINI_API_KEYS = json.loads(GEMINI_API_KEYS)
     except:
         GEMINI_API_KEYS = [
-            "AIzaSyA2j48JnmiuQKf6uAfzHSg0vAW1gkN7ISc",
-            "AIzaSyCsq2YBVbc0mxoaQcjnGnd3qasoVZaucQk",
-            "AIzaSyCkvLqyIoX4M_dvyG4Tyy1ujpuK_ia-BtQ",
-            "AIzaSyBB1KdR3pKOziItOEsCr5QHEGAf2ZED8lo",
-            "AIzaSyCJoEWTJfBUhuIPZoIh62KrUqV8IEiPnOo",
-            "AIzaSyAI_vkc2IFhOPKELbxpu1QODKCd5h-bEOI",
-            "AIzaSyBy_aoWhZ5ZKm4yyhw7mNzP-8U-t4pXWMI",
-            "AIzaSyA4jtchIEaTWrHnr_yQcRGTsZIWTAstXNA"
+            "AIzaSyBVX6wcwviTFLXZumpApEzogCddy4SHQaQ",
+            "AIzaSyCJyiYNk2PDd0eEF-l_deLl638wtY4vcgQ"
+            "AIzaSyASat89t1UUD7BXHxlXf9Oela6AsCzjOXc",
+            "AIzaSyATKIJVRLb35J8K0HS1G_ql7IS9cJJm4Ys",
+            "AIzaSyDJNu3lzF-VYrKpmw6Bzjm5JToasfhm8sU",
+            "AIzaSyBudSc-lz-ypF_2pigH5_7DfLGxF0COJYQ",
+            "AIzaSyA9iL90r62KthqSkdcon3wcLKeMaXOsBfM",
+            "AIzaSyBZkVAruHt6zPCJF1gf67kVbk6fHY-eelo",
+            "AIzaSyB9VqHVXudqHHN3_b_BWM9nNEEvNn-geKw",
+            "AIzaSyCeME8Lvm3p5QYBjJh5FucEyJ4J22E1NOY",
+            "AIzaSyDtcHsN6daIR9WQ1psELkArzRrJH1IHu70"
         ]
 else:
     GEMINI_API_KEYS = [
-        "AIzaSyA2j48JnmiuQKf6uAfzHSg0vAW1gkN7ISc",
-        "AIzaSyCsq2YBVbc0mxoaQcjnGnd3qasoVZaucQk",
-        "AIzaSyCkvLqyIoX4M_dvyG4Tyy1ujpuK_ia-BtQ",
-        "AIzaSyBB1KdR3pKOziItOEsCr5QHEGAf2ZED8lo",
-        "AIzaSyCJoEWTJfBUhuIPZoIh62KrUqV8IEiPnOo",
-        "AIzaSyAI_vkc2IFhOPKELbxpu1QODKCd5h-bEOI",
-        "AIzaSyBy_aoWhZ5ZKm4yyhw7mNzP-8U-t4pXWMI",
-        "AIzaSyA4jtchIEaTWrHnr_yQcRGTsZIWTAstXNA"
+        "AIzaSyBVX6wcwviTFLXZumpApEzogCddy4SHQaQ",
+        "AIzaSyCJyiYNk2PDd0eEF-l_deLl638wtY4vcgQ"
+        "AIzaSyASat89t1UUD7BXHxlXf9Oela6AsCzjOXc",
+        "AIzaSyATKIJVRLb35J8K0HS1G_ql7IS9cJJm4Ys",
+        "AIzaSyDJNu3lzF-VYrKpmw6Bzjm5JToasfhm8sU",
+        "AIzaSyBudSc-lz-ypF_2pigH5_7DfLGxF0COJYQ",
+        "AIzaSyA9iL90r62KthqSkdcon3wcLKeMaXOsBfM",
+        "AIzaSyBZkVAruHt6zPCJF1gf67kVbk6fHY-eelo",
+        "AIzaSyB9VqHVXudqHHN3_b_BWM9nNEEvNn-geKw",
+        "AIzaSyCeME8Lvm3p5QYBjJh5FucEyJ4J22E1NOY",
+        "AIzaSyDtcHsN6daIR9WQ1psELkArzRrJH1IHu70"
     ]
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
