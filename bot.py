@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple, Any
 from enum import Enum
 from collections import defaultdict
+import signal
 
 import pytz
 from aiogram import Bot, Dispatcher, types, Router, F
@@ -37,6 +38,9 @@ SUPPORT_BOT_USERNAME = os.getenv("SUPPORT_BOT_USERNAME", "support_bot")
 ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@admin")
 SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/koles_tech_support")
 
+# Railway порт
+PORT = int(os.getenv("PORT", 8080))
+
 # ========== AI CONFIGURATION ==========
 GEMINI_API_KEYS = os.getenv("GEMINI_API_KEYS", "")
 if GEMINI_API_KEYS:
@@ -45,7 +49,7 @@ if GEMINI_API_KEYS:
     except:
         GEMINI_API_KEYS = [
             "AIzaSyBVX6wcwviTFLXZumpApEzogCddy4SHQaQ",
-            "AIzaSyCJyiYNk2PDd0eEF-l_deLl638wtY4vcgQ",  # Исправлено: добавлена запятая
+            "AIzaSyCJyiYNk2PDd0eEF-l_deLl638wtY4vcgQ",
             "AIzaSyASat89t1UUD7BXHxlXf9Oela6AsCzjOXc",
             "AIzaSyATKIJVRLb35J8K0HS1G_ql7IS9cJJm4Ys",
             "AIzaSyDJNu3lzF-VYrKpmw6Bzjm5JToasfhm8sU",
@@ -59,7 +63,7 @@ if GEMINI_API_KEYS:
 else:
     GEMINI_API_KEYS = [
         "AIzaSyBVX6wcwviTFLXZumpApEzogCddy4SHQaQ",
-        "AIzaSyCJyiYNk2PDd0eEF-l_deLl638wtY4vcgQ",  # Исправлено: добавлена запятая
+        "AIzaSyCJyiYNk2PDd0eEF-l_deLl638wtY4vcgQ",
         "AIzaSyASat89t1UUD7BXHxlXf9Oela6AsCzjOXc",
         "AIzaSyATKIJVRLb35J8K0HS1G_ql7IS9cJJm4Ys",
         "AIzaSyDJNu3lzF-VYrKpmw6Bzjm5JToasfhm8sU",
@@ -2839,7 +2843,7 @@ async def show_tariffs(callback: CallbackQuery):
     tariffs_text = (
         "💎 Доступные тарифы:\n\n"
         "🚀 Mini (Бесплатно):\n"
-        "• 1 канал, 2 поста в день\n"
+        "• 1 канал, 2 постов в день\n"
         "• 1 AI-копирайтинг, 10 идей\n"
         "• Базовые функции\n\n"
         "⭐ Standard ($4/месяц):\n"
@@ -3691,6 +3695,29 @@ async def auto_rotate_keys_task():
         logger.error(f"Ошибка автоматической ротации ключей: {e}")
 
 # ========== STARTUP/SHUTDOWN ==========
+async def start_web_server():
+    """Запуск веб-сервера для Railway"""
+    try:
+        from aiohttp import web
+        
+        async def health_check(request):
+            return web.Response(text="OK", status=200)
+        
+        app = web.Application()
+        app.router.add_get('/', health_check)
+        app.router.add_get('/health', health_check)
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', PORT)
+        await site.start()
+        
+        logger.info(f"🌐 Веб-сервер запущен на порту {PORT}")
+        return runner
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска веб-сервера: {e}")
+        return None
+
 async def on_startup():
     """Запуск бота"""
     logger.info("=" * 60)
@@ -3699,6 +3726,7 @@ async def on_startup():
     logger.info(f"🔑 Gemini ключей: {len(GEMINI_API_KEYS)}")
     logger.info(f"👑 Admin ID: {ADMIN_ID}")
     logger.info(f"🆘 Поддержка: {SUPPORT_BOT_USERNAME or SUPPORT_URL}")
+    logger.info(f"🌐 Порт Railway: {PORT}")
     logger.info("=" * 60)
     
     try:
@@ -3754,6 +3782,7 @@ async def on_startup():
                     f"🤖 AI сервисы: ВКЛЮЧЕНЫ\n"
                     f"🔑 Gemini ключей: {len(GEMINI_API_KEYS)}\n"
                     f"🔄 Система ротации ключей: АКТИВНА\n"
+                    f"🌐 Порт Railway: {PORT}\n"
                     f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}"
                 )
             except Exception as e:
@@ -3830,13 +3859,20 @@ async def main():
         logger.error("❌ Не удалось запустить бота")
         return
     
+    # Запускаем веб-сервер для Railway
+    web_runner = await start_web_server()
+    
     try:
+        # Запускаем поллинг бота
         await dp.start_polling(bot, skip_updates=True)
     except KeyboardInterrupt:
         logger.info("⚠️ Получен сигнал прерывания")
     except Exception as e:
         logger.error(f"💥 КРИТИЧЕСКАЯ ОШИБКА: {e}")
     finally:
+        # Останавливаем веб-сервер
+        if web_runner:
+            await web_runner.cleanup()
         await on_shutdown()
 
 if __name__ == "__main__":
