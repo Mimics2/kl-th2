@@ -44,34 +44,39 @@ if GEMINI_API_KEYS:
         GEMINI_API_KEYS = json.loads(GEMINI_API_KEYS)
     except:
         GEMINI_API_KEYS = [
-            "AIzaSyA2j48JnmiuQKf6uAfzHSg0vAW1gkN7ISc",
-            "AIzaSyCsq2YBVbc0mxoaQcjnGnd3qasoVZaucQk",
-            "AIzaSyCkvLqyIoX4M_dvyG4Tyy1ujpuK_ia-BtQ",
-            "AIzaSyBB1KdR3pKOziItOEsCr5QHEGAf2ZED8lo",
-            "AIzaSyCJoEWTJfBUhuIPZoIh62KrUqV8IEiPnOo",
-            "AIzaSyAI_vkc2IFhOPKELbxpu1QODKCd5h-bEOI",
-            "AIzaSyBy_aoWhZ5ZKm4yyhw7mNzP-8U-t4pXWMI",
-            "AIzaSyA4jtchIEaTWrHnr_yQcRGTsZIWTAstXNA"
+            "AIzaSyBVX6wcwviTFLXZumpApEzogCddy4SHQaQ",
+            "AIzaSyCJyiYNk2PDd0eEF-l_deLl638wtY4vcgQ"
+            "AIzaSyASat89t1UUD7BXHxlXf9Oela6AsCzjOXc",
+            "AIzaSyATKIJVRLb35J8K0HS1G_ql7IS9cJJm4Ys",
+            "AIzaSyDJNu3lzF-VYrKpmw6Bzjm5JToasfhm8sU",
+            "AIzaSyBudSc-lz-ypF_2pigH5_7DfLGxF0COJYQ",
+            "AIzaSyA9iL90r62KthqSkdcon3wcLKeMaXOsBfM",
+            "AIzaSyBZkVAruHt6zPCJF1gf67kVbk6fHY-eelo",
+            "AIzaSyB9VqHVXudqHHN3_b_BWM9nNEEvNn-geKw",
+            "AIzaSyCeME8Lvm3p5QYBjJh5FucEyJ4J22E1NOY",
+            "AIzaSyDtcHsN6daIR9WQ1psELkArzRrJH1IHu70"   
         ]
 else:
     GEMINI_API_KEYS = [
-        "AIzaSyA2j48JnmiuQKf6uAfzHSg0vAW1gkN7ISc",
-        "AIzaSyCsq2YBVbc0mxoaQcjnGnd3qasoVZaucQk",
-        "AIzaSyCkvLqyIoX4M_dvyG4Tyy1ujpuK_ia-BtQ",
-        "AIzaSyBB1KdR3pKOziItOEsCr5QHEGAf2ZED8lo",
-        "AIzaSyCJoEWTJfBUhuIPZoIh62KrUqV8IEiPnOo",
-        "AIzaSyAI_vkc2IFhOPKELbxpu1QODKCd5h-bEOI",
-        "AIzaSyBy_aoWhZ5ZKm4yyhw7mNzP-8U-t4pXWMI",
-        "AIzaSyA4jtchIEaTWrHnr_yQcRGTsZIWTAstXNA"
+        "AIzaSyBVX6wcwviTFLXZumpApEzogCddy4SHQaQ",
+        "AIzaSyCJyiYNk2PDd0eEF-l_deLl638wtY4vcgQ"
+        "AIzaSyASat89t1UUD7BXHxlXf9Oela6AsCzjOXc",
+        "AIzaSyATKIJVRLb35J8K0HS1G_ql7IS9cJJm4Ys",
+        "AIzaSyDJNu3lzF-VYrKpmw6Bzjm5JToasfhm8sU",
+        "AIzaSyBudSc-lz-ypF_2pigH5_7DfLGxF0COJYQ",
+        "AIzaSyBZkVAruHt6zPCJF1gf67kVbk6fHY-eelo",
+        "AIzaSyB9VqHVXudqHHN3_b_BWM9nNEEvNn-geKw",
+        "AIzaSyCeME8Lvm3p5QYBjJh5FucEyJ4J22E1NOY",
+        "AIzaSyDtcHsN6daIR9WQ1psELkArzRrJH1IHu70"
     ]
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-ALTERNATIVE_MODELS = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+ALTERNATIVE_MODELS = ["gemini-2.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
 
 # Ротация настроек
-MAX_403_RETRIES = 3  # Максимум 3 попытки при ошибке 403
-REQUEST_COOLDOWN = 60  # 60 секунд между запросами пользователя
-KEY_BLOCK_DURATION = 300  # 5 минут блокировки ключа после 3 ошибок 403
+MAX_403_RETRIES = 1  # Только 1 попытка при ошибке 403
+REQUEST_COOLDOWN = 30  # 30 секунд между запросами пользователя
+KEY_BLOCK_DURATION = 600  # 10 минут блокировки ключа после ошибки 403
 
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 POST_CHARACTER_LIMIT = 4000
@@ -202,6 +207,7 @@ class AdvancedAISessionManager:
         self.current_model_index = 0
         self.models = [GEMINI_MODEL] + ALTERNATIVE_MODELS
         self.user_request_counts = defaultdict(int)
+        self.last_key_rotation = datetime.now(MOSCOW_TZ)
         
     def _init_key_stats(self):
         """Инициализация статистики ключей"""
@@ -212,7 +218,9 @@ class AdvancedAISessionManager:
                 "403_errors": 0,
                 "blocked_until": None,
                 "last_used": None,
-                "successful_requests": 0
+                "successful_requests": 0,
+                "last_error": None,
+                "priority": 100  # Приоритет: чем меньше, тем лучше
             }
     
     def get_session(self, user_id: int) -> Dict:
@@ -230,7 +238,8 @@ class AdvancedAISessionManager:
                 'word_count': 200,
                 'current_attempts': 0,
                 'consecutive_errors': 0,
-                'last_error_time': None
+                'last_error_time': None,
+                'failed_keys': set()  # Ключи, которые не сработали для этого пользователя
             }
         return self.sessions[user_id]
     
@@ -238,47 +247,80 @@ class AdvancedAISessionManager:
         """Выбирает лучший доступный ключ с интеллектуальной ротацией"""
         session = self.get_session(user_id)
         
-        # Пробуем последний успешный ключ сначала
+        # Сначала проверяем последний успешный ключ
         if session['last_successful_key']:
             key = session['last_successful_key']
-            if self._is_key_available(key):
-                return key, GEMINI_API_KEYS.index(key), self.get_current_model()
+            if self._is_key_available(key) and key not in session['failed_keys']:
+                key_index = GEMINI_API_KEYS.index(key)
+                session['current_key_index'] = key_index
+                self._update_key_stats_on_use(key)
+                return key, key_index, self.get_current_model()
         
-        # Ищем ключ с наименьшим количеством ошибок
+        # Ищем ключ с наивысшим приоритетом
         available_keys = []
         for key in GEMINI_API_KEYS:
-            if self._is_key_available(key):
+            if self._is_key_available(key) and key not in session['failed_keys']:
                 stats = self.key_stats[key]
-                score = self._calculate_key_score(stats)
-                available_keys.append((score, key))
+                available_keys.append((stats['priority'], key))
         
+        # Если все ключи в failed_keys, очищаем список
+        if not available_keys and session['failed_keys']:
+            logger.warning(f"Все ключи в failed_keys для user_{user_id}, очищаю список")
+            session['failed_keys'].clear()
+            # Повторяем поиск
+            for key in GEMINI_API_KEYS:
+                if self._is_key_available(key):
+                    stats = self.key_stats[key]
+                    available_keys.append((stats['priority'], key))
+        
+        # Если нет доступных ключей, пробуем самый старый в блокировке
         if not available_keys:
-            # Если нет доступных ключей, пробуем самый старый в блокировке
             for key in GEMINI_API_KEYS:
                 stats = self.key_stats[key]
-                if stats['blocked_until'] and stats['blocked_until'] < datetime.now(MOSCOW_TZ) + timedelta(minutes=30):
+                if stats['blocked_until'] and stats['blocked_until'] < datetime.now(MOSCOW_TZ) + timedelta(minutes=5):
                     stats['403_errors'] = 0
                     stats['blocked_until'] = None
-                    return key, GEMINI_API_KEYS.index(key), self.get_current_model()
+                    stats['priority'] = 50  # Средний приоритет
+                    key_index = GEMINI_API_KEYS.index(key)
+                    session['current_key_index'] = key_index
+                    self._update_key_stats_on_use(key)
+                    return key, key_index, self.get_current_model()
             
-            # Все ключи заблокированы, пробуем первый
+            # Все ключи заблокированы, пробуем первый с лучшим приоритетом
+            for key in GEMINI_API_KEYS:
+                if self.key_stats[key]['priority'] < 90:  # Исключаем полностью заблокированные
+                    key_index = GEMINI_API_KEYS.index(key)
+                    self.key_stats[key]['403_errors'] = 0
+                    self.key_stats[key]['blocked_until'] = None
+                    session['current_key_index'] = key_index
+                    self._update_key_stats_on_use(key)
+                    return key, key_index, self.get_current_model()
+            
+            # Последний вариант - первый ключ
             key = GEMINI_API_KEYS[0]
             self.key_stats[key]['403_errors'] = 0
             self.key_stats[key]['blocked_until'] = None
-            return key, 0, self.get_current_model()
+            key_index = 0
+            session['current_key_index'] = key_index
+            self._update_key_stats_on_use(key)
+            return key, key_index, self.get_current_model()
         
-        # Выбираем ключ с наилучшим score
+        # Выбираем ключ с наилучшим приоритетом
         available_keys.sort(key=lambda x: x[0])
         best_key = available_keys[0][1]
         key_index = GEMINI_API_KEYS.index(best_key)
         
         # Обновляем статистику
         session['current_key_index'] = key_index
-        session['request_count'] += 1
-        self.key_stats[best_key]['requests'] += 1
-        self.key_stats[best_key]['last_used'] = datetime.now(MOSCOW_TZ)
+        self._update_key_stats_on_use(best_key)
         
         return best_key, key_index, self.get_current_model()
+    
+    def _update_key_stats_on_use(self, key: str):
+        """Обновляет статистику при использовании ключа"""
+        if key in self.key_stats:
+            self.key_stats[key]['requests'] += 1
+            self.key_stats[key]['last_used'] = datetime.now(MOSCOW_TZ)
     
     def _is_key_available(self, key: str) -> bool:
         """Проверяет, доступен ли ключ"""
@@ -290,24 +332,15 @@ class AdvancedAISessionManager:
         if stats['blocked_until'] and stats['blocked_until'] > datetime.now(MOSCOW_TZ):
             return False
         
-        # Проверяем количество ошибки 403
+        # Проверяем количество ошибок 403
         if stats['403_errors'] >= MAX_403_RETRIES:
             return False
         
+        # Ключ с низким приоритетом считается менее доступным
+        if stats['priority'] > 80:
+            return False
+        
         return True
-    
-    def _calculate_key_score(self, stats: Dict) -> float:
-        """Рассчитывает score ключа (чем меньше, тем лучше)"""
-        score = 0
-        score += stats['errors'] * 10
-        score += stats['403_errors'] * 100
-        score += stats['requests'] * 0.1
-        
-        if stats['last_used']:
-            minutes_since_last_use = (datetime.now(MOSCOW_TZ) - stats['last_used']).total_seconds() / 60
-            score -= min(minutes_since_last_use, 60) * 0.5
-        
-        return score
     
     def mark_key_error(self, key: str, error_type: str = "403"):
         """Отмечает ошибку для ключа"""
@@ -316,14 +349,22 @@ class AdvancedAISessionManager:
         
         stats = self.key_stats[key]
         stats['errors'] += 1
+        stats['last_error'] = datetime.now(MOSCOW_TZ)
         
         if error_type == "403":
             stats['403_errors'] += 1
-            logger.warning(f"Ключ {key[:15]}... получил 403 ошибку. Всего: {stats['403_errors']}/{MAX_403_RETRIES}")
+            stats['priority'] = min(100, stats['priority'] + 20)  # Понижаем приоритет
+            logger.warning(f"Ключ {key[:15]}... получил 403 ошибку. Приоритет: {stats['priority']}")
             
             if stats['403_errors'] >= MAX_403_RETRIES:
                 stats['blocked_until'] = datetime.now(MOSCOW_TZ) + timedelta(seconds=KEY_BLOCK_DURATION)
+                stats['priority'] = 90  # Низкий приоритет для заблокированных
                 logger.warning(f"Ключ {key[:15]}... заблокирован на {KEY_BLOCK_DURATION // 60} минут")
+        elif error_type in ["429", "quota"]:
+            stats['priority'] = min(100, stats['priority'] + 15)
+            logger.warning(f"Ключ {key[:15]}... превысил лимит. Приоритет: {stats['priority']}")
+        else:
+            stats['priority'] = min(100, stats['priority'] + 5)
     
     def mark_key_success(self, key: str, user_id: int):
         """Отмечает успешное использование ключа"""
@@ -334,11 +375,16 @@ class AdvancedAISessionManager:
         stats['errors'] = 0
         stats['403_errors'] = 0
         stats['successful_requests'] += 1
+        stats['priority'] = max(1, stats['priority'] - 10)  # Повышаем приоритет
+        stats['blocked_until'] = None
         
         session = self.get_session(user_id)
         session['last_successful_key'] = key
         session['consecutive_errors'] = 0
         session['current_attempts'] = 0
+        session['failed_keys'].discard(key)  # Убираем ключ из списка неудачных
+        
+        logger.info(f"Ключ {key[:15]}... успешно использован. Приоритет: {stats['priority']}")
     
     def increment_user_attempts(self, user_id: int) -> int:
         """Увеличивает счетчик попыток пользователя"""
@@ -347,11 +393,18 @@ class AdvancedAISessionManager:
         session['consecutive_errors'] += 1
         return session['current_attempts']
     
+    def add_failed_key(self, user_id: int, key: str):
+        """Добавляет ключ в список неудачных для пользователя"""
+        session = self.get_session(user_id)
+        session['failed_keys'].add(key)
+        logger.info(f"Ключ {key[:15]}... добавлен в failed_keys для user_{user_id}")
+    
     def reset_user_attempts(self, user_id: int):
         """Сбрасывает счетчик попыток пользователя"""
         session = self.get_session(user_id)
         session['current_attempts'] = 0
         session['consecutive_errors'] = 0
+        session['failed_keys'].clear()  # Очищаем список неудачных ключей
     
     def can_user_request(self, user_id: int) -> Tuple[bool, Optional[str]]:
         """Проверяет, может ли пользователь сделать запрос"""
@@ -364,7 +417,7 @@ class AdvancedAISessionManager:
                 return False, f"⏳ Подождите {wait_time} секунд перед следующим запросом"
         
         session = self.get_session(user_id)
-        if session['consecutive_errors'] > 5:
+        if session['consecutive_errors'] > 3:
             return False, "⚠️ Слишком много ошибок подряд. Попробуйте позже."
         
         self.last_request_time[user_id] = now
@@ -377,7 +430,13 @@ class AdvancedAISessionManager:
     def rotate_model(self):
         """Переключает на следующую модель"""
         self.current_model_index += 1
-        logger.info(f"Ротация модели на: {self.get_current_model()}")
+        model_name = self.get_current_model()
+        logger.info(f"Ротация модели на: {model_name}")
+        
+        # При ротации модели сбрасываем некоторые блокировки
+        for key in GEMINI_API_KEYS:
+            if self.key_stats[key]['priority'] > 80:
+                self.key_stats[key]['priority'] = 60  # Средний приоритет
     
     def reset_daily_limits(self):
         """Сбрасывает дневные лимиты"""
@@ -389,6 +448,7 @@ class AdvancedAISessionManager:
                 session['last_reset'] = today
                 session['consecutive_errors'] = 0
                 session['current_attempts'] = 0
+                session['failed_keys'].clear()  # Очищаем список неудачных ключей
     
     def set_word_count(self, user_id: int, word_count: int):
         """Устанавливает количество слов"""
@@ -407,7 +467,8 @@ class AdvancedAISessionManager:
             'ideas_used': session['ideas_used'],
             'total_requests': session['total_requests'],
             'consecutive_errors': session['consecutive_errors'],
-            'word_count': session['word_count']
+            'word_count': session['word_count'],
+            'failed_keys_count': len(session['failed_keys'])
         }
     
     def get_system_stats(self) -> Dict:
@@ -423,6 +484,7 @@ class AdvancedAISessionManager:
                 'errors': stats['errors'],
                 '403_errors': stats['403_errors'],
                 'successful': stats['successful_requests'],
+                'priority': stats['priority'],
                 'blocked': stats['blocked_until'] is not None and stats['blocked_until'] > datetime.now(MOSCOW_TZ)
             }
         
@@ -432,8 +494,34 @@ class AdvancedAISessionManager:
             'total_copies': total_copies,
             'total_ideas': total_ideas,
             'key_stats': key_stats_summary,
-            'active_sessions': len([s for s in self.sessions.values() if s['total_requests'] > 0])
+            'active_sessions': len([s for s in self.sessions.values() if s['total_requests'] > 0]),
+            'available_keys': len([k for k, v in self.key_stats.items() if v['priority'] < 80])
         }
+    
+    def check_and_rotate_keys(self):
+        """Проверяет и ротирует ключи если нужно"""
+        now = datetime.now(MOSCOW_TZ)
+        if (now - self.last_key_rotation).total_seconds() > 3600:  # Каждый час
+            self.last_key_rotation = now
+            
+            # Восстанавливаем приоритеты заблокированных ключей
+            for key in GEMINI_API_KEYS:
+                stats = self.key_stats[key]
+                if stats['blocked_until'] and stats['blocked_until'] < now:
+                    stats['403_errors'] = 0
+                    stats['blocked_until'] = None
+                    stats['priority'] = 50
+                    logger.info(f"Восстановлен ключ {key[:15]}...")
+            
+            # Повышаем приоритеты редко используемых ключей
+            for key in GEMINI_API_KEYS:
+                stats = self.key_stats[key]
+                if stats['last_used']:
+                    hours_since_use = (now - stats['last_used']).total_seconds() / 3600
+                    if hours_since_use > 2:
+                        stats['priority'] = max(1, stats['priority'] - 5)
+            
+            logger.info("Выполнена автоматическая ротация ключей")
 
 ai_manager = AdvancedAISessionManager()
 
@@ -483,8 +571,11 @@ IDEAS_PROMPT = """Ты эксперт по контенту для Telegram. С�
 Верни список идей с нумерацией, каждый с новой строки."""
 
 # ========== AI GENERATION FUNCTIONS ==========
-async def generate_with_gemini_advanced(prompt: str, user_id: int, max_retries: int = 3) -> Optional[str]:
+async def generate_with_gemini_advanced(prompt: str, user_id: int, max_retries: int = 5) -> Optional[str]:
     """Усовершенствованная генерация с интеллектуальной ротацией"""
+    
+    # Проверяем и ротируем ключи если нужно
+    ai_manager.check_and_rotate_keys()
     
     for attempt in range(1, max_retries + 1):
         try:
@@ -494,45 +585,72 @@ async def generate_with_gemini_advanced(prompt: str, user_id: int, max_retries: 
                 logger.error(f"Нет доступных ключей для user_{user_id}")
                 return None
             
-            logger.info(f"Попытка #{attempt} | user_{user_id} | key_{key_index} | модель: {model_name}")
+            logger.info(f"Попытка #{attempt} | user_{user_id} | key_{key_index} | модель: {model_name} | приоритет: {ai_manager.key_stats[key]['priority']}")
             
             genai.configure(api_key=key)
-            model = genai.GenerativeModel(model_name)
             
-            response = model.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": 0.8,
-                    "top_p": 0.95,
-                    "top_k": 40,
-                    "max_output_tokens": 4000,
-                }
-            )
+            # Пробуем разные модели если первая не работает
+            current_model_index = ai_manager.current_model_index
+            models_to_try = [model_name]
+            models_to_try.extend(ai_manager.models)
             
-            ai_manager.mark_key_success(key, user_id)
-            logger.info(f"✅ Успешно | user_{user_id} | ключ: {key_index} | попытка: {attempt}")
-            return response.text.strip()
-            
+            for model_to_try in models_to_try[:3]:  # Пробуем максимум 3 модели
+                try:
+                    model = genai.GenerativeModel(model_to_try)
+                    
+                    response = model.generate_content(
+                        prompt,
+                        generation_config={
+                            "temperature": 0.8,
+                            "top_p": 0.95,
+                            "top_k": 40,
+                            "max_output_tokens": 4000,
+                        }
+                    )
+                    
+                    ai_manager.mark_key_success(key, user_id)
+                    logger.info(f"✅ Успешно | user_{user_id} | ключ: {key_index} | модель: {model_to_try} | попытка: {attempt}")
+                    return response.text.strip()
+                    
+                except Exception as model_error:
+                    if "not supported" in str(model_error).lower() or "not found" in str(model_error).lower():
+                        logger.warning(f"Модель {model_to_try} не поддерживается, пробую следующую")
+                        continue
+                    else:
+                        raise model_error
+                    
         except Exception as e:
             error_str = str(e)
             logger.warning(f"Ошибка попытки #{attempt} для user_{user_id}: {error_str[:100]}")
             
+            # Анализируем ошибку
             if "429" in error_str or "quota" in error_str or "resource exhausted" in error_str:
                 ai_manager.mark_key_error(key, "quota")
-            elif "403" in error_str or "permission denied" in error_str:
+                ai_manager.add_failed_key(user_id, key)
+            elif "403" in error_str or "permission denied" in error_str or "leaked" in error_str:
                 ai_manager.mark_key_error(key, "403")
+                ai_manager.add_failed_key(user_id, key)
             elif "503" in error_str or "unavailable" in error_str:
                 ai_manager.rotate_model()
+                ai_manager.add_failed_key(user_id, key)
             else:
                 logger.error(f"Неизвестная ошибка: {e}")
+                ai_manager.add_failed_key(user_id, key)
             
-            ai_manager.increment_user_attempts(user_id)
+            attempts = ai_manager.increment_user_attempts(user_id)
+            
+            # Если много ошибок подряд, делаем паузу
+            if attempts >= 3:
+                wait_time = 2 * (attempts - 2)
+                logger.info(f"Много ошибок подряд ({attempts}), пауза {wait_time} секунд")
+                await asyncio.sleep(wait_time)
             
             if attempt < max_retries:
-                wait_time = 1 * attempt
+                wait_time = 0.5 * attempt
                 await asyncio.sleep(wait_time)
             else:
                 logger.error(f"Все {max_retries} попыток исчерпаны для user_{user_id}")
+                logger.error(f"Статистика ключей: {ai_manager.get_system_stats()['key_stats']}")
     
     return None
 
@@ -1736,7 +1854,7 @@ async def start_generation(callback: CallbackQuery, state: FSMContext, word_coun
         f"🎨 Стиль: {data['style']}\n"
         f"📝 Слов: {word_count}\n"
         f"📚 Примеры: {data['examples'][:100]}...\n\n"
-        f"⏳ Генерирую текст... Пробую разные ключи (макс. {MAX_403_RETRIES} попытки)"
+        f"⏳ Генерирую текст... Пробую разные ключи (макс. 5 попыток)"
     )
     
     await callback.message.edit_text(preview_text)
@@ -1755,22 +1873,25 @@ async def start_generation(callback: CallbackQuery, state: FSMContext, word_coun
     progress_msg = await callback.message.answer("🔄 Пробую ключ #1...")
     
     # Генерируем текст
-    generated_text = await generate_with_gemini_advanced(prompt, user_id, max_retries=MAX_403_RETRIES)
+    generated_text = await generate_with_gemini_advanced(prompt, user_id, max_retries=5)
     
     await progress_msg.delete()
     
     # Обработка результата
     if not generated_text:
+        system_stats = ai_manager.get_system_stats()
+        available_keys = system_stats['available_keys']
+        
         await callback.message.edit_text(
-            f"❌ Не удалось сгенерировать текст после {MAX_403_RETRIES} попыток!\n\n"
-            f"Возможные причины:\n"
-            f"• Все ключи API временно недоступны\n"
-            f"• Закончились лимиты на всех ключах\n"
-            f"• Проблемы с сетью или сервисом Gemini\n\n"
+            f"❌ Не удалось сгенерировать текст после 5 попыток!\n\n"
+            f"Статистика системы:\n"
+            f"• Доступных ключей: {available_keys} из {len(GEMINI_API_KEYS)}\n"
+            f"• Все ключи могут быть временно недоступны\n\n"
             f"📌 Что можно сделать:\n"
             f"1. Попробовать позже (через 5-10 минут)\n"
-            f"2. Использовать другой тариф с большим количеством попыток\n"
-            f"3. Обратиться в поддержку: {SUPPORT_URL}",
+            f"2. Проверить доступность новых ключей API\n"
+            f"3. Обратиться в поддержку: {SUPPORT_URL}\n\n"
+            f"⚠️ Система автоматически попробует другие ключи при следующем запросе.",
             reply_markup=get_ai_main_menu(await get_user_tariff(user_id))
         )
         await state.clear()
@@ -1779,6 +1900,7 @@ async def start_generation(callback: CallbackQuery, state: FSMContext, word_coun
     # Обновляем статистику
     session = ai_manager.get_session(user_id)
     session['copies_used'] += 1
+    session['total_requests'] += 1
     
     # Логируем успешный запрос
     await update_ai_usage_log(
@@ -1853,7 +1975,7 @@ async def start_generation_for_message(message: Message, data: Dict, word_count:
         f"🎨 Стиль: {data['style']}\n"
         f"📝 Слов: {word_count}\n"
         f"📚 Примеры: {data['examples'][:100]}...\n\n"
-        f"⏳ Генерирую текст... Пробую разные ключи (макс. {MAX_403_RETRIES} попытки)"
+        f"⏳ Генерирую текст... Пробую разные ключи (макс. 5 попыток)"
     )
     
     await message.answer(preview_text)
@@ -1872,22 +1994,25 @@ async def start_generation_for_message(message: Message, data: Dict, word_count:
     progress_msg = await message.answer("🔄 Пробую ключ #1...")
     
     # Генерируем текст
-    generated_text = await generate_with_gemini_advanced(prompt, user_id, max_retries=MAX_403_RETRIES)
+    generated_text = await generate_with_gemini_advanced(prompt, user_id, max_retries=5)
     
     await progress_msg.delete()
     
     # Обработка результата
     if not generated_text:
+        system_stats = ai_manager.get_system_stats()
+        available_keys = system_stats['available_keys']
+        
         await message.answer(
-            f"❌ Не удалось сгенерировать текст после {MAX_403_RETRIES} попыток!\n\n"
-            f"Возможные причины:\n"
-            f"• Все ключи API временно недоступны\n"
-            f"• Закончились лимиты на всех ключах\n"
-            f"• Проблемы с сетью или сервисом Gemini\n\n"
+            f"❌ Не удалось сгенерировать текст после 5 попыток!\n\n"
+            f"Статистика системы:\n"
+            f"• Доступных ключей: {available_keys} из {len(GEMINI_API_KEYS)}\n"
+            f"• Все ключи могут быть временно недоступны\n\n"
             f"📌 Что можно сделать:\n"
             f"1. Попробовать позже (через 5-10 минут)\n"
-            f"2. Использовать другой тариф с большим количеством попыток\n"
-            f"3. Обратиться в поддержку: {SUPPORT_URL}",
+            f"2. Проверить доступность новых ключей API\n"
+            f"3. Обратиться в поддержку: {SUPPORT_URL}\n\n"
+            f"⚠️ Система автоматически попробует другие ключи при следующем запросе.",
             reply_markup=get_ai_main_menu(await get_user_tariff(user_id))
         )
         return
@@ -1895,6 +2020,7 @@ async def start_generation_for_message(message: Message, data: Dict, word_count:
     # Обновляем статистику
     session = ai_manager.get_session(user_id)
     session['copies_used'] += 1
+    session['total_requests'] += 1
     
     # Логируем успешный запрос
     await update_ai_usage_log(
@@ -2037,14 +2163,20 @@ async def generate_ideas(callback: CallbackQuery, state: FSMContext):
     
     loading_msg = await callback.message.answer("🔄 ИИ генерирует идеи...")
     
-    generated_ideas = await generate_with_gemini_advanced(prompt, callback.from_user.id, max_retries=MAX_403_RETRIES)
+    generated_ideas = await generate_with_gemini_advanced(prompt, callback.from_user.id, max_retries=5)
     
     await loading_msg.delete()
     
     # Обработка результата
     if not generated_ideas:
+        system_stats = ai_manager.get_system_stats()
+        available_keys = system_stats['available_keys']
+        
         await callback.message.edit_text(
-            f"❌ Не удалось сгенерировать идеи после {MAX_403_RETRIES} попыток!\n\n"
+            f"❌ Не удалось сгенерировать идеи после 5 попыток!\n\n"
+            f"Статистика системы:\n"
+            f"• Доступных ключей: {available_keys} из {len(GEMINI_API_KEYS)}\n"
+            f"• Все ключи могут быть временно недоступны\n\n"
             f"Попробуйте позже или обратитесь в поддержку.",
             reply_markup=get_ai_main_menu(await get_user_tariff(callback.from_user.id))
         )
@@ -2062,6 +2194,7 @@ async def generate_ideas(callback: CallbackQuery, state: FSMContext):
     # Обновляем статистику
     session = ai_manager.get_session(callback.from_user.id)
     session['ideas_used'] += 1
+    session['total_requests'] += 1
     
     # Логируем успешный запрос
     await update_ai_usage_log(
@@ -2122,6 +2255,9 @@ async def show_ai_limits(callback: CallbackQuery):
     hours = int(time_left.total_seconds() // 3600)
     minutes = int((time_left.total_seconds() % 3600) // 60)
     
+    system_stats = ai_manager.get_system_stats()
+    available_keys = system_stats['available_keys']
+    
     limits_text = (
         f"📊 Ваши AI-лимиты\n\n"
         f"💎 Тариф: {tariff_info['name']}\n\n"
@@ -2132,7 +2268,10 @@ async def show_ai_limits(callback: CallbackQuery):
         f"• Использовано: {session['ideas_used']}/{tariff_info['ai_ideas_limit']}\n"
         f"• Осталось: {tariff_info['ai_ideas_limit'] - session['ideas_used']}\n\n"
         f"🔄 Обновление через: {hours}ч {minutes}м\n\n"
-        f"📈 Всего AI запросов: {session['total_requests']}"
+        f"📈 Всего AI запросов: {session['total_requests']}\n\n"
+        f"🔑 Система ключей:\n"
+        f"• Доступных ключей: {available_keys} из {len(GEMINI_API_KEYS)}\n"
+        f"• Ошибок подряд: {session['consecutive_errors']}"
     )
     
     await callback.message.edit_text(
@@ -2236,6 +2375,9 @@ async def show_my_stats(callback: CallbackQuery):
     user_id = callback.from_user.id
     stats = await get_user_stats(user_id)
     
+    system_stats = ai_manager.get_system_stats()
+    available_keys = system_stats['available_keys']
+    
     stats_text = (
         f"📊 Ваша статистика:\n\n"
         f"💎 Тариф: {stats['tariff']}\n\n"
@@ -2248,6 +2390,8 @@ async def show_my_stats(callback: CallbackQuery):
         f"• Копирайтинг: {stats['ai_copies_used']}/{stats['ai_copies_limit']}\n"
         f"• Идеи: {stats['ai_ideas_used']}/{stats['ai_ideas_limit']}\n"
         f"• Всего AI запросов: {stats['total_ai_requests']}\n\n"
+        f"🔑 Система ключей:\n"
+        f"• Доступных ключей: {available_keys} из {len(GEMINI_API_KEYS)}\n\n"
         f"📍 Время по Москве: {datetime.now(MOSCOW_TZ).strftime('%H:%M')}"
     )
     
@@ -2831,12 +2975,17 @@ async def admin_panel(callback: CallbackQuery):
         await callback.answer("⛔ Доступ запрещен!", show_alert=True)
         return
     
+    system_stats = ai_manager.get_system_stats()
+    available_keys = system_stats['available_keys']
+    
     admin_text = (
         "👑 Админ-панель KOLES-TECH\n\n"
         "📊 Системная информация:\n"
-        f"• Пользователей в системе: {len(ai_manager.sessions)}\n"
-        f"• Всего AI запросов: {ai_manager.get_system_stats()['total_requests']}\n"
-        f"• Активных ключей: {len([k for k, v in ai_manager.key_stats.items() if v.get('403_errors', 0) < MAX_403_RETRIES])}\n"
+        f"• Пользователей в системе: {system_stats['total_users']}\n"
+        f"• Всего AI запросов: {system_stats['total_requests']}\n"
+        f"• Активных ключей: {available_keys}/{len(GEMINI_API_KEYS)}\n"
+        f"• AI-копирайтингов: {system_stats['total_copies']}\n"
+        f"• AI-идей: {system_stats['total_ideas']}\n"
         f"• Время: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}\n\n"
         "👇 Выберите действие:"
     )
@@ -2904,7 +3053,8 @@ async def admin_stats(callback: CallbackQuery):
         f"   • Копирайтингов: {system_stats['total_copies']}\n"
         f"   • Идей сгенерировано: {system_stats['total_ideas']}\n"
         f"   • Всего AI запросов: {system_stats['total_requests']}\n"
-        f"   • Активных сессий: {system_stats['active_sessions']}\n\n"
+        f"   • Активных сессий: {system_stats['active_sessions']}\n"
+        f"   • Доступных ключей: {system_stats['available_keys']}/{len(GEMINI_API_KEYS)}\n\n"
         f"🛒 Заказы:\n"
         f"   • Ожидают: {pending_orders}\n"
         f"   • Выполнены: {completed_orders}\n\n"
@@ -3532,11 +3682,19 @@ async def cleanup_old_sessions_task():
     except Exception as e:
         logger.error(f"Ошибка очистки сессий: {e}")
 
+async def auto_rotate_keys_task():
+    """Автоматическая ротация ключей"""
+    try:
+        ai_manager.check_and_rotate_keys()
+        logger.info("✅ Автоматическая ротация ключей выполнена")
+    except Exception as e:
+        logger.error(f"Ошибка автоматической ротации ключей: {e}")
+
 # ========== STARTUP/SHUTDOWN ==========
 async def on_startup():
     """Запуск бота"""
     logger.info("=" * 60)
-    logger.info(f"🚀 ЗАПУСК БОТА KOLES-TECH v2.0")
+    logger.info(f"🚀 ЗАПУСК БОТА KOLES-TECH v2.1")
     logger.info(f"🤖 AI сервисы: ВКЛЮЧЕНЫ")
     logger.info(f"🔑 Gemini ключей: {len(GEMINI_API_KEYS)}")
     logger.info(f"👑 Admin ID: {ADMIN_ID}")
@@ -3571,6 +3729,14 @@ async def on_startup():
             id='cleanup_sessions'
         )
         
+        # Автоматическая ротация ключей каждые 30 минут
+        scheduler.add_job(
+            auto_rotate_keys_task,
+            trigger='interval',
+            minutes=30,
+            id='auto_rotate_keys'
+        )
+        
         # Восстановление запланированных постов
         await restore_scheduled_posts()
         
@@ -3587,7 +3753,7 @@ async def on_startup():
                     f"🆔 ID: {me.id}\n"
                     f"🤖 AI сервисы: ВКЛЮЧЕНЫ\n"
                     f"🔑 Gemini ключей: {len(GEMINI_API_KEYS)}\n"
-                    f"🔄 Ротация при ошибке 403: {MAX_403_RETRIES} попытки\n"
+                    f"🔄 Система ротации ключей: АКТИВНА\n"
                     f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}"
                 )
             except Exception as e:
