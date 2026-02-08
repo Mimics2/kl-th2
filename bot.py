@@ -48,17 +48,15 @@ if GEMINI_API_KEYS:
         GEMINI_API_KEYS = json.loads(GEMINI_API_KEYS)
     except:
         GEMINI_API_KEYS = [
-            "AIzaSyBVX6wcwviTFLXZumpApEzogCddy4SHQaQ",
-            "AIzaSyCJyiYNk2PDd0eEF-l_deLl638wtY4vcgQ",
-            "AIzaSyASat89t1UUD7BXHxlXf9Oela6AsCzjOXc",
-            "AIzaSyATKIJVRLb35J8K0HS1G_ql7IS9cJJm4Ys",
-            "AIzaSyDJNu3lzF-VYrKpmw6Bzjm5JToasfhm8sU",
-            "AIzaSyBudSc-lz-ypF_2pigH5_7DfLGxF0COJYQ",
-            "AIzaSyA9iL90r62KthqSkdcon3wcLKeMaXOsBfM",
-            "AIzaSyBZkVAruHt6zPCJF1gf67kVbk6fHY-eelo",
-            "AIzaSyB9VqHVXudqHHN3_b_BWM9nNEEvNn-geKw",
-            "AIzaSyCeME8Lvm3p5QYBjJh5FucEyJ4J22E1NOY",
-            "AIzaSyDtcHsN6daIR9WQ1psELkArzRrJH1IHu70"   
+            "AIzaSyANdn61NlmIsibgohrNI8dNVbLNr-jv9_c",
+            "AIzaSyAQWjtmj0czZ1NtU3tydH6d-ncz4hzy0zo",
+            "AIzaSyCfdW8PSsY7bCzlBtuJuQXiVGuRQOPO7XA",
+            "AIzaSyCf-95v3QI06jI6p40hffZ7XPBvqeDwZXE",
+            "AIzaSyDHEGSl0soW0ei25bebXJnAV3JAsgM0xxQ",
+            "AIzaSyBHbtCii0kasYAtonJjCb9BQ6t1tLGAFL4",
+            "AIzaSyCHfiXQ3-6tGD-eNPKn9USEtNL7G92gPNk",
+            "AIzaSyDESq3Lcey3jQAKVgkzLB0ilnrG9qL8t04",
+            "AIzaSyC0lOzADIx-_lbUk1wtcxGBRi6UgIjPQM4" 
         ]
 else:
     GEMINI_API_KEYS = [
