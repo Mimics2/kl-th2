@@ -103,27 +103,30 @@ TARIFFS = {
         "daily_posts_limit": 2,
         "ai_copies_limit": 1,
         "ai_ideas_limit": 10,
-        "description": "Бесплатный тариф для начала работы"
+        "description": "Бесплатный тариф для начала работы",
+        "duration_days": 30  # Добавлено: длительность тарифа
     },
     Tariff.STANDARD.value: {
         "name": "⭐ Standard",
-        "price": 4,
+        "price": 5,  # Исправлено: было 4, стало 5
         "currency": "USD",
         "channels_limit": 2,
         "daily_posts_limit": 6,
         "ai_copies_limit": 3,
         "ai_ideas_limit": 30,
-        "description": "Для активных пользователей"
+        "description": "Для активных пользователей",
+        "duration_days": 30
     },
     Tariff.VIP.value: {
         "name": "👑 VIP",
-        "price": 7,
+        "price": 10,  # Исправлено: было 7, стало 10
         "currency": "USD",
         "channels_limit": 3,
         "daily_posts_limit": 12,
         "ai_copies_limit": 7,
         "ai_ideas_limit": 50,
-        "description": "Максимальные возможности"
+        "description": "Максимальные возможности",
+        "duration_days": 30
     },
     Tariff.ADMIN.value: {
         "name": "⚡ Admin",
@@ -133,7 +136,8 @@ TARIFFS = {
         "daily_posts_limit": 999,
         "ai_copies_limit": 999,
         "ai_ideas_limit": 999,
-        "description": "Безлимитный доступ"
+        "description": "Безлимитный доступ",
+        "duration_days": 9999
     }
 }
 
@@ -688,6 +692,7 @@ async def init_database():
             username TEXT,
             first_name TEXT,
             tariff TEXT DEFAULT 'mini',
+            tariff_expires_at TIMESTAMPTZ,  # Добавлено: срок действия тарифа
             posts_today INTEGER DEFAULT 0,
             posts_reset_date DATE DEFAULT CURRENT_DATE,
             ai_copies_used INTEGER DEFAULT 0,
@@ -703,6 +708,9 @@ async def init_database():
         # Индексы для таблицы users
         '''
         CREATE INDEX IF NOT EXISTS idx_users_tariff ON users(tariff)
+        ''',
+        '''
+        CREATE INDEX IF NOT EXISTS idx_users_tariff_expires ON users(tariff_expires_at)
         ''',
         '''
         CREATE INDEX IF NOT EXISTS idx_users_created ON users(created_at)
@@ -820,6 +828,7 @@ async def migrate_database():
     """Миграция базы данных"""
     try:
         columns_to_add = [
+            ('users', 'tariff_expires_at', 'TIMESTAMPTZ'),
             ('users', 'last_seen', 'TIMESTAMPTZ'),
             ('users', 'ai_last_used', 'TIMESTAMPTZ'),
             ('scheduled_posts', 'message_type', 'TEXT')
@@ -841,12 +850,13 @@ async def migrate_database():
                 logger.error(f"Ошибка при добавлении колонки {column}: {e}")
         
         if ADMIN_ID > 0:
+            # Устанавливаем админу вечный тариф
             await execute_query('''
-                INSERT INTO users (id, is_admin, tariff) 
-                VALUES ($1, TRUE, 'admin')
+                INSERT INTO users (id, is_admin, tariff, tariff_expires_at) 
+                VALUES ($1, TRUE, 'admin', $2)
                 ON CONFLICT (id) DO UPDATE 
-                SET is_admin = TRUE, tariff = 'admin'
-            ''', ADMIN_ID)
+                SET is_admin = TRUE, tariff = 'admin', tariff_expires_at = $2
+            ''', ADMIN_ID, datetime.now(MOSCOW_TZ) + timedelta(days=9999))
         
         logger.info("✅ Миграции завершены")
     except Exception as e:
@@ -865,14 +875,26 @@ async def get_user_tariff(user_id: int) -> str:
     await update_user_activity(user_id)
     
     user = await execute_query(
-        "SELECT tariff, is_admin FROM users WHERE id = $1", 
+        "SELECT tariff, is_admin, tariff_expires_at FROM users WHERE id = $1", 
         user_id
     )
     
     if not user:
+        # Создаем нового пользователя с бесплатным тарифом на 30 дней
+        expires_at = datetime.now(MOSCOW_TZ) + timedelta(days=30)
         await execute_query(
-            "INSERT INTO users (id, tariff) VALUES ($1, 'mini') ON CONFLICT DO NOTHING",
-            user_id
+            "INSERT INTO users (id, tariff, tariff_expires_at) VALUES ($1, 'mini', $2) ON CONFLICT DO NOTHING",
+            user_id, expires_at
+        )
+        return 'mini'
+    
+    # Проверяем срок действия тарифа
+    tariff_expires = user[0].get('tariff_expires_at')
+    if tariff_expires and tariff_expires < datetime.now(MOSCOW_TZ):
+        # Тариф истек, ставим mini
+        await execute_query(
+            "UPDATE users SET tariff = 'mini', tariff_expires_at = $1 WHERE id = $2",
+            datetime.now(MOSCOW_TZ) + timedelta(days=30), user_id
         )
         return 'mini'
     
@@ -880,6 +902,17 @@ async def get_user_tariff(user_id: int) -> str:
         return 'admin'
     
     return user[0].get('tariff', 'mini')
+
+async def get_tariff_expires_date(user_id: int) -> Optional[datetime]:
+    """Получает дату окончания тарифа"""
+    result = await execute_query(
+        "SELECT tariff_expires_at FROM users WHERE id = $1",
+        user_id
+    )
+    
+    if result and result[0]['tariff_expires_at']:
+        return result[0]['tariff_expires_at']
+    return None
 
 async def update_ai_usage_log(user_id: int, service_type: str, success: bool, 
                              api_key_index: int, model_name: str, 
@@ -1071,6 +1104,12 @@ async def get_user_stats(user_id: int) -> Dict:
         )
         scheduled_posts = scheduled_posts[0]['count'] if scheduled_posts else 0
         
+        # Срок действия тарифа
+        expires_at = await get_tariff_expires_date(user_id)
+        days_left = 0
+        if expires_at:
+            days_left = max(0, (expires_at - datetime.now(MOSCOW_TZ)).days)
+        
         return {
             'tariff': tariff_info['name'],
             'posts_today': posts_today,
@@ -1082,7 +1121,9 @@ async def get_user_stats(user_id: int) -> Dict:
             'ai_ideas_used': ai_stats['ideas_used'],
             'ai_ideas_limit': tariff_info['ai_ideas_limit'],
             'total_ai_requests': ai_stats['total_requests'],
-            'scheduled_posts': scheduled_posts
+            'scheduled_posts': scheduled_posts,
+            'tariff_expires_days': days_left,
+            'tariff_expires_date': expires_at
         }
     except Exception as e:
         logger.error(f"Ошибка получения статистики пользователя {user_id}: {e}")
@@ -1105,7 +1146,9 @@ async def create_tariff_order(user_id: int, tariff_id: str) -> bool:
                     f"👤 Пользователь: {user_id}\n"
                     f"💎 Тариф: {tariff_info.get('name', tariff_id)}\n"
                     f"💰 Стоимость: {tariff_info.get('price', 0)} {tariff_info.get('currency', 'USD')}\n"
-                    f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
+                    f"📅 На 30 дней\n"
+                    f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}\n\n"
+                    f"ℹ️ Для выдачи тарифа используйте команду /admin"
                 )
             except Exception:
                 pass
@@ -1151,7 +1194,7 @@ async def update_order_status(order_id: int, status: str, admin_notes: str = Non
 async def get_all_users() -> List[Dict]:
     """Получает всех пользователей"""
     return await execute_query('''
-        SELECT id, username, first_name, tariff, is_admin, created_at
+        SELECT id, username, first_name, tariff, tariff_expires_at, is_admin, created_at
         FROM users 
         ORDER BY created_at DESC
     ''')
@@ -1159,7 +1202,7 @@ async def get_all_users() -> List[Dict]:
 async def get_user_by_id(user_id: int) -> Optional[Dict]:
     """Получает пользователя по ID"""
     result = await execute_query(
-        "SELECT id, username, first_name, tariff, is_admin, created_at FROM users WHERE id = $1",
+        "SELECT id, username, first_name, tariff, tariff_expires_at, is_admin, created_at FROM users WHERE id = $1",
         user_id
     )
     
@@ -1167,18 +1210,27 @@ async def get_user_by_id(user_id: int) -> Optional[Dict]:
         return result[0]
     return None
 
-async def update_user_tariff(user_id: int, tariff: str) -> bool:
-    """Обновляет тариф пользователя"""
+async def update_user_tariff(user_id: int, tariff: str, extend_days: int = 30) -> bool:
+    """Обновляет тариф пользователя на определенный срок"""
     try:
+        # Получаем текущую дату окончания
+        current_expires = await get_tariff_expires_date(user_id)
+        if not current_expires or current_expires < datetime.now(MOSCOW_TZ):
+            # Если тарифа нет или он истек, начинаем с сегодня
+            new_expires = datetime.now(MOSCOW_TZ) + timedelta(days=extend_days)
+        else:
+            # Если тариф активен, продлеваем
+            new_expires = current_expires + timedelta(days=extend_days)
+        
         await execute_query('''
-            UPDATE users SET tariff = $1 WHERE id = $2
-        ''', tariff, user_id)
+            UPDATE users SET tariff = $1, tariff_expires_at = $2 WHERE id = $3
+        ''', tariff, new_expires, user_id)
         return True
     except Exception as e:
         logger.error(f"Ошибка обновления тарифа: {e}")
         return False
 
-async def force_update_user_tariff(user_id: int, tariff: str, admin_id: int) -> Tuple[bool, str]:
+async def force_update_user_tariff(user_id: int, tariff: str, admin_id: int, extend_days: int = 30) -> Tuple[bool, str]:
     """Принудительно обновляет тариф пользователя (админ)"""
     try:
         user = await get_user_by_id(user_id)
@@ -1187,15 +1239,18 @@ async def force_update_user_tariff(user_id: int, tariff: str, admin_id: int) -> 
         
         old_tariff = user.get('tariff', 'mini')
         
-        success = await update_user_tariff(user_id, tariff)
+        success = await update_user_tariff(user_id, tariff, extend_days)
         if success:
             await execute_query('''
                 INSERT INTO tariff_orders (user_id, tariff, status, admin_notes)
                 VALUES ($1, $2, 'force_completed', $3)
-            ''', user_id, tariff, f"Принудительное обновление админом {admin_id}")
+            ''', user_id, tariff, f"Принудительное обновление админом {admin_id} на {extend_days} дней")
             
             tariff_info = TARIFFS.get(tariff, {})
             old_tariff_info = TARIFFS.get(old_tariff, {})
+            
+            new_expires = await get_tariff_expires_date(user_id)
+            expires_str = new_expires.strftime("%d.%m.%Y %H:%M") if new_expires else "Не указано"
             
             return True, (
                 f"✅ Тариф пользователя {user_id} обновлен!\n\n"
@@ -1203,6 +1258,8 @@ async def force_update_user_tariff(user_id: int, tariff: str, admin_id: int) -> 
                 f"👤 Пользователь: {user.get('first_name', 'N/A')} (@{user.get('username', 'N/A')})\n"
                 f"🔄 Старый тариф: {old_tariff_info.get('name', old_tariff)}\n"
                 f"🆕 Новый тариф: {tariff_info.get('name', tariff)}\n"
+                f"📅 Срок: {extend_days} дней\n"
+                f"📆 Действует до: {expires_str}\n"
                 f"👑 Обновил: админ {admin_id}\n"
                 f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
             )
@@ -1210,6 +1267,41 @@ async def force_update_user_tariff(user_id: int, tariff: str, admin_id: int) -> 
             return False, f"❌ Ошибка при обновлении тарифа пользователя {user_id}"
     except Exception as e:
         logger.error(f"Ошибка принудительного обновления тарифа: {e}")
+        return False, f"❌ Ошибка: {str(e)}"
+
+async def extend_user_tariff(user_id: int, extend_days: int = 30) -> Tuple[bool, str]:
+    """Продлевает текущий тариф пользователя"""
+    try:
+        user = await get_user_by_id(user_id)
+        if not user:
+            return False, f"❌ Пользователь с ID {user_id} не найден"
+        
+        current_tariff = user.get('tariff', 'mini')
+        current_expires = await get_tariff_expires_date(user_id)
+        
+        if not current_expires or current_expires < datetime.now(MOSCOW_TZ):
+            new_expires = datetime.now(MOSCOW_TZ) + timedelta(days=extend_days)
+        else:
+            new_expires = current_expires + timedelta(days=extend_days)
+        
+        await execute_query('''
+            UPDATE users SET tariff_expires_at = $1 WHERE id = $2
+        ''', new_expires, user_id)
+        
+        tariff_info = TARIFFS.get(current_tariff, {})
+        expires_str = new_expires.strftime("%d.%m.%Y %H:%M")
+        
+        return True, (
+            f"✅ Тариф успешно продлен!\n\n"
+            f"📋 Информация:\n"
+            f"👤 Пользователь: {user.get('first_name', 'N/A')} (@{user.get('username', 'N/A')})\n"
+            f"💎 Тариф: {tariff_info.get('name', current_tariff)}\n"
+            f"📅 Продлено на: {extend_days} дней\n"
+            f"📆 Действует до: {expires_str}\n"
+            f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка продления тарифа: {e}")
         return False, f"❌ Ошибка: {str(e)}"
 
 # ========== KEYBOARDS ==========
@@ -1220,7 +1312,8 @@ def get_main_menu(user_id: int, is_admin: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📅 Запланировать пост", callback_data="schedule_post")],
         [InlineKeyboardButton(text="📊 Моя статистика", callback_data="my_stats")],
         [InlineKeyboardButton(text="📢 Мои каналы", callback_data="my_channels")],
-        [InlineKeyboardButton(text="💎 Тарифы", callback_data="tariffs")]
+        [InlineKeyboardButton(text="💎 Тарифы", callback_data="tariffs")],
+        [InlineKeyboardButton(text="🔄 Продлить тариф", callback_data="extend_tariff")]
     ]
     
     if SUPPORT_BOT_USERNAME and SUPPORT_BOT_USERNAME != "support_bot":
@@ -1233,8 +1326,104 @@ def get_main_menu(user_id: int, is_admin: bool = False) -> InlineKeyboardMarkup:
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# Остальные функции клавиатур остаются без изменений (они такие же как в исходном коде)
-# Для экономии места я не буду их копировать полностью, они работают корректно
+def get_tariffs_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура с тарифами"""
+    keyboard = []
+    
+    for tariff_id, tariff_info in TARIFFS.items():
+        if tariff_id == "admin":
+            continue
+            
+        price_text = "Бесплатно" if tariff_info['price'] == 0 else f"{tariff_info['price']} {tariff_info['currency']}"
+        button_text = f"{tariff_info['name']} - {price_text}"
+        keyboard.append([InlineKeyboardButton(text=button_text, callback_data=f"tariff_{tariff_id}")])
+    
+    keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_admin_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура админ-панели"""
+    buttons = [
+        [InlineKeyboardButton(text="📊 Статистика системы", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="👥 Список пользователей", callback_data="admin_users")],
+        [InlineKeyboardButton(text="🛒 Заказы тарифов", callback_data="admin_orders")],
+        [InlineKeyboardButton(text="💎 Выдать тариф", callback_data="admin_assign_tariff")],
+        [InlineKeyboardButton(text="🔄 Продлить тариф", callback_data="admin_extend_tariff")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+    ]
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_orders_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура для работы с заказами"""
+    buttons = [
+        [InlineKeyboardButton(text="⏳ Ожидающие", callback_data="orders_pending")],
+        [InlineKeyboardButton(text="✅ Завершенные", callback_data="orders_completed")],
+        [InlineKeyboardButton(text="❌ Отмененные", callback_data="orders_cancelled")],
+        [InlineKeyboardButton(text="📋 Все заказы", callback_data="orders_all")],
+        [InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel")]
+    ]
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_users_list_keyboard(users: List[Dict], page: int = 0, page_size: int = 10) -> InlineKeyboardMarkup:
+    """Клавиатура списка пользователей"""
+    buttons = []
+    
+    start_idx = page * page_size
+    end_idx = min(start_idx + page_size, len(users))
+    
+    for user in users[start_idx:end_idx]:
+        user_id = user['id']
+        username = user.get('username', 'N/A')
+        first_name = user.get('first_name', 'N/A')
+        tariff = user.get('tariff', 'mini')
+        
+        button_text = f"{first_name} (@{username}) - {tariff}"
+        buttons.append([InlineKeyboardButton(text=button_text, callback_data=f"user_detail_{user_id}")])
+    
+    # Кнопки навигации
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"users_page_{page-1}"))
+    if end_idx < len(users):
+        nav_buttons.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"users_page_{page+1}"))
+    
+    if nav_buttons:
+        buttons.append(nav_buttons)
+    
+    buttons.append([InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_tariff_selection_keyboard(action: str = "assign") -> InlineKeyboardMarkup:
+    """Клавиатура выбора тарифа"""
+    buttons = []
+    
+    for tariff_id, tariff_info in TARIFFS.items():
+        if tariff_id == "admin":
+            continue
+            
+        button_text = f"{tariff_info['name']} - {tariff_info['price']} {tariff_info['currency']}"
+        buttons.append([InlineKeyboardButton(text=button_text, callback_data=f"{action}_tariff_{tariff_id}")])
+    
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_extend_period_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура выбора периода продления"""
+    buttons = [
+        [InlineKeyboardButton(text="7 дней", callback_data="extend_7")],
+        [InlineKeyboardButton(text="30 дней", callback_data="extend_30")],
+        [InlineKeyboardButton(text="90 дней", callback_data="extend_90")],
+        [InlineKeyboardButton(text="180 дней", callback_data="extend_180")],
+        [InlineKeyboardButton(text="365 дней", callback_data="extend_365")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]
+    ]
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ========== STATES ==========
 class PostStates(StatesGroup):
@@ -1256,6 +1445,12 @@ class AdminStates(StatesGroup):
     waiting_for_order_note = State()
     waiting_for_user_id = State()
     waiting_for_confirm_assign = State()
+    waiting_for_extend_user_id = State()
+    waiting_for_extend_period = State()
+    waiting_for_assign_tariff = State()
+
+class TariffStates(StatesGroup):
+    waiting_for_confirmation = State()
 
 # ========== UTILITY FUNCTIONS ==========
 def format_datetime(dt: datetime) -> str:
@@ -1327,25 +1522,34 @@ async def cmd_start(message: Message):
     is_admin = user_id == ADMIN_ID
     
     try:
+        # Устанавливаем бесплатный тариф на 30 дней для новых пользователей
+        expires_at = datetime.now(MOSCOW_TZ) + timedelta(days=30)
         await execute_query('''
-            INSERT INTO users (id, username, first_name, is_admin, tariff, last_seen)
-            VALUES ($1, $2, $3, $4, $5, NOW())
+            INSERT INTO users (id, username, first_name, is_admin, tariff, tariff_expires_at, last_seen)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW())
             ON CONFLICT (id) DO UPDATE 
             SET username = EXCLUDED.username, 
                 first_name = EXCLUDED.first_name,
                 is_admin = EXCLUDED.is_admin,
                 last_seen = NOW()
-        ''', user_id, username, first_name, is_admin, 'admin' if is_admin else 'mini')
+        ''', user_id, username, first_name, is_admin, 'mini' if not is_admin else 'admin', expires_at)
     except Exception as e:
         logger.error(f"Ошибка регистрации пользователя {user_id}: {e}")
     
     current_tariff = await get_user_tariff(user_id)
     tariff_info = TARIFFS.get(current_tariff, TARIFFS['mini'])
     
+    # Получаем оставшееся время тарифа
+    expires_at = await get_tariff_expires_date(user_id)
+    days_left = 0
+    if expires_at:
+        days_left = max(0, (expires_at - datetime.now(MOSCOW_TZ)).days)
+    
     welcome_text = (
         f"👋 Привет, {first_name}!\n\n"
         f"🤖 Я — бот KOLES-TECH для планирования постов и AI-контента.\n\n"
-        f"💎 Ваш текущий тариф: {tariff_info['name']}\n\n"
+        f"💎 Ваш текущий тариф: {tariff_info['name']}\n"
+        f"📅 Тариф действует: {days_left} дней\n\n"
         f"✨ Возможности:\n"
         f"• 🤖 AI-копирайтер и генератор идей\n"
         f"• 📅 Запланировать пост с любым контентом\n"
@@ -1377,22 +1581,842 @@ async def cmd_help(message: Message):
         "4. Укажите дату и время\n"
         "5. Подтвердите публикацию\n\n"
         
-        "💎 Тарифы:\n"
-        "• Mini - 1 копирайт, 10 идей, 1 канал, 2 постов\n"
-        "• Standard ($4) - 3 копирайта, 30 идей, 2 канала, 6 постов\n"
-        "• VIP ($7) - 7 копирайтов, 50 идей, 3 канал, 12 постов\n\n"
+        "💎 Тарифы (на 30 дней):\n"
+        "• Mini - бесплатно (1 копирайт, 10 идей, 1 канал, 2 постов)\n"
+        "• Standard ($5) - 3 копирайта, 30 идей, 2 канала, 6 постов\n"
+        "• VIP ($10) - 7 копирайтов, 50 идей, 3 канал, 12 постов\n\n"
         
         f"🆘 Поддержка: {SUPPORT_URL}\n"
-        f"💬 Вопросы по оплате: @{ADMIN_CONTACT.replace('@', '')}"
+        f"💬 Вопросы по оплате: @{ADMIN_CONTACT.replace('@', '')}\n\n"
+        "📍 Все тарифы действуют 30 дней с момента активации"
     )
     
     await message.answer(help_text)
 
-# ========== AI HANDLERS ==========
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    """Админ-панель"""
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID:
+        await message.answer("❌ У вас нет доступа к админ-панели")
+        return
+    
+    await message.answer(
+        "👑 Админ-панель KOLES-TECH\n\n"
+        "📊 Управление ботом и пользователями\n\n"
+        "👇 Выберите действие:",
+        reply_markup=get_admin_keyboard()
+    )
+
+# ========== TARIFF HANDLERS ==========
+@router.callback_query(F.data == "tariffs")
+async def show_tariffs(callback: CallbackQuery):
+    """Показывает тарифы"""
+    tariffs_text = (
+        "💎 Тарифы KOLES-TECH\n\n"
+        "📍 Все тарифы активируются на 30 дней\n\n"
+        "🚀 Mini:\n"
+        "• Цена: Бесплатно\n"
+        "• AI-копирайтер: 1 текст/день\n"
+        "• Идеи для постов: 10/день\n"
+        "• Каналы: 1\n"
+        "• Посты: 2/день\n"
+        "• Идеально для знакомства\n\n"
+        "⭐ Standard ($5):\n"
+        "• AI-копирайтер: 3 текста/день\n"
+        "• Идеи для постов: 30/день\n"
+        "• Каналы: 2\n"
+        "• Посты: 6/день\n"
+        "• Для активных пользователей\n\n"
+        "👑 VIP ($10):\n"
+        "• AI-копирайтер: 7 текстов/день\n"
+        "• Идеи для постов: 50/день\n"
+        "• Каналы: 3\n"
+        "• Посты: 12/день\n"
+        "• Максимальные возможности\n\n"
+        "💳 Оплата:\n"
+        "• По вопросам оплаты пишите: @{admin}\n"
+        "• После оплаты тариф активируется вручную админом\n"
+        "• Тариф действует 30 дней с момента активации\n\n"
+        "👇 Выберите тариф для заказа:"
+    ).format(admin=ADMIN_CONTACT.replace('@', ''))
+    
+    await callback.message.edit_text(
+        tariffs_text,
+        reply_markup=get_tariffs_keyboard(callback.from_user.id)
+    )
+
+@router.callback_query(F.data.startswith("tariff_"))
+async def select_tariff(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора тарифа"""
+    tariff_id = callback.data.replace("tariff_", "")
+    
+    if tariff_id not in TARIFFS:
+        await callback.answer("❌ Неизвестный тариф", show_alert=True)
+        return
+    
+    tariff_info = TARIFFS[tariff_id]
+    user_id = callback.from_user.id
+    
+    if tariff_id == "mini":
+        # Бесплатный тариф - активируем сразу
+        success = await update_user_tariff(user_id, "mini", 30)
+        if success:
+            await callback.message.edit_text(
+                f"✅ Бесплатный тариф Mini активирован!\n\n"
+                f"💎 Тариф: {tariff_info['name']}\n"
+                f"📅 Действует: 30 дней\n"
+                f"✨ Теперь вам доступны все функции тарифа\n\n"
+                f"📍 Чтобы использовать больше возможностей, выберите платный тариф",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💎 Посмотреть тарифы", callback_data="tariffs")],
+                    [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+                ])
+            )
+        else:
+            await callback.message.edit_text(
+                "❌ Ошибка активации тарифа. Попробуйте позже.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="tariffs")]
+                ])
+            )
+        return
+    
+    # Платный тариф - создаем заказ
+    await state.update_data(selected_tariff=tariff_id)
+    await state.set_state(TariffStates.waiting_for_confirmation)
+    
+    confirmation_text = (
+        f"🛒 Подтверждение заказа тарифа\n\n"
+        f"💎 Тариф: {tariff_info['name']}\n"
+        f"💰 Стоимость: {tariff_info['price']} {tariff_info['currency']}\n"
+        f"📅 Срок действия: 30 дней\n\n"
+        f"📋 Что включено:\n"
+        f"• AI-копирайтер: {tariff_info['ai_copies_limit']} текстов/день\n"
+        f"• Идеи для постов: {tariff_info['ai_ideas_limit']}/день\n"
+        f"• Каналы: {tariff_info['channels_limit']}\n"
+        f"• Посты: {tariff_info['daily_posts_limit']}/день\n\n"
+        f"💳 Оплата:\n"
+        f"1. Нажмите '✅ Подтвердить заказ'\n"
+        f"2. Напишите админу для оплаты: @{ADMIN_CONTACT.replace('@', '')}\n"
+        f"3. После оплаты админ активирует тариф\n"
+        f"4. Тариф будет активен 30 дней с момента активации\n\n"
+        f"📍 Вопросы? Пишите: @{ADMIN_CONTACT.replace('@', '')}"
+    )
+    
+    await callback.message.edit_text(
+        confirmation_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Подтвердить заказ", callback_data="confirm_order"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="tariffs")
+            ]
+        ])
+    )
+
+@router.callback_query(F.data == "confirm_order", TariffStates.waiting_for_confirmation)
+async def confirm_tariff_order(callback: CallbackQuery, state: FSMContext):
+    """Подтверждение заказа тарифа"""
+    data = await state.get_data()
+    tariff_id = data.get('selected_tariff')
+    
+    if not tariff_id:
+        await callback.answer("❌ Ошибка: тариф не выбран", show_alert=True)
+        return
+    
+    tariff_info = TARIFFS.get(tariff_id)
+    if not tariff_info:
+        await callback.answer("❌ Ошибка: тариф не найден", show_alert=True)
+        return
+    
+    user_id = callback.from_user.id
+    
+    # Создаем заказ
+    success = await create_tariff_order(user_id, tariff_id)
+    
+    if success:
+        await callback.message.edit_text(
+            f"✅ Заказ тарифа создан!\n\n"
+            f"💎 Тариф: {tariff_info['name']}\n"
+            f"💰 Стоимость: {tariff_info['price']} {tariff_info['currency']}\n"
+            f"📅 Срок: 30 дней\n\n"
+            f"📋 Дальнейшие действия:\n"
+            f"1. Напишите админу для оплаты: @{ADMIN_CONTACT.replace('@', '')}\n"
+            f"2. Укажите ваш ID: {user_id}\n"
+            f"3. После оплаты админ активирует тариф\n"
+            f"4. Вы получите уведомление о активации\n\n"
+            f"📍 Вопросы? Пишите: @{ADMIN_CONTACT.replace('@', '')}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Посмотреть тарифы", callback_data="tariffs")],
+                [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+            ])
+        )
+    else:
+        await callback.message.edit_text(
+            "❌ Ошибка создания заказа. Попробуйте позже.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад к тарифам", callback_data="tariffs")]
+            ])
+        )
+    
+    await state.clear()
+
+@router.callback_query(F.data == "extend_tariff")
+async def extend_tariff_handler(callback: CallbackQuery):
+    """Продление тарифа"""
+    user_id = callback.from_user.id
+    
+    # Получаем информацию о текущем тарифе
+    current_tariff = await get_user_tariff(user_id)
+    tariff_info = TARIFFS.get(current_tariff, TARIFFS['mini'])
+    expires_at = await get_tariff_expires_date(user_id)
+    
+    days_left = 0
+    if expires_at:
+        days_left = max(0, (expires_at - datetime.now(MOSCOW_TZ)).days)
+    
+    extend_text = (
+        f"🔄 Продление тарифа\n\n"
+        f"💎 Текущий тариф: {tariff_info['name']}\n"
+        f"📅 Осталось дней: {days_left}\n\n"
+        f"💰 Стоимость продления на 30 дней:\n"
+        f"• Mini: Бесплатно\n"
+        f"• Standard: $5\n"
+        f"• VIP: $10\n\n"
+        f"💳 Как продлить:\n"
+        f"1. Напишите админу: @{ADMIN_CONTACT.replace('@', '')}\n"
+        f"2. Укажите ваш ID: {user_id}\n"
+        f"3. Укажите сколько дней хотите продлить\n"
+        f"4. После оплаты админ продлит тариф\n\n"
+        f"📍 При продлении дни добавляются к текущему сроку"
+    )
+    
+    await callback.message.edit_text(
+        extend_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💎 Посмотреть тарифы", callback_data="tariffs")],
+            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+        ])
+    )
+
+# ========== ADMIN HANDLERS ==========
+@router.callback_query(F.data == "admin_panel")
+async def admin_panel_handler(callback: CallbackQuery):
+    """Обработчик админ-панели"""
+    user_id = callback.from_user.id
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет доступа к админ-панели", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "👑 Админ-панель KOLES-TECH\n\n"
+        "📊 Управление ботом и пользователями\n\n"
+        "👇 Выберите действие:",
+        reply_markup=get_admin_keyboard()
+    )
+
+@router.callback_query(F.data == "admin_stats")
+async def admin_stats_handler(callback: CallbackQuery):
+    """Статистика системы"""
+    user_id = callback.from_user.id
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    # Получаем статистику
+    all_users = await get_all_users()
+    total_users = len(all_users)
+    
+    # Статистика по тарифам
+    tariffs_count = {}
+    for user in all_users:
+        tariff = user.get('tariff', 'mini')
+        tariffs_count[tariff] = tariffs_count.get(tariff, 0) + 1
+    
+    # AI статистика
+    system_stats = ai_manager.get_system_stats()
+    
+    # Заказы
+    pending_orders = await get_tariff_orders('pending')
+    
+    stats_text = (
+        f"📊 Статистика системы\n\n"
+        f"👥 Пользователи:\n"
+        f"• Всего: {total_users}\n"
+        f"• Mini: {tariffs_count.get('mini', 0)}\n"
+        f"• Standard: {tariffs_count.get('standard', 0)}\n"
+        f"• VIP: {tariffs_count.get('vip', 0)}\n"
+        f"• Admin: {tariffs_count.get('admin', 0)}\n\n"
+        f"🤖 AI сервисы:\n"
+        f"• Всего запросов: {system_stats['total_requests']}\n"
+        f"• Копирайтинг: {system_stats['total_copies']}\n"
+        f"• Идеи: {system_stats['total_ideas']}\n"
+        f"• Активных сессий: {system_stats['active_sessions']}\n\n"
+        f"🔑 Ключи Gemini:\n"
+        f"• Всего ключей: {system_stats['total_keys']}\n"
+        f"• Доступных: {system_stats['available_keys']}\n\n"
+        f"🛒 Заказы:\n"
+        f"• Ожидающих: {len(pending_orders)}\n\n"
+        f"🕐 Время сервера: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}"
+    )
+    
+    await callback.message.edit_text(
+        stats_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel")]
+        ])
+    )
+
+@router.callback_query(F.data == "admin_users")
+async def admin_users_handler(callback: CallbackQuery):
+    """Список пользователей"""
+    user_id = callback.from_user.id
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    all_users = await get_all_users()
+    
+    if not all_users:
+        await callback.message.edit_text(
+            "📭 Пользователей нет",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel")]
+            ])
+        )
+        return
+    
+    await callback.message.edit_text(
+        f"👥 Список пользователей ({len(all_users)}):\n\n"
+        f"👇 Выберите пользователя для просмотра деталей:",
+        reply_markup=get_users_list_keyboard(all_users)
+    )
+
+@router.callback_query(F.data.startswith("users_page_"))
+async def admin_users_page_handler(callback: CallbackQuery):
+    """Навигация по страницам пользователей"""
+    user_id = callback.from_user.id
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    page = int(callback.data.replace("users_page_", ""))
+    all_users = await get_all_users()
+    
+    await callback.message.edit_text(
+        f"👥 Список пользователей ({len(all_users)}):\n\n"
+        f"Страница {page + 1}\n\n"
+        f"👇 Выберите пользователя для просмотра деталей:",
+        reply_markup=get_users_list_keyboard(all_users, page)
+    )
+
+@router.callback_query(F.data.startswith("user_detail_"))
+async def user_detail_handler(callback: CallbackQuery):
+    """Детали пользователя"""
+    user_id = callback.from_user.id
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    target_user_id = int(callback.data.replace("user_detail_", ""))
+    user = await get_user_by_id(target_user_id)
+    
+    if not user:
+        await callback.answer("❌ Пользователь не найден", show_alert=True)
+        return
+    
+    # Получаем статистику пользователя
+    stats = await get_user_stats(target_user_id)
+    expires_at = await get_tariff_expires_date(target_user_id)
+    
+    expires_str = "Не указано"
+    if expires_at:
+        expires_str = expires_at.strftime("%d.%m.%Y %H:%M")
+        days_left = max(0, (expires_at - datetime.now(MOSCOW_TZ)).days)
+        expires_str += f" ({days_left} дней)"
+    
+    user_text = (
+        f"👤 Детали пользователя\n\n"
+        f"🆔 ID: {user['id']}\n"
+        f"👤 Имя: {user.get('first_name', 'N/A')}\n"
+        f"📱 Username: @{user.get('username', 'N/A')}\n"
+        f"💎 Тариф: {user.get('tariff', 'mini')}\n"
+        f"📅 Тариф до: {expires_str}\n"
+        f"👑 Админ: {'✅ Да' if user.get('is_admin') else '❌ Нет'}\n"
+        f"📅 Регистрация: {user.get('created_at', 'N/A')}\n\n"
+        f"📊 Статистика:\n"
+        f"• Постов сегодня: {stats.get('posts_today', 0)}/{stats.get('posts_limit', 0)}\n"
+        f"• Каналов: {stats.get('channels_count', 0)}/{stats.get('channels_limit', 0)}\n"
+        f"• AI-копирайтинг: {stats.get('ai_copies_used', 0)}/{stats.get('ai_copies_limit', 0)}\n"
+        f"• AI-идеи: {stats.get('ai_ideas_used', 0)}/{stats.get('ai_ideas_limit', 0)}\n"
+        f"• Запланировано: {stats.get('scheduled_posts', 0)}"
+    )
+    
+    await callback.message.edit_text(
+        user_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="💎 Выдать тариф", callback_data=f"admin_assign_specific_{target_user_id}"),
+                InlineKeyboardButton(text="🔄 Продлить", callback_data=f"admin_extend_specific_{target_user_id}")
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="admin_users")]
+        ])
+    )
+
+@router.callback_query(F.data == "admin_orders")
+async def admin_orders_handler(callback: CallbackQuery):
+    """Заказы тарифов"""
+    user_id = callback.from_user.id
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "🛒 Управление заказами тарифов\n\n"
+        "👇 Выберите тип заказов:",
+        reply_markup=get_orders_keyboard()
+    )
+
+@router.callback_query(F.data.startswith("orders_"))
+async def show_orders_handler(callback: CallbackQuery):
+    """Показать заказы по статусу"""
+    user_id = callback.from_user.id
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    status_filter = callback.data.replace("orders_", "")
+    
+    if status_filter == "all":
+        orders = await get_tariff_orders()
+        status_text = "все"
+    else:
+        orders = await get_tariff_orders(status_filter)
+        status_text = status_filter
+    
+    if not orders:
+        await callback.message.edit_text(
+            f"📭 Заказов со статусом '{status_text}' нет",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад к заказам", callback_data="admin_orders")]
+            ])
+        )
+        return
+    
+    orders_text = f"🛒 Заказы ({status_text}):\n\n"
+    
+    for i, order in enumerate(orders[:20], 1):  # Показываем первые 20 заказов
+        user_info = await get_user_by_id(order['user_id'])
+        username = user_info.get('username', 'N/A') if user_info else 'N/A'
+        first_name = user_info.get('first_name', 'N/A') if user_info else 'N/A'
+        
+        tariff_info = TARIFFS.get(order['tariff'], {})
+        tariff_name = tariff_info.get('name', order['tariff'])
+        
+        order_date = order['order_date']
+        if order_date:
+            order_date = order_date.strftime("%d.%m.%Y %H:%M")
+        
+        orders_text += (
+            f"{i}. 👤 {first_name} (@{username})\n"
+            f"   💎 Тариф: {tariff_name}\n"
+            f"   📅 Дата: {order_date}\n"
+            f"   📊 Статус: {order['status']}\n"
+            f"   🆔 ID заказа: {order['id']}\n\n"
+        )
+    
+    if len(orders) > 20:
+        orders_text += f"📋 ... и еще {len(orders) - 20} заказов\n\n"
+    
+    orders_text += "ℹ️ Для обработки заказа используйте /admin"
+    
+    await callback.message.edit_text(
+        orders_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад к заказам", callback_data="admin_orders")]
+        ])
+    )
+
+@router.callback_query(F.data == "admin_assign_tariff")
+async def admin_assign_tariff_handler(callback: CallbackQuery, state: FSMContext):
+    """Выдача тарифа - запрос ID пользователя"""
+    user_id = callback.from_user.id
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.waiting_for_user_id)
+    
+    await callback.message.edit_text(
+        "💎 Выдача тарифа пользователю\n\n"
+        "Введите ID пользователя, которому нужно выдать тариф:\n\n"
+        "📍 ID можно получить:\n"
+        "• Из списка пользователей в админ-панели\n"
+        "• Попросить пользователя отправить команду /id\n"
+        "• Через детали заказа\n\n"
+        "❌ Для отмены нажмите /cancel",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]
+        ])
+    )
+
+@router.message(AdminStates.waiting_for_user_id)
+async def process_user_id_for_assign(message: Message, state: FSMContext):
+    """Обработка ID пользователя для выдачи тарифа"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        target_user_id = int(message.text.strip())
+        
+        # Проверяем существует ли пользователь
+        user = await get_user_by_id(target_user_id)
+        if not user:
+            await message.answer(
+                "❌ Пользователь с таким ID не найден.\n\n"
+                "Проверьте ID и попробуйте еще раз:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]
+                ])
+            )
+            return
+        
+        await state.update_data(target_user_id=target_user_id)
+        await state.set_state(AdminStates.waiting_for_assign_tariff)
+        
+        current_tariff = user.get('tariff', 'mini')
+        current_tariff_info = TARIFFS.get(current_tariff, {})
+        
+        await message.answer(
+            f"👤 Пользователь найден:\n\n"
+            f"🆔 ID: {target_user_id}\n"
+            f"👤 Имя: {user.get('first_name', 'N/A')}\n"
+            f"📱 Username: @{user.get('username', 'N/A')}\n"
+            f"💎 Текущий тариф: {current_tariff_info.get('name', current_tariff)}\n\n"
+            f"👇 Выберите тариф для выдачи:",
+            reply_markup=get_tariff_selection_keyboard("assign")
+        )
+        
+    except ValueError:
+        await message.answer(
+            "❌ Неверный формат ID! ID должен быть числом.\n\n"
+            "Попробуйте еще раз:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]
+            ])
+        )
+
+@router.callback_query(F.data.startswith("assign_tariff_"), AdminStates.waiting_for_assign_tariff)
+async def process_tariff_selection_for_assign(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора тарифа для выдачи"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    tariff_id = callback.data.replace("assign_tariff_", "")
+    
+    if tariff_id not in TARIFFS:
+        await callback.answer("❌ Неизвестный тариф", show_alert=True)
+        return
+    
+    data = await state.get_data()
+    target_user_id = data.get('target_user_id')
+    
+    if not target_user_id:
+        await callback.answer("❌ Ошибка: пользователь не выбран", show_alert=True)
+        return
+    
+    tariff_info = TARIFFS[tariff_id]
+    
+    await state.update_data(selected_tariff=tariff_id)
+    await state.set_state(AdminStates.waiting_for_confirm_assign)
+    
+    # Получаем информацию о пользователе
+    user = await get_user_by_id(target_user_id)
+    current_tariff = user.get('tariff', 'mini') if user else 'mini'
+    current_tariff_info = TARIFFS.get(current_tariff, {})
+    
+    confirmation_text = (
+        f"✅ Подтверждение выдачи тарифа\n\n"
+        f"👤 Пользователь:\n"
+        f"• ID: {target_user_id}\n"
+        f"• Имя: {user.get('first_name', 'N/A') if user else 'N/A'}\n"
+        f"• Username: @{user.get('username', 'N/A') if user else 'N/A'}\n\n"
+        f"🔄 Текущий тариф: {current_tariff_info.get('name', current_tariff)}\n"
+        f"🆕 Новый тариф: {tariff_info['name']}\n"
+        f"💰 Цена: {tariff_info['price']} {tariff_info['currency']}\n"
+        f"📅 Срок: 30 дней\n\n"
+        f"📋 Что изменится:\n"
+        f"• AI-копирайтер: {current_tariff_info.get('ai_copies_limit', 1)} → {tariff_info['ai_copies_limit']}/день\n"
+        f"• Идеи: {current_tariff_info.get('ai_ideas_limit', 10)} → {tariff_info['ai_ideas_limit']}/день\n"
+        f"• Каналы: {current_tariff_info.get('channels_limit', 1)} → {tariff_info['channels_limit']}\n"
+        f"• Посты: {current_tariff_info.get('daily_posts_limit', 2)} → {tariff_info['daily_posts_limit']}/день\n\n"
+        f"📍 Тариф будет действовать 30 дней с момента активации"
+    )
+    
+    await callback.message.edit_text(
+        confirmation_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_assign"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")
+            ]
+        ])
+    )
+
+@router.callback_query(F.data == "confirm_assign", AdminStates.waiting_for_confirm_assign)
+async def confirm_tariff_assign(callback: CallbackQuery, state: FSMContext):
+    """Подтверждение выдачи тарифа"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    data = await state.get_data()
+    target_user_id = data.get('target_user_id')
+    tariff_id = data.get('selected_tariff')
+    
+    if not target_user_id or not tariff_id:
+        await callback.answer("❌ Ошибка: данные не найдены", show_alert=True)
+        return
+    
+    # Выдаем тариф
+    success, message = await force_update_user_tariff(target_user_id, tariff_id, callback.from_user.id, 30)
+    
+    if success:
+        # Уведомляем пользователя
+        try:
+            await bot.send_message(
+                target_user_id,
+                f"🎉 Поздравляем! Вам выдан тариф!\n\n"
+                f"💎 Тариф: {TARIFFS[tariff_id]['name']}\n"
+                f"📅 Действует: 30 дней\n"
+                f"✨ Теперь вам доступны все возможности тарифа\n\n"
+                f"📍 Для просмотра статистики нажмите /start"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось уведомить пользователя {target_user_id}: {e}")
+    
+    await callback.message.edit_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel")]
+        ])
+    )
+    
+    await state.clear()
+
+@router.callback_query(F.data.startswith("admin_assign_specific_"))
+async def admin_assign_specific_handler(callback: CallbackQuery, state: FSMContext):
+    """Выдача тарифа конкретному пользователю"""
+    user_id = callback.from_user.id
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    target_user_id = int(callback.data.replace("admin_assign_specific_", ""))
+    
+    await state.update_data(target_user_id=target_user_id)
+    await state.set_state(AdminStates.waiting_for_assign_tariff)
+    
+    user = await get_user_by_id(target_user_id)
+    current_tariff = user.get('tariff', 'mini') if user else 'mini'
+    current_tariff_info = TARIFFS.get(current_tariff, {})
+    
+    await callback.message.edit_text(
+        f"💎 Выдача тарифа пользователю\n\n"
+        f"👤 Пользователь:\n"
+        f"• ID: {target_user_id}\n"
+        f"• Имя: {user.get('first_name', 'N/A') if user else 'N/A'}\n"
+        f"• Username: @{user.get('username', 'N/A') if user else 'N/A'}\n"
+        f"• Текущий тариф: {current_tariff_info.get('name', current_tariff)}\n\n"
+        f"👇 Выберите тариф для выдачи:",
+        reply_markup=get_tariff_selection_keyboard("assign")
+    )
+
+@router.callback_query(F.data == "admin_extend_tariff")
+async def admin_extend_tariff_handler(callback: CallbackQuery, state: FSMContext):
+    """Продление тарифа - запрос ID пользователя"""
+    user_id = callback.from_user.id
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.waiting_for_extend_user_id)
+    
+    await callback.message.edit_text(
+        "🔄 Продление тарифа пользователю\n\n"
+        "Введите ID пользователя, которому нужно продлить тариф:\n\n"
+        "📍 ID можно получить:\n"
+        "• Из списка пользователей в админ-панели\n"
+        "• Попросить пользователя отправить команду /id\n"
+        "• Через детали заказа\n\n"
+        "❌ Для отмены нажмите /cancel",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]
+        ])
+    )
+
+@router.message(AdminStates.waiting_for_extend_user_id)
+async def process_user_id_for_extend(message: Message, state: FSMContext):
+    """Обработка ID пользователя для продления тарифа"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        target_user_id = int(message.text.strip())
+        
+        # Проверяем существует ли пользователь
+        user = await get_user_by_id(target_user_id)
+        if not user:
+            await message.answer(
+                "❌ Пользователь с таким ID не найден.\n\n"
+                "Проверьте ID и попробуйте еще раз:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]
+                ])
+            )
+            return
+        
+        await state.update_data(target_user_id=target_user_id)
+        await state.set_state(AdminStates.waiting_for_extend_period)
+        
+        current_tariff = user.get('tariff', 'mini')
+        current_tariff_info = TARIFFS.get(current_tariff, {})
+        expires_at = await get_tariff_expires_date(target_user_id)
+        
+        days_left = 0
+        if expires_at:
+            days_left = max(0, (expires_at - datetime.now(MOSCOW_TZ)).days)
+        
+        await message.answer(
+            f"👤 Пользователь найден:\n\n"
+            f"🆔 ID: {target_user_id}\n"
+            f"👤 Имя: {user.get('first_name', 'N/A')}\n"
+            f"📱 Username: @{user.get('username', 'N/A')}\n"
+            f"💎 Текущий тариф: {current_tariff_info.get('name', current_tariff)}\n"
+            f"📅 Осталось дней: {days_left}\n\n"
+            f"👇 Выберите период продления:",
+            reply_markup=get_extend_period_keyboard()
+        )
+        
+    except ValueError:
+        await message.answer(
+            "❌ Неверный формат ID! ID должен быть числом.\n\n"
+            "Попробуйте еще раз:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]
+            ])
+        )
+
+@router.callback_query(F.data.startswith("extend_"), AdminStates.waiting_for_extend_period)
+async def process_extend_period(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора периода продления"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    period_str = callback.data.replace("extend_", "")
+    try:
+        period_days = int(period_str)
+    except ValueError:
+        await callback.answer("❌ Неверный период", show_alert=True)
+        return
+    
+    data = await state.get_data()
+    target_user_id = data.get('target_user_id')
+    
+    if not target_user_id:
+        await callback.answer("❌ Ошибка: пользователь не выбран", show_alert=True)
+        return
+    
+    # Продлеваем тариф
+    success, message = await extend_user_tariff(target_user_id, period_days)
+    
+    if success:
+        # Уведомляем пользователя
+        try:
+            user = await get_user_by_id(target_user_id)
+            current_tariff = user.get('tariff', 'mini') if user else 'mini'
+            tariff_info = TARIFFS.get(current_tariff, {})
+            new_expires = await get_tariff_expires_date(target_user_id)
+            
+            expires_str = new_expires.strftime("%d.%m.%Y") if new_expires else "Не указано"
+            
+            await bot.send_message(
+                target_user_id,
+                f"✅ Ваш тариф продлен!\n\n"
+                f"💎 Тариф: {tariff_info.get('name', current_tariff)}\n"
+                f"📅 Продлено на: {period_days} дней\n"
+                f"📆 Действует до: {expires_str}\n\n"
+                f"📍 Для просмотра статистики нажмите /start"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось уведомить пользователя {target_user_id}: {e}")
+    
+    await callback.message.edit_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel")]
+        ])
+    )
+    
+    await state.clear()
+
+@router.callback_query(F.data.startswith("admin_extend_specific_"))
+async def admin_extend_specific_handler(callback: CallbackQuery, state: FSMContext):
+    """Продление тарифа конкретному пользователю"""
+    user_id = callback.from_user.id
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет доступа", show_alert=True)
+        return
+    
+    target_user_id = int(callback.data.replace("admin_extend_specific_", ""))
+    
+    await state.update_data(target_user_id=target_user_id)
+    await state.set_state(AdminStates.waiting_for_extend_period)
+    
+    user = await get_user_by_id(target_user_id)
+    current_tariff = user.get('tariff', 'mini') if user else 'mini'
+    current_tariff_info = TARIFFS.get(current_tariff, {})
+    expires_at = await get_tariff_expires_date(target_user_id)
+    
+    days_left = 0
+    if expires_at:
+        days_left = max(0, (expires_at - datetime.now(MOSCOW_TZ)).days)
+    
+    await callback.message.edit_text(
+        f"🔄 Продление тарифа пользователю\n\n"
+        f"👤 Пользователь:\n"
+        f"• ID: {target_user_id}\n"
+        f"• Имя: {user.get('first_name', 'N/A') if user else 'N/A'}\n"
+        f"• Username: @{user.get('username', 'N/A') if user else 'N/A'}\n"
+        f"• Текущий тариф: {current_tariff_info.get('name', current_tariff)}\n"
+        f"• Осталось дней: {days_left}\n\n"
+        f"👇 Выберите период продления:",
+        reply_markup=get_extend_period_keyboard()
+    )
+
+# ========== AI HANDLERS (остаются без изменений, только добавляем проверку срока действия тарифа) ==========
 @router.callback_query(F.data == "ai_services")
 async def ai_services_menu(callback: CallbackQuery):
     """Меню AI сервисов"""
     user_id = callback.from_user.id
+    
+    # Проверяем срок действия тарифа
+    expires_at = await get_tariff_expires_date(user_id)
+    if expires_at and expires_at < datetime.now(MOSCOW_TZ):
+        await callback.message.edit_text(
+            "❌ Ваш тариф истек!\n\n"
+            "Для использования AI-сервисов необходимо продлить тариф.\n\n"
+            "👇 Выберите действие:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Продлить тариф", callback_data="extend_tariff")],
+                [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+            ])
+        )
+        return
+    
     tariff = await get_user_tariff(user_id)
     tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
     
@@ -1427,6 +2451,20 @@ async def ai_services_menu(callback: CallbackQuery):
 async def start_copywriter(callback: CallbackQuery, state: FSMContext):
     """Запуск AI копирайтера"""
     user_id = callback.from_user.id
+    
+    # Проверяем срок действия тарифа
+    expires_at = await get_tariff_expires_date(user_id)
+    if expires_at and expires_at < datetime.now(MOSCOW_TZ):
+        await callback.message.edit_text(
+            "❌ Ваш тариф истек!\n\n"
+            "Для использования AI-сервисов необходимо продлить тариф.\n\n"
+            "👇 Выберите действие:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Продлить тариф", callback_data="extend_tariff")],
+                [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+            ])
+        )
+        return
     
     # Проверка лимитов
     can_use, message, tariff_info = await check_ai_limits(user_id, 'copy')
@@ -1466,414 +2504,24 @@ async def start_copywriter(callback: CallbackQuery, state: FSMContext):
         ])
     )
 
-@router.message(AIStates.waiting_for_topic)
-async def process_topic(message: Message, state: FSMContext):
-    """Обработка темы"""
-    if len(message.text) < 5:
-        await message.answer(
-            "❌ Тема слишком короткая! Минимум 5 символов.\n\nВведите тему еще раз:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
-            ])
-        )
-        return
-    
-    await state.update_data(topic=message.text)
-    await state.set_state(AIStates.waiting_for_examples)
-    
-    await message.answer(
-        "📌 Шаг 2/4\n"
-        "Пришлите примеры работ или ссылки (по желанию):\n\n"
-        "Можно:\n"
-        "• Прислать тексты постов\n"
-        "• Ссылки на каналы\n"
-        "• Ключевые фразы\n"
-        "• Стилистические предпочтения\n\n"
-        "Или напишите 'пропустить', если примеров нет:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
-        ])
-    )
-
-@router.message(AIStates.waiting_for_examples)
-async def process_examples(message: Message, state: FSMContext):
-    """Обработка примеров"""
-    examples = message.text if message.text.lower() != 'пропустить' else "Примеры не предоставлены"
-    
-    await state.update_data(examples=examples)
-    await state.set_state(AIStates.waiting_for_style)
-    
-    await message.answer(
-        "📌 Шаг 3/4\n"
-        "Выберите стиль текста:\n\n"
-        "📱 Продающий - для продаж и конверсии\n"
-        "📝 Информационный - полезный контент\n"
-        "🎭 Креативный - нестандартный подход\n"
-        "🎯 Целевой - для конкретной аудитории\n"
-        "🚀 Для соцсетей - виральный контент\n"
-        "📰 Новостной - анонсы и новости",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📱 Продающий", callback_data="style_selling"),
-                InlineKeyboardButton(text="📝 Информационный", callback_data="style_info")
-            ],
-            [
-                InlineKeyboardButton(text="🎭 Креативный", callback_data="style_creative"),
-                InlineKeyboardButton(text="🎯 Целевой", callback_data="style_targeted")
-            ],
-            [
-                InlineKeyboardButton(text="🚀 Для соцсетей", callback_data="style_social"),
-                InlineKeyboardButton(text="📰 Новостной", callback_data="style_news")
-            ],
-            [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
-        ])
-    )
-
-@router.callback_query(F.data.startswith("style_"))
-async def process_style(callback: CallbackQuery, state: FSMContext):
-    """Обработка выбора стиля"""
-    style_map = {
-        "style_selling": "продающий",
-        "style_info": "информационный",
-        "style_creative": "креативный",
-        "style_targeted": "целевой",
-        "style_social": "для соцсетей",
-        "style_news": "новостной"
-    }
-    
-    style_key = callback.data
-    style_name = style_map.get(style_key, "продающий")
-    
-    await state.update_data(style=style_name)
-    await state.set_state(AIStates.waiting_for_word_count)
-    
-    current_word_count = ai_manager.get_word_count(callback.from_user.id)
-    
-    await callback.message.edit_text(
-        f"📌 Шаг 4/4\n"
-        f"Выберите количество слов для текста:\n\n"
-        f"📊 Рекомендуем:\n"
-        f"• 50-100 слов - короткие анонсы\n"
-        f"• 150-200 слов - стандартные посты\n"
-        f"• 250-300 слов - подробные статьи\n\n"
-        f"📍 Текущая настройка: {current_word_count} слов",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="50 слов", callback_data="words_50"),
-                InlineKeyboardButton(text="100 слов", callback_data="words_100")
-            ],
-            [
-                InlineKeyboardButton(text="150 слов", callback_data="words_150"),
-                InlineKeyboardButton(text="200 слов", callback_data="words_200")
-            ],
-            [
-                InlineKeyboardButton(text="250 слов", callback_data="words_250"),
-                InlineKeyboardButton(text="300 слов", callback_data="words_300")
-            ],
-            [
-                InlineKeyboardButton(text="📝 Свое значение", callback_data="words_custom"),
-                InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")
-            ]
-        ])
-    )
-
-@router.callback_query(F.data.startswith("words_"))
-async def process_word_count(callback: CallbackQuery, state: FSMContext):
-    """Обработка выбора количества слов"""
-    if callback.data == "words_custom":
-        await callback.message.edit_text(
-            "📝 Введите нужное количество слов (от 50 до 1000):\n\n"
-            "Примеры:\n"
-            "• 80 - короткий анонс\n"
-            "• 150 - стандартный пост\n"
-            "• 400 - подробная статья\n"
-            "• 600 - длинный обзор",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
-            ])
-        )
-        return
-    
-    try:
-        word_count = int(callback.data.split("_")[1])
-        user_id = callback.from_user.id
-        
-        # Устанавливаем количество слов
-        ai_manager.set_word_count(user_id, word_count)
-        
-        # Получаем данные из состояния
-        data = await state.get_data()
-        
-        # Показываем превью запроса
-        preview_text = (
-            f"📋 Ваш запрос:\n\n"
-            f"📌 Тема: {data['topic']}\n"
-            f"🎨 Стиль: {data['style']}\n"
-            f"📝 Слов: {word_count}\n"
-            f"📚 Примеры: {data['examples'][:100]}...\n\n"
-            f"⏳ Генерирую текст... Пробую разные ключи (макс. 8 попыток)"
-        )
-        
-        await callback.message.edit_text(preview_text)
-        
-        # Создаем промпт
-        current_date = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
-        prompt = COPYWRITER_PROMPT.format(
-            topic=data['topic'],
-            style=data['style'],
-            examples=data['examples'],
-            word_count=word_count,
-            current_date=current_date
-        )
-        
-        # Индикатор прогресса
-        progress_msg = await callback.message.answer("🔄 Пробую ключ #1...")
-        
-        # Генерируем текст
-        generated_text = await generate_with_gemini_advanced(prompt, user_id, max_retries=8)
-        
-        await progress_msg.delete()
-        
-        # Обработка результата
-        if not generated_text:
-            system_stats = ai_manager.get_system_stats()
-            available_keys = system_stats['available_keys']
-            total_keys = system_stats['total_keys']
-            
-            await callback.message.edit_text(
-                f"❌ Не удалось сгенерировать текст после 8 попыток!\n\n"
-                f"📊 Статистика системы:\n"
-                f"• Доступных ключей: {available_keys} из {total_keys}\n"
-                f"• Все ключи могут быть временно недоступны\n\n"
-                f"📌 Что можно сделать:\n"
-                f"1. Попробовать позже (через 5-10 минут)\n"
-                f"2. Проверить доступность новых ключей API\n"
-                f"3. Обратиться в поддержку: {SUPPORT_URL}\n\n"
-                f"⚠️ Система автоматически попробует другие ключи при следующем запросе.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔄 Попробовать еще раз", callback_data="ai_copywriter")],
-                    [InlineKeyboardButton(text="⬅️ В меню AI", callback_data="ai_services")]
-                ])
-            )
-            await state.clear()
-            return
-        
-        # Обновляем статистику
-        session = ai_manager.get_session(user_id)
-        session['copies_used'] += 1
-        
-        # Логируем успешный запрос
-        await update_ai_usage_log(
-            user_id=user_id,
-            service_type='copy',
-            success=True,
-            api_key_index=session.get('current_key_index', 0),
-            model_name=ai_manager.get_current_model(),
-            prompt_length=len(prompt),
-            response_length=len(generated_text)
-        )
-        
-        # Форматируем результат
-        actual_word_count = len(generated_text.split())
-        attempts = session['current_attempts'] or 1
-        
-        result_text = (
-            f"✅ Текст готов! (Попытка #{attempts})\n\n"
-            f"📊 Детали:\n"
-            f"• Запрошено слов: {word_count}\n"
-            f"• Получено слов: {actual_word_count}\n"
-            f"• Символов: {len(generated_text)}\n"
-            f"• Время генерации: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}\n\n"
-            f"📝 Результат:\n\n"
-            f"{generated_text}\n\n"
-            f"📈 Статистика:\n"
-            f"• Использовано сегодня: {session['copies_used']}/{TARIFFS.get(await get_user_tariff(user_id), TARIFFS['mini'])['ai_copies_limit']}"
-        )
-        
-        # Отправляем результат (разбиваем если нужно)
-        if len(result_text) > 4000:
-            parts = split_message(result_text)
-            for i, part in enumerate(parts):
-                if i == 0:
-                    await callback.message.edit_text(part)
-                else:
-                    await callback.message.answer(part)
-        else:
-            await callback.message.edit_text(result_text)
-        
-        # Клавиатура действий с текстом
-        action_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📱 Отправить в чат", callback_data="send_to_chat"),
-                InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_text")
-            ],
-            [
-                InlineKeyboardButton(text="🔄 Новый текст", callback_data="ai_copywriter"),
-                InlineKeyboardButton(text="📋 Сохранить", callback_data="save_text")
-            ],
-            [
-                InlineKeyboardButton(text="⬅️ В меню AI", callback_data="ai_services")
-            ]
-        ])
-        
-        # Сохраняем сгенерированный текст в состоянии
-        await state.update_data(generated_text=generated_text)
-        
-        await callback.message.answer(
-            "👇 Что сделать с текстом?",
-            reply_markup=action_keyboard
-        )
-        
-    except ValueError:
-        await callback.answer("❌ Ошибка в количестве слов", show_alert=True)
-
-@router.message(AIStates.waiting_for_word_count)
-async def process_custom_word_count(message: Message, state: FSMContext):
-    """Обработка пользовательского количества слов"""
-    try:
-        word_count = int(message.text.strip())
-        if word_count < 50 or word_count > 1000:
-            await message.answer(
-                "❌ Количество слов должно быть от 50 до 1000!\n\n"
-                "Попробуйте еще раз:",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
-                ])
-            )
-            return
-        
-        user_id = message.from_user.id
-        ai_manager.set_word_count(user_id, word_count)
-        
-        data = await state.get_data()
-        
-        # Показываем превью запроса
-        preview_text = (
-            f"📋 Ваш запрос:\n\n"
-            f"📌 Тема: {data['topic']}\n"
-            f"🎨 Стиль: {data['style']}\n"
-            f"📝 Слов: {word_count}\n"
-            f"📚 Примеры: {data['examples'][:100]}...\n\n"
-            f"⏳ Генерирую текст... Пробую разные ключи (макс. 8 попыток)"
-        )
-        
-        await message.answer(preview_text)
-        
-        # Создаем промпт
-        current_date = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
-        prompt = COPYWRITER_PROMPT.format(
-            topic=data['topic'],
-            style=data['style'],
-            examples=data['examples'],
-            word_count=word_count,
-            current_date=current_date
-        )
-        
-        # Индикатор прогресса
-        progress_msg = await message.answer("🔄 Пробую ключ #1...")
-        
-        # Генерируем текст
-        generated_text = await generate_with_gemini_advanced(prompt, user_id, max_retries=8)
-        
-        await progress_msg.delete()
-        
-        # Обработка результата
-        if not generated_text:
-            system_stats = ai_manager.get_system_stats()
-            available_keys = system_stats['available_keys']
-            total_keys = system_stats['total_keys']
-            
-            await message.answer(
-                f"❌ Не удалось сгенерировать текст после 8 попыток!\n\n"
-                f"📊 Статистика системы:\n"
-                f"• Доступных ключей: {available_keys} из {total_keys}\n"
-                f"• Все ключи могут быть временно недоступны\n\n"
-                f"📌 Что можно сделать:\n"
-                f"1. Попробовать позже (через 5-10 минут)\n"
-                f"2. Проверить доступность новых ключей API\n"
-                f"3. Обратиться в поддержку: {SUPPORT_URL}\n\n"
-                f"⚠️ Система автоматически попробует другие ключи при следующем запросе.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔄 Попробовать еще раз", callback_data="ai_copywriter")],
-                    [InlineKeyboardButton(text="⬅️ В меню AI", callback_data="ai_services")]
-                ])
-            )
-            return
-        
-        # Обновляем статистику
-        session = ai_manager.get_session(user_id)
-        session['copies_used'] += 1
-        
-        # Логируем успешный запрос
-        await update_ai_usage_log(
-            user_id=user_id,
-            service_type='copy',
-            success=True,
-            api_key_index=session.get('current_key_index', 0),
-            model_name=ai_manager.get_current_model(),
-            prompt_length=len(prompt),
-            response_length=len(generated_text)
-        )
-        
-        # Форматируем результат
-        actual_word_count = len(generated_text.split())
-        attempts = session['current_attempts'] or 1
-        
-        result_text = (
-            f"✅ Текст готов! (Попытка #{attempts})\n\n"
-            f"📊 Детали:\n"
-            f"• Запрошено слов: {word_count}\n"
-            f"• Получено слов: {actual_word_count}\n"
-            f"• Символов: {len(generated_text)}\n"
-            f"• Время генерации: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}\n\n"
-            f"📝 Результат:\n\n"
-            f"{generated_text}\n\n"
-            f"📈 Статистика:\n"
-            f"• Использовано сегодня: {session['copies_used']}/{TARIFFS.get(await get_user_tariff(user_id), TARIFFS['mini'])['ai_copies_limit']}"
-        )
-        
-        # Отправляем результат (разбиваем если нужно)
-        if len(result_text) > 4000:
-            parts = split_message(result_text)
-            for i, part in enumerate(parts):
-                await message.answer(part)
-        else:
-            await message.answer(result_text)
-        
-        # Клавиатура действий с текстом
-        action_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📱 Отправить в чат", callback_data="send_to_chat"),
-                InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_text")
-            ],
-            [
-                InlineKeyboardButton(text="🔄 Новый текст", callback_data="ai_copywriter"),
-                InlineKeyboardButton(text="📋 Сохранить", callback_data="save_text")
-            ],
-            [
-                InlineKeyboardButton(text="⬅️ В меню AI", callback_data="ai_services")
-            ]
-        ])
-        
-        await state.update_data(generated_text=generated_text)
-        
-        await message.answer(
-            "👇 Что сделать с текстом?",
-            reply_markup=action_keyboard
-        )
-        
-    except ValueError:
-        await message.answer(
-            "❌ Введите число!\n\nПример: 150, 200, 300",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
-            ])
-        )
-
 @router.callback_query(F.data == "ai_ideas")
 async def start_ideas_generator(callback: CallbackQuery, state: FSMContext):
     """Запуск генератора идей"""
     user_id = callback.from_user.id
+    
+    # Проверяем срок действия тарифа
+    expires_at = await get_tariff_expires_date(user_id)
+    if expires_at and expires_at < datetime.now(MOSCOW_TZ):
+        await callback.message.edit_text(
+            "❌ Ваш тариф истек!\n\n"
+            "Для использования AI-сервисов необходимо продлить тариф.\n\n"
+            "👇 Выберите действие:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Продлить тариф", callback_data="extend_tariff")],
+                [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+            ])
+        )
+        return
     
     # Проверка лимитов
     can_use, message, tariff_info = await check_ai_limits(user_id, 'ideas')
@@ -1912,236 +2560,6 @@ async def start_ideas_generator(callback: CallbackQuery, state: FSMContext):
         ])
     )
 
-@router.message(AIStates.waiting_for_idea_topic)
-async def process_idea_topic(message: Message, state: FSMContext):
-    """Обработка темы для идей"""
-    if len(message.text) < 3:
-        await message.answer(
-            "❌ Тема слишком короткая! Минимум 3 символа.\n\nВведите тему еще раз:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
-            ])
-        )
-        return
-    
-    await state.update_data(topic=message.text)
-    
-    await message.answer(
-        "Выберите количество идей (от 5 до 20):\n\n"
-        "📊 Рекомендуем:\n"
-        "• 5 идей - быстрый просмотр\n"
-        "• 10 идей - оптимальный выбор\n"
-        "• 15-20 идей - полный охват темы",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="5 идей", callback_data="ideas_5"),
-                InlineKeyboardButton(text="10 идей", callback_data="ideas_10")
-            ],
-            [
-                InlineKeyboardButton(text="15 идей", callback_data="ideas_15"),
-                InlineKeyboardButton(text="20 идей", callback_data="ideas_20")
-            ],
-            [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_ai")]
-        ])
-    )
-
-@router.callback_query(F.data.startswith("ideas_"))
-async def generate_ideas(callback: CallbackQuery, state: FSMContext):
-    """Генерация идей"""
-    count = int(callback.data.split("_")[1])
-    data = await state.get_data()
-    
-    if count > 20:
-        count = 20
-    
-    # Показываем индикатор
-    await callback.message.edit_text(
-        f"💡 Генерация {count} идей по теме:\n"
-        f"📌 '{data['topic']}'\n\n"
-        f"⏳ Это займет 10-30 секунд..."
-    )
-    
-    # Генерация идей
-    current_date = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
-    prompt = IDEAS_PROMPT.format(
-        count=count,
-        topic=data['topic'],
-        current_date=current_date
-    )
-    
-    loading_msg = await callback.message.answer("🔄 ИИ генерирует идеи...")
-    
-    generated_ideas = await generate_with_gemini_advanced(prompt, callback.from_user.id, max_retries=8)
-    
-    await loading_msg.delete()
-    
-    # Обработка результата
-    if not generated_ideas:
-        system_stats = ai_manager.get_system_stats()
-        available_keys = system_stats['available_keys']
-        total_keys = system_stats['total_keys']
-        
-        await callback.message.edit_text(
-            f"❌ Не удалось сгенерировать идеи после 8 попыток!\n\n"
-            f"📊 Статистика системы:\n"
-            f"• Доступных ключей: {available_keys} из {total_keys}\n"
-            f"• Все ключи могут быть временно недоступны\n\n"
-            f"Попробуйте позже или обратитесь в поддержку.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Попробовать еще раз", callback_data="ai_ideas")],
-                [InlineKeyboardButton(text="⬅️ В меню AI", callback_data="ai_services")]
-            ])
-        )
-        await state.clear()
-        return
-    
-    # Форматируем результат
-    ideas_list = generated_ideas.split('\n')
-    formatted_ideas = []
-    
-    for i, idea in enumerate(ideas_list[:count], 1):
-        if idea.strip():
-            formatted_ideas.append(f"{i}. {idea.strip()}")
-    
-    # Обновляем статистику
-    session = ai_manager.get_session(callback.from_user.id)
-    session['ideas_used'] += 1
-    
-    # Логируем успешный запрос
-    await update_ai_usage_log(
-        user_id=callback.from_user.id,
-        service_type='ideas',
-        success=True,
-        api_key_index=session.get('current_key_index', 0),
-        model_name=ai_manager.get_current_model(),
-        prompt_length=len(prompt),
-        response_length=len(generated_ideas)
-    )
-    
-    result_text = (
-        f"✅ Сгенерировано {len(formatted_ideas)} идей! (Попытка #{session['current_attempts'] or 1})\n\n"
-        f"📌 Тема: {data['topic']}\n\n"
-        f"💡 Идеи:\n\n" +
-        "\n".join(formatted_ideas) +
-        f"\n\n📊 Статистика:\n"
-        f"• Использовано сегодня: {session['ideas_used']}/{TARIFFS.get(await get_user_tariff(callback.from_user.id), TARIFFS['mini'])['ai_ideas_limit']}"
-    )
-    
-    # Разбиваем длинные сообщения
-    if len(result_text) > 4000:
-        parts = split_message(result_text)
-        for i, part in enumerate(parts):
-            if i == 0:
-                await callback.message.edit_text(part)
-            else:
-                await callback.message.answer(part)
-    else:
-        await callback.message.edit_text(result_text)
-    
-    await callback.message.answer(
-        "👇 Выберите действие:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💡 Новые идеи", callback_data="ai_ideas")],
-            [InlineKeyboardButton(text="📝 Копирайтер", callback_data="ai_copywriter")],
-            [InlineKeyboardButton(text="⬅️ В меню AI", callback_data="ai_services")]
-        ])
-    )
-    
-    await state.clear()
-
-@router.callback_query(F.data == "ai_limits")
-async def show_ai_limits(callback: CallbackQuery):
-    """Показывает лимиты AI"""
-    user_id = callback.from_user.id
-    tariff = await get_user_tariff(user_id)
-    tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
-    
-    session = ai_manager.get_session(user_id)
-    
-    # Рассчитываем оставшееся время до сброса
-    today = datetime.now(MOSCOW_TZ).date()
-    reset_time = datetime.combine(today + timedelta(days=1), datetime.min.time())
-    reset_time = MOSCOW_TZ.localize(reset_time)
-    time_left = reset_time - datetime.now(MOSCOW_TZ)
-    hours = int(time_left.total_seconds() // 3600)
-    minutes = int((time_left.total_seconds() % 3600) // 60)
-    
-    system_stats = ai_manager.get_system_stats()
-    available_keys = system_stats['available_keys']
-    total_keys = system_stats['total_keys']
-    
-    limits_text = (
-        f"📊 Ваши AI-лимиты\n\n"
-        f"💎 Тариф: {tariff_info['name']}\n\n"
-        f"📝 Копирайтер:\n"
-        f"• Использовано: {session['copies_used']}/{tariff_info['ai_copies_limit']}\n"
-        f"• Осталось: {tariff_info['ai_copies_limit'] - session['copies_used']}\n\n"
-        f"💡 Генератор идей:\n"
-        f"• Использовано: {session['ideas_used']}/{tariff_info['ai_ideas_limit']}\n"
-        f"• Осталось: {tariff_info['ai_ideas_limit'] - session['ideas_used']}\n\n"
-        f"🔄 Обновление через: {hours}ч {minutes}м\n\n"
-        f"📈 Всего AI запросов: {session['total_requests']}\n\n"
-        f"🔑 Система ключей:\n"
-        f"• Доступных ключей: {available_keys} из {total_keys}\n"
-        f"• Ошибок подряд: {session['consecutive_errors']}"
-    )
-    
-    await callback.message.edit_text(
-        limits_text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ В меню AI", callback_data="ai_services")]
-        ])
-    )
-
-@router.callback_query(F.data == "send_to_chat")
-async def send_to_chat_handler(callback: CallbackQuery, state: FSMContext):
-    """Отправляет текст в чат"""
-    data = await state.get_data()
-    generated_text = data.get('generated_text')
-    
-    if not generated_text:
-        await callback.answer("❌ Текст не найден!", show_alert=True)
-        return
-    
-    await callback.message.answer(
-        f"📝 Ваш текст:\n\n{generated_text}"
-    )
-    
-    await callback.answer("✅ Текст отправлен в чат!")
-
-@router.callback_query(F.data == "edit_text")
-async def edit_text_handler(callback: CallbackQuery, state: FSMContext):
-    """Редактирование текста"""
-    data = await state.get_data()
-    generated_text = data.get('generated_text')
-    
-    if not generated_text:
-        await callback.answer("❌ Текст не найден!", show_alert=True)
-        return
-    
-    await callback.message.answer(
-        f"✏️ Чтобы отредактировать текст, просто отправьте новую версию:\n\n"
-        f"Текущий текст:\n{generated_text[:500]}..."
-    )
-
-@router.callback_query(F.data == "save_text")
-async def save_text_handler(callback: CallbackQuery):
-    """Сохранение текста"""
-    await callback.answer("✅ Текст сохранен (функция в разработке)", show_alert=True)
-
-@router.callback_query(F.data == "cancel_ai")
-async def cancel_ai(callback: CallbackQuery, state: FSMContext):
-    """Отмена AI операций"""
-    await state.clear()
-    user_id = callback.from_user.id
-    
-    await callback.message.edit_text(
-        "❌ Операция отменена",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ В меню AI", callback_data="ai_services")]
-        ])
-    )
-
 # ========== STATISTICS HANDLERS ==========
 @router.callback_query(F.data == "my_stats")
 async def show_my_stats(callback: CallbackQuery):
@@ -2153,9 +2571,20 @@ async def show_my_stats(callback: CallbackQuery):
     available_keys = system_stats['available_keys']
     total_keys = system_stats['total_keys']
     
+    # Форматируем дату окончания тарифа
+    expires_str = "Не указано"
+    if stats.get('tariff_expires_date'):
+        expires_date = stats['tariff_expires_date']
+        if isinstance(expires_date, str):
+            expires_str = expires_date
+        else:
+            expires_str = expires_date.strftime("%d.%m.%Y %H:%M")
+    
     stats_text = (
         f"📊 Ваша статистика:\n\n"
-        f"💎 Тариф: {stats['tariff']}\n\n"
+        f"💎 Тариф: {stats['tariff']}\n"
+        f"📅 Тариф до: {expires_str}\n"
+        f"⏳ Осталось дней: {stats.get('tariff_expires_days', 0)}\n\n"
         f"📅 Посты сегодня:\n"
         f"• Отправлено: {stats['posts_today']}/{stats['posts_limit']}\n"
         f"• Запланировано: {stats['scheduled_posts']}\n\n"
@@ -2170,9 +2599,15 @@ async def show_my_stats(callback: CallbackQuery):
         f"📍 Время по Москве: {datetime.now(MOSCOW_TZ).strftime('%H:%M')}"
     )
     
+    keyboard_buttons = []
+    if stats.get('tariff_expires_days', 0) < 7:
+        keyboard_buttons.append([InlineKeyboardButton(text="🔄 Продлить тариф", callback_data="extend_tariff")])
+    
+    keyboard_buttons.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")])
+    
     await callback.message.edit_text(
         stats_text,
-        reply_markup=get_main_menu(user_id, user_id == ADMIN_ID)
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     )
 
 # ========== BACK HANDLERS ==========
@@ -2252,6 +2687,42 @@ async def auto_rotate_keys_task():
     except Exception as e:
         logger.error(f"Ошибка автоматической ротации ключей: {e}")
 
+async def check_expired_tariffs_task():
+    """Проверка истекших тарифов"""
+    try:
+        expired_users = await execute_query('''
+            SELECT id, username, first_name, tariff 
+            FROM users 
+            WHERE tariff_expires_at < NOW() 
+            AND tariff NOT IN ('mini', 'admin')
+        ''')
+        
+        for user in expired_users:
+            user_id = user['id']
+            username = user.get('username', 'N/A')
+            first_name = user.get('first_name', 'N/A')
+            old_tariff = user.get('tariff', 'standard')
+            
+            # Переводим на бесплатный тариф
+            await update_user_tariff(user_id, 'mini', 30)
+            
+            # Уведомляем пользователя
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"📢 Уведомление о тарифе\n\n"
+                    f"Ваш тариф {old_tariff} истек.\n"
+                    f"Вы переведены на бесплатный тариф Mini.\n\n"
+                    f"📍 Для продолжения работы с прежними возможностями продлите тариф."
+                )
+            except Exception as e:
+                logger.error(f"Не удалось уведомить пользователя {user_id}: {e}")
+        
+        if expired_users:
+            logger.info(f"✅ Проверка тарифов: {len(expired_users)} пользователей переведены на Mini")
+    except Exception as e:
+        logger.error(f"Ошибка проверки тарифов: {e}")
+
 # ========== STARTUP/SHUTDOWN ==========
 async def start_web_server():
     """Запуск веб-сервера для Railway"""
@@ -2279,10 +2750,12 @@ async def start_web_server():
 async def on_startup():
     """Запуск бота"""
     logger.info("=" * 60)
-    logger.info(f"🚀 ЗАПУСК БОТА KOLES-TECH v3.0")
+    logger.info(f"🚀 ЗАПУСК БОТА KOLES-TECH v4.0")
     logger.info(f"🤖 AI сервисы: ВКЛЮЧЕНЫ")
     logger.info(f"🔑 Gemini ключей: {len(GEMINI_API_KEYS)}")
     logger.info(f"👑 Admin ID: {ADMIN_ID}")
+    logger.info(f"💎 Тарифы: Mini (бесплатно), Standard ($5), VIP ($10)")
+    logger.info(f"📅 Срок тарифов: 30 дней")
     logger.info(f"🆘 Поддержка: {SUPPORT_BOT_USERNAME or SUPPORT_URL}")
     logger.info(f"🌐 Порт Railway: {PORT}")
     logger.info("=" * 60)
@@ -2323,6 +2796,16 @@ async def on_startup():
             id='auto_rotate_keys'
         )
         
+        # Проверка истекших тарифов каждый день
+        scheduler.add_job(
+            check_expired_tariffs_task,
+            trigger='cron',
+            hour=1,
+            minute=0,
+            timezone=MOSCOW_TZ,
+            id='check_expired_tariffs'
+        )
+        
         # Восстановление запланированных постов
         await restore_scheduled_posts()
         
@@ -2339,6 +2822,8 @@ async def on_startup():
                     f"🆔 ID: {me.id}\n"
                     f"🤖 AI сервисы: ВКЛЮЧЕНЫ\n"
                     f"🔑 Gemini ключей: {len(GEMINI_API_KEYS)}\n"
+                    f"💎 Тарифы: Mini (бесплатно), Standard ($5), VIP ($10)\n"
+                    f"📅 Срок тарифов: 30 дней\n"
                     f"🔄 Система ротации ключей: АКТИВНА\n"
                     f"🌐 Порт Railway: {PORT}\n"
                     f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}"
@@ -2347,7 +2832,7 @@ async def on_startup():
                 logger.error(f"Не удалось уведомить админа: {e}")
         
         logger.info("=" * 60)
-        logger.info("🎉 БОТ УСПЕШНО ЗАПУЩЕН С AI СЕРВИСАМИ!")
+        logger.info("🎉 БОТ УСПЕШНО ЗАПУЩЕН С ТАРИФНОЙ СИСТЕМОЙ НА 30 ДНЕЙ!")
         logger.info("=" * 60)
         return True
         
