@@ -1108,17 +1108,25 @@ async def increment_user_posts(user_id: int) -> bool:
         return False
 
 async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, scheduled_time: datetime) -> Optional[int]:
-    """Сохраняет запланированный пост"""
+    """Сохраняет запланированный пост - ИСПРАВЛЕННАЯ ВЕРСИЯ"""
     try:
         if scheduled_time.tzinfo is None:
             scheduled_time = MOSCOW_TZ.localize(scheduled_time)
         scheduled_time_utc = scheduled_time.astimezone(pytz.UTC)
         
-        # Правильная обработка post_data
+        # ПРАВИЛЬНАЯ обработка post_data (без обращения как к словарю словаря)
         message_type = post_data.get('message_type', 'text')
-        message_text = post_data.get('message_text')
+        message_text = post_data.get('message_text', '')
         media_file_id = post_data.get('media_file_id')
         media_caption = post_data.get('media_caption')
+        
+        # Преобразуем None значения в NULL для базы данных
+        if message_text is None:
+            message_text = ''
+        if media_file_id is None:
+            media_file_id = ''
+        if media_caption is None:
+            media_caption = ''
         
         result = await execute_query('''
             INSERT INTO scheduled_posts 
@@ -1135,9 +1143,15 @@ async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, sc
         scheduled_time_utc
         )
         
-        return result[0]['id'] if result else None
+        # ПРАВИЛЬНОЕ извлечение результата
+        if result and isinstance(result, list) and len(result) > 0:
+            return result[0].get('id')  # Используем .get() для безопасного доступа
+        return None
+        
     except Exception as e:
         logger.error(f"Ошибка сохранения поста: {e}")
+        logger.error(f"Данные поста: {post_data}")
+        logger.error(traceback.format_exc())
         return None
 
 async def get_user_stats(user_id: int) -> Dict:
@@ -1909,7 +1923,7 @@ async def process_custom_word_count(message: Message, state: FSMContext):
             f"🎨 Стиль: {data['style']}\n"
             f"📝 Слов: {word_count}\n"
             f"📚 Примеры: {data['examples'][:100]}...\n\n"
-            f"⏳ Генерирую текст... Пробю разные ключи (макс. 8 попыток)"
+            f"⏳ Генерирую текст... Пробую разные ключи (макс. 8 попыток)"
         )
         
         await message.answer(preview_text)
@@ -2677,7 +2691,7 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
     post_data = data.get('post_data', {})
     scheduled_datetime = data.get('scheduled_datetime')
     
-    # Сохраняем пост в базу данных
+    # Сохраняем пост в базу данных - ИСПРАВЛЕННАЯ ФУНКЦИЯ
     post_id = await save_scheduled_post(user_id, channel_id, post_data, scheduled_datetime)
     
     if not post_id:
@@ -2958,7 +2972,7 @@ async def show_tariffs(callback: CallbackQuery):
     tariffs_text += (
         f"📍 Чтобы оформить подписку:\n"
         f"1. Выберите нужный тариф ниже\n"
-        f"2. Свяжитесь с администратором для оплаты\n"
+        f"2. Свяжитесь с администратором для оплата\n"
         f"3. После оплаты подписка будет активирована\n\n"
         f"💬 Контакт администратора: @{ADMIN_CONTACT.replace('@', '')}"
     )
