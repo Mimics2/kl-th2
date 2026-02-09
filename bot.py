@@ -80,7 +80,7 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 ALTERNATIVE_MODELS = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
 
 # Ротация настроек
-MAX_403_RETRIES = 2  # 2 попытки при ошибке 403
+MAX_403_RETRIES = 3  # 3 попытки при ошибке 403
 REQUEST_COOLDOWN = 15  # 15 секунд между запросами пользователя
 KEY_BLOCK_DURATION = 300  # 5 минут блокировки ключа после ошибки 403
 
@@ -211,10 +211,10 @@ class AdvancedAISessionManager:
         self._init_key_stats()
         self.last_request_time: Dict[int, datetime] = {}
         self.current_model_index = 0
-        self.models = [GEMINI_MODEL] + ALTERNATIVE_MODELS
+        self.models = [GEMINI_MODEL] + [m for m in ALTERNATIVE_MODELS if m != GEMINI_MODEL]
         self.user_request_counts = defaultdict(int)
         self.last_key_rotation = datetime.now(MOSCOW_TZ)
-        self.current_key_index = random.randint(0, len(GEMINI_API_KEYS) - 1)  # Начинаем со случайного ключа
+        self.current_key_index = random.randint(0, len(GEMINI_API_KEYS) - 1)
         
     def _init_key_stats(self):
         """Инициализация статистики ключей"""
@@ -227,8 +227,8 @@ class AdvancedAISessionManager:
                 "last_used": None,
                 "successful_requests": 0,
                 "last_error": None,
-                "priority": 100,  # Приоритет: чем меньше, тем лучше
-                "failed_users": set(),  # Пользователи, для которых ключ не сработал
+                "priority": 50,
+                "failed_users": set(),
                 "last_success": None
             }
     
@@ -248,7 +248,7 @@ class AdvancedAISessionManager:
                 'current_attempts': 0,
                 'consecutive_errors': 0,
                 'last_error_time': None,
-                'failed_keys': set(),  # Ключи, которые не сработали для этого пользователя
+                'failed_keys': set(),
                 'last_success_time': None
             }
         return self.sessions[user_id]
@@ -257,14 +257,10 @@ class AdvancedAISessionManager:
         """Выбирает лучший доступный ключ с интеллектуальной ротацией"""
         session = self.get_session(user_id)
         
-        # Пробуем разные ключи по порядку, начиная со следующего после последнего использованного
+        # Получаем список доступных ключей с приоритетами
         available_keys = []
-        start_index = session.get('current_key_index', self.current_key_index)
         
-        for i in range(len(GEMINI_API_KEYS)):
-            key_index = (start_index + i) % len(GEMINI_API_KEYS)
-            key = GEMINI_API_KEYS[key_index]
-            
+        for i, key in enumerate(GEMINI_API_KEYS):
             if self._is_key_available(key, user_id):
                 stats = self.key_stats[key]
                 priority = stats['priority']
@@ -276,10 +272,16 @@ class AdvancedAISessionManager:
                 # Повышаем приоритет если ключ недавно успешно использовался
                 if stats['last_success']:
                     hours_since_success = (datetime.now(MOSCOW_TZ) - stats['last_success']).total_seconds() / 3600
-                    if hours_since_success < 1:  # Успешно использовался менее часа назад
+                    if hours_since_success < 1:
                         priority -= 30
                 
-                available_keys.append((priority, key_index, key))
+                # Повышаем приоритет ключам, которые давно не использовались
+                if stats['last_used']:
+                    hours_since_use = (datetime.now(MOSCOW_TZ) - stats['last_used']).total_seconds() / 3600
+                    if hours_since_use > 2:
+                        priority -= 20
+                
+                available_keys.append((priority, i, key))
         
         # Если нет доступных ключей, пробуем любой незаблокированный
         if not available_keys:
@@ -294,21 +296,21 @@ class AdvancedAISessionManager:
             logger.error("❌ Нет доступных ключей!")
             return None, 0, self.models[0]
         
-        # Сортируем по приоритету
+        # Сортируем по приоритету (ниже = лучше)
         available_keys.sort(key=lambda x: x[0])
         
         # Выбираем ключ с наилучшим приоритетом
-        best_key = available_keys[0][2]
-        key_index = available_keys[0][1]
+        best_priority, key_index, best_key = available_keys[0]
         
         # Обновляем статистику
-        session['current_key_index'] = (key_index + 1) % len(GEMINI_API_KEYS)  # Следующий ключ для следующего запроса
+        session['current_key_index'] = (key_index + 1) % len(GEMINI_API_KEYS)
         self._update_key_stats_on_use(best_key)
         
-        # Рандомно выбираем модель для разнообразия
-        model_index = random.randint(0, len(self.models) - 1)
+        # Выбираем модель
+        model_index = self.current_model_index % len(self.models)
+        model_name = self.models[model_index]
         
-        return best_key, key_index, self.models[model_index]
+        return best_key, key_index, model_name
     
     def _update_key_stats_on_use(self, key: str):
         """Обновляет статистику при использовании ключа"""
@@ -330,16 +332,12 @@ class AdvancedAISessionManager:
         if stats['403_errors'] >= MAX_403_RETRIES:
             return False
         
-        # Ключ с очень высоким приоритетом считается менее доступным
-        if stats['priority'] > 90:
-            return False
-        
         # Проверяем, не провалился ли ключ для этого пользователя
         if user_id in stats['failed_users']:
-            # Но даем шанс через некоторое время
+            # Даем шанс через 1 час
             if stats['last_error']:
                 hours_since_error = (datetime.now(MOSCOW_TZ) - stats['last_error']).total_seconds() / 3600
-                if hours_since_error > 2:  # Через 2 часа даем еще шанс
+                if hours_since_error > 1:
                     stats['failed_users'].discard(user_id)
                 else:
                     return False
@@ -360,12 +358,12 @@ class AdvancedAISessionManager:
         
         if error_type == "403":
             stats['403_errors'] += 1
-            stats['priority'] = min(100, stats['priority'] + 30)  # Сильно понижаем приоритет
+            stats['priority'] = min(100, stats['priority'] + 30)
             logger.warning(f"Ключ {key[:15]}... получил 403 ошибку. Приоритет: {stats['priority']}")
             
             if stats['403_errors'] >= MAX_403_RETRIES:
                 stats['blocked_until'] = datetime.now(MOSCOW_TZ) + timedelta(seconds=KEY_BLOCK_DURATION)
-                stats['priority'] = 95  # Низкий приоритет для заблокированных
+                stats['priority'] = 95
                 logger.warning(f"Ключ {key[:15]}... заблокирован на {KEY_BLOCK_DURATION // 60} минут")
         elif error_type in ["429", "quota"]:
             stats['priority'] = min(100, stats['priority'] + 20)
@@ -382,16 +380,16 @@ class AdvancedAISessionManager:
         stats['errors'] = 0
         stats['403_errors'] = 0
         stats['successful_requests'] += 1
-        stats['priority'] = max(1, stats['priority'] - 20)  # Сильно повышаем приоритет
+        stats['priority'] = max(1, stats['priority'] - 25)
         stats['blocked_until'] = None
         stats['last_success'] = datetime.now(MOSCOW_TZ)
-        stats['failed_users'].discard(user_id)  # Убираем пользователя из списка неудачных
+        stats['failed_users'].discard(user_id)
         
         session = self.get_session(user_id)
         session['last_successful_key'] = key
         session['consecutive_errors'] = 0
         session['current_attempts'] = 0
-        session['failed_keys'].discard(key)  # Убираем ключ из списка неудачных
+        session['failed_keys'].discard(key)
         session['last_success_time'] = datetime.now(MOSCOW_TZ)
         
         logger.info(f"✅ Ключ {key[:15]}... успешно использован. Приоритет: {stats['priority']}")
@@ -407,7 +405,6 @@ class AdvancedAISessionManager:
         """Добавляет ключ в список неудачных для пользователя"""
         session = self.get_session(user_id)
         session['failed_keys'].add(key)
-        logger.info(f"Ключ {key[:15]}... добавлен в failed_keys для user_{user_id}")
     
     def reset_user_attempts(self, user_id: int):
         """Сбрасывает счетчик попыток пользователя"""
@@ -494,7 +491,7 @@ class AdvancedAISessionManager:
                 'failed_users_count': len(stats['failed_users'])
             }
         
-        available_keys = len([k for k, v in self.key_stats.items() if v['priority'] < 80])
+        available_keys = len([k for k, v in self.key_stats.items() if v['blocked_until'] is None or v['blocked_until'] < datetime.now(MOSCOW_TZ)])
         
         return {
             'total_users': len(self.sessions),
@@ -529,12 +526,12 @@ class AdvancedAISessionManager:
                 if hours_since_use > 1:
                     stats['priority'] = max(1, stats['priority'] - 10)
         
-        # Очищаем старые failed_users (старше 6 часов)
+        # Очищаем старые failed_users (старше 1 часа)
         for key in GEMINI_API_KEYS:
             stats = self.key_stats[key]
             if stats['last_error']:
                 hours_since_error = (now - stats['last_error']).total_seconds() / 3600
-                if hours_since_error > 6:
+                if hours_since_error > 1:
                     stats['failed_users'].clear()
         
         logger.info("✅ Выполнена автоматическая ротация ключей")
@@ -604,14 +601,15 @@ async def generate_with_gemini_advanced(prompt: str, user_id: int, max_retries: 
                 logger.error(f"Нет доступных ключей для user_{user_id}")
                 return None
             
-            logger.info(f"Попытка #{attempt} | user_{user_id} | key_{key_index} | модель: {model_name} | приоритет: {ai_manager.key_stats[key]['priority']}")
+            logger.info(f"Попытка #{attempt} | user_{user_id} | key_{key_index} | модель: {model_name}")
             
             genai.configure(api_key=key)
             
             try:
                 model = genai.GenerativeModel(model_name)
                 
-                response = model.generate_content(
+                response = await asyncio.to_thread(
+                    model.generate_content,
                     prompt,
                     generation_config={
                         "temperature": 0.8,
@@ -621,9 +619,12 @@ async def generate_with_gemini_advanced(prompt: str, user_id: int, max_retries: 
                     }
                 )
                 
-                ai_manager.mark_key_success(key, user_id)
-                logger.info(f"✅ Успешно | user_{user_id} | ключ: {key_index} | модель: {model_name} | попытка: {attempt}")
-                return response.text.strip()
+                if response.text:
+                    ai_manager.mark_key_success(key, user_id)
+                    logger.info(f"✅ Успешно | user_{user_id} | ключ: {key_index} | модель: {model_name} | попытка: {attempt}")
+                    return response.text.strip()
+                else:
+                    raise Exception("Пустой ответ от модели")
                 
             except Exception as model_error:
                 error_str = str(model_error)
@@ -631,9 +632,7 @@ async def generate_with_gemini_advanced(prompt: str, user_id: int, max_retries: 
                 # Пробуем другую модель если текущая не поддерживается
                 if "not supported" in error_str.lower() or "not found" in error_str.lower():
                     logger.warning(f"Модель {model_name} не поддерживается, пробую следующую")
-                    # Пробуем следующую модель
-                    next_model_index = (ai_manager.models.index(model_name) + 1) % len(ai_manager.models)
-                    model_name = ai_manager.models[next_model_index]
+                    ai_manager.rotate_model()
                     continue
                 else:
                     raise model_error
@@ -665,7 +664,7 @@ async def generate_with_gemini_advanced(prompt: str, user_id: int, max_retries: 
                 await asyncio.sleep(wait_time)
             
             if attempt < max_retries:
-                wait_time = 0.3 * attempt
+                wait_time = 0.5 * attempt
                 await asyncio.sleep(wait_time)
             else:
                 logger.error(f"Все {max_retries} попыток исчерпаны для user_{user_id}")
@@ -696,7 +695,9 @@ async def init_database():
             is_active BOOLEAN DEFAULT TRUE,
             is_admin BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ DEFAULT NOW(),
-            last_seen TIMESTAMPTZ DEFAULT NOW()
+            last_seen TIMESTAMPTZ DEFAULT NOW(),
+            tariff_expires DATE DEFAULT NULL,
+            subscription_days INTEGER DEFAULT 0
         )
         ''',
         
@@ -820,9 +821,8 @@ async def migrate_database():
     """Миграция базы данных"""
     try:
         columns_to_add = [
-            ('users', 'last_seen', 'TIMESTAMPTZ'),
-            ('users', 'ai_last_used', 'TIMESTAMPTZ'),
-            ('scheduled_posts', 'message_type', 'TEXT')
+            ('users', 'tariff_expires', 'DATE'),
+            ('users', 'subscription_days', 'INTEGER')
         ]
         
         for table, column, definition in columns_to_add:
@@ -865,7 +865,7 @@ async def get_user_tariff(user_id: int) -> str:
     await update_user_activity(user_id)
     
     user = await execute_query(
-        "SELECT tariff, is_admin FROM users WHERE id = $1", 
+        "SELECT tariff, is_admin, tariff_expires FROM users WHERE id = $1", 
         user_id
     )
     
@@ -879,7 +879,82 @@ async def get_user_tariff(user_id: int) -> str:
     if user[0].get('is_admin'):
         return 'admin'
     
+    # Проверяем срок действия тарифа
+    tariff_expires = user[0].get('tariff_expires')
+    if tariff_expires and tariff_expires < datetime.now(MOSCOW_TZ).date():
+        # Тариф истек, возвращаем к минимуму
+        await execute_query(
+            "UPDATE users SET tariff = 'mini', tariff_expires = NULL, subscription_days = 0 WHERE id = $1",
+            user_id
+        )
+        return 'mini'
+    
     return user[0].get('tariff', 'mini')
+
+async def update_user_subscription(user_id: int, tariff: str, days: int) -> bool:
+    """Обновляет подписку пользователя"""
+    try:
+        today = datetime.now(MOSCOW_TZ).date()
+        
+        # Получаем текущую дату окончания
+        user = await execute_query(
+            "SELECT tariff_expires FROM users WHERE id = $1",
+            user_id
+        )
+        
+        if user and user[0]['tariff_expires']:
+            # Продлеваем существующую подписку
+            expires_date = user[0]['tariff_expires']
+            if expires_date >= today:
+                # Продлеваем с текущей даты окончания
+                new_expires = expires_date + timedelta(days=days)
+            else:
+                # Начинаем с сегодня
+                new_expires = today + timedelta(days=days)
+        else:
+            # Новая подписка
+            new_expires = today + timedelta(days=days)
+        
+        await execute_query('''
+            UPDATE users 
+            SET tariff = $1, 
+                tariff_expires = $2,
+                subscription_days = subscription_days + $3
+            WHERE id = $4
+        ''', tariff, new_expires, days, user_id)
+        
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка обновления подписки: {e}")
+        return False
+
+async def get_user_subscription_info(user_id: int) -> Dict:
+    """Получает информацию о подписке пользователя"""
+    user = await execute_query(
+        "SELECT tariff, tariff_expires, subscription_days FROM users WHERE id = $1",
+        user_id
+    )
+    
+    if not user:
+        return {'tariff': 'mini', 'expires': None, 'days': 0, 'expired': True}
+    
+    data = user[0]
+    tariff_expires = data.get('tariff_expires')
+    
+    if tariff_expires:
+        expired = tariff_expires < datetime.now(MOSCOW_TZ).date()
+        days_left = (tariff_expires - datetime.now(MOSCOW_TZ).date()).days if not expired else 0
+    else:
+        expired = True
+        days_left = 0
+    
+    return {
+        'tariff': data.get('tariff', 'mini'),
+        'expires': tariff_expires,
+        'days': data.get('subscription_days', 0),
+        'expired': expired,
+        'days_left': days_left
+    }
 
 async def update_ai_usage_log(user_id: int, service_type: str, success: bool, 
                              api_key_index: int, model_name: str, 
@@ -1077,6 +1152,9 @@ async def get_user_stats(user_id: int) -> Dict:
         )
         scheduled_posts = scheduled_posts[0]['count'] if scheduled_posts else 0
         
+        # Информация о подписке
+        subscription_info = await get_user_subscription_info(user_id)
+        
         return {
             'tariff': tariff_info['name'],
             'posts_today': posts_today,
@@ -1088,7 +1166,10 @@ async def get_user_stats(user_id: int) -> Dict:
             'ai_ideas_used': ai_stats['ideas_used'],
             'ai_ideas_limit': tariff_info['ai_ideas_limit'],
             'total_ai_requests': ai_stats['total_requests'],
-            'scheduled_posts': scheduled_posts
+            'scheduled_posts': scheduled_posts,
+            'subscription_expires': subscription_info['expires'],
+            'subscription_days_left': subscription_info['days_left'],
+            'subscription_expired': subscription_info['expired']
         }
     except Exception as e:
         logger.error(f"Ошибка получения статистики пользователя {user_id}: {e}")
@@ -1157,7 +1238,8 @@ async def update_order_status(order_id: int, status: str, admin_notes: str = Non
 async def get_all_users() -> List[Dict]:
     """Получает всех пользователей"""
     return await execute_query('''
-        SELECT id, username, first_name, tariff, is_admin, created_at
+        SELECT id, username, first_name, tariff, is_admin, created_at,
+               tariff_expires, subscription_days
         FROM users 
         ORDER BY created_at DESC
     ''')
@@ -1165,7 +1247,7 @@ async def get_all_users() -> List[Dict]:
 async def get_user_by_id(user_id: int) -> Optional[Dict]:
     """Получает пользователя по ID"""
     result = await execute_query(
-        "SELECT id, username, first_name, tariff, is_admin, created_at FROM users WHERE id = $1",
+        "SELECT id, username, first_name, tariff, is_admin, created_at, tariff_expires, subscription_days FROM users WHERE id = $1",
         user_id
     )
     
@@ -1282,6 +1364,19 @@ def get_tariffs_keyboard(user_tariff: str = 'mini') -> InlineKeyboardMarkup:
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+def get_admin_subscription_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура для управления подписками в админке"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➕ Выдать подписку", callback_data="admin_grant_subscription"),
+            InlineKeyboardButton(text="🔄 Продлить подписку", callback_data="admin_extend_subscription")
+        ],
+        [
+            InlineKeyboardButton(text="📋 Список подписок", callback_data="admin_list_subscriptions"),
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")
+        ]
+    ])
+
 # ========== STATES ==========
 class PostStates(StatesGroup):
     waiting_for_channel = State()
@@ -1301,7 +1396,10 @@ class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
     waiting_for_order_note = State()
     waiting_for_user_id = State()
-    waiting_for_confirm_assign = State()
+    waiting_for_tariff_selection = State()
+    waiting_for_days_selection = State()
+    waiting_for_confirm_grant = State()
+    waiting_for_confirm_extend = State()
 
 # ========== UTILITY FUNCTIONS ==========
 def format_datetime(dt: datetime) -> str:
@@ -2588,7 +2686,8 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
             send_scheduled_post,
             trigger=DateTrigger(run_date=scheduled_datetime),
             args=(channel_id, post_data, post_id),
-            id=f"post_{post_id}"
+            id=f"post_{post_id}",
+            replace_existing=True
         )
         
         # Увеличиваем счетчик постов пользователя
@@ -2648,9 +2747,21 @@ async def show_my_stats(callback: CallbackQuery):
     available_keys = system_stats['available_keys']
     total_keys = system_stats['total_keys']
     
+    # Форматируем дату окончания подписки
+    expires_info = ""
+    if stats['subscription_expires']:
+        expires_date = stats['subscription_expires']
+        if stats['subscription_expired']:
+            expires_info = f"❌ Подписка истекла: {expires_date.strftime('%d.%m.%Y')}"
+        else:
+            expires_info = f"✅ Подписка активна до: {expires_date.strftime('%d.%m.%Y')} (осталось {stats['subscription_days_left']} дней)"
+    else:
+        expires_info = "ℹ️ Подписка отсутствует"
+    
     stats_text = (
         f"📊 Ваша статистика:\n\n"
-        f"💎 Тариф: {stats['tariff']}\n\n"
+        f"💎 Тариф: {stats['tariff']}\n"
+        f"{expires_info}\n\n"
         f"📅 Посты сегодня:\n"
         f"• Отправлено: {stats['posts_today']}/{stats['posts_limit']}\n"
         f"• Запланировано: {stats['scheduled_posts']}\n\n"
@@ -2722,7 +2833,7 @@ async def show_tariffs(callback: CallbackQuery):
         is_current = tariff_id == user_tariff
         current_marker = " ✅ ТЕКУЩИЙ" if is_current else ""
         
-        price_text = f"${tariff_info['price']}" if tariff_info['price'] > 0 else "Бесплатно"
+        price_text = f"${tariff_info['price']}/месяц" if tariff_info['price'] > 0 else "Бесплатно"
         
         tariffs_text += (
             f"{tariff_info['name']} - {price_text}{current_marker}\n"
@@ -2734,10 +2845,10 @@ async def show_tariffs(callback: CallbackQuery):
         )
     
     tariffs_text += (
-        f"📍 Чтобы изменить тариф:\n"
+        f"📍 Чтобы оформить подписку:\n"
         f"1. Выберите нужный тариф ниже\n"
         f"2. Свяжитесь с администратором для оплаты\n"
-        f"3. После оплаты ваш тариф будет обновлен\n\n"
+        f"3. После оплаты подписка будет активирована\n\n"
         f"💬 Контакт администратора: @{ADMIN_CONTACT.replace('@', '')}"
     )
     
@@ -2770,11 +2881,11 @@ async def select_tariff(callback: CallbackQuery):
             f"🛒 Запрос на смену тарифа отправлен!\n\n"
             f"📋 Детали:\n"
             f"• Новый тариф: {tariff_info['name']}\n"
-            f"• Стоимость: {tariff_info['price']} {tariff_info['currency']}\n"
+            f"• Стоимость: {tariff_info['price']} {tariff_info['currency']}/месяц\n"
             f"• Ваш ID: {user_id}\n\n"
             f"📍 Дальнейшие действия:\n"
             f"1. Свяжитесь с администратором для оплаты\n"
-            f"2. После оплаты ваш тариф будет обновлен\n"
+            f"2. После оплаты подписка будет активирована\n"
             f"3. Вы получите уведомление\n\n"
             f"💬 Контакт: @{ADMIN_CONTACT.replace('@', '')}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -2837,6 +2948,9 @@ async def admin_panel(callback: CallbackQuery):
     pending_orders = await execute_query("SELECT COUNT(*) as count FROM tariff_orders WHERE status = 'pending'")
     pending_orders = pending_orders[0]['count'] if pending_orders else 0
     
+    active_subscriptions = await execute_query("SELECT COUNT(*) as count FROM users WHERE tariff_expires >= CURRENT_DATE")
+    active_subscriptions = active_subscriptions[0]['count'] if active_subscriptions else 0
+    
     system_stats = ai_manager.get_system_stats()
     
     stats_text = (
@@ -2844,6 +2958,7 @@ async def admin_panel(callback: CallbackQuery):
         f"📊 Статистика бота:\n"
         f"• Всего пользователей: {total_users}\n"
         f"• Активных (7 дней): {active_users}\n"
+        f"• Активных подписок: {active_subscriptions}\n"
         f"• Ожидающих заказов: {pending_orders}\n\n"
         f"🤖 AI система:\n"
         f"• Всего ключей: {system_stats['total_keys']}\n"
@@ -2859,7 +2974,610 @@ async def admin_panel(callback: CallbackQuery):
             [InlineKeyboardButton(text="🛒 Заказы тарифов", callback_data="admin_orders")],
             [InlineKeyboardButton(text="🤖 Статистика AI", callback_data="admin_ai_stats")],
             [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
+            [InlineKeyboardButton(text="💎 Управление подписками", callback_data="admin_subscriptions")],
             [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+        ])
+    )
+
+@router.callback_query(F.data == "admin_subscriptions")
+async def admin_subscriptions_menu(callback: CallbackQuery):
+    """Меню управления подписками"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "💎 Управление подписками\n\n"
+        "Выберите действие:",
+        reply_markup=get_admin_subscription_keyboard()
+    )
+
+@router.callback_query(F.data == "admin_grant_subscription")
+async def admin_grant_subscription_start(callback: CallbackQuery, state: FSMContext):
+    """Начало выдачи подписки"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.waiting_for_user_id)
+    await state.update_data(action="grant")
+    
+    await callback.message.edit_text(
+        "👤 Введите ID пользователя для выдачи подписки:\n\n"
+        "📍 ID можно получить:\n"
+        "• Из статистики пользователей\n"
+        "• Из заказов тарифов\n"
+        "• Попросить пользователя отправить /start\n\n"
+        "Введите ID пользователя:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_subscriptions")]
+        ])
+    )
+
+@router.callback_query(F.data == "admin_extend_subscription")
+async def admin_extend_subscription_start(callback: CallbackQuery, state: FSMContext):
+    """Начало продления подписки"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.waiting_for_user_id)
+    await state.update_data(action="extend")
+    
+    await callback.message.edit_text(
+        "👤 Введите ID пользователя для продления подписки:\n\n"
+        "📍 ID можно получить:\n"
+        "• Из статистики пользователей\n"
+        "• Из заказов тарифов\n"
+        "• Попросить пользователя отправить /start\n\n"
+        "Введите ID пользователя:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_subscriptions")]
+        ])
+    )
+
+@router.message(AdminStates.waiting_for_user_id)
+async def admin_process_user_id(message: Message, state: FSMContext):
+    """Обработка ID пользователя"""
+    try:
+        target_user_id = int(message.text.strip())
+        data = await state.get_data()
+        action = data.get('action')
+        
+        # Проверяем существование пользователя
+        user = await get_user_by_id(target_user_id)
+        if not user:
+            await message.answer(
+                "❌ Пользователь с таким ID не найден!\n\n"
+                "Проверьте ID и попробуйте снова:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_subscriptions")]
+                ])
+            )
+            return
+        
+        await state.update_data(target_user_id=target_user_id)
+        
+        if action == "grant":
+            await state.set_state(AdminStates.waiting_for_tariff_selection)
+            await message.answer(
+                f"✅ Пользователь найден:\n"
+                f"👤 ID: {target_user_id}\n"
+                f"📛 Имя: {user.get('first_name', 'N/A')}\n"
+                f"👤 Username: @{user.get('username', 'N/A')}\n"
+                f"💎 Текущий тариф: {user.get('tariff', 'mini')}\n\n"
+                f"Выберите тариф для выдачи:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="⭐ Standard", callback_data="admin_tariff_standard"),
+                        InlineKeyboardButton(text="👑 VIP", callback_data="admin_tariff_vip")
+                    ],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_subscriptions")]
+                ])
+            )
+        elif action == "extend":
+            # Получаем информацию о текущей подписке
+            subscription_info = await get_user_subscription_info(target_user_id)
+            
+            if subscription_info['expired'] and not subscription_info['expires']:
+                await message.answer(
+                    f"❌ У пользователя нет активной подписки!\n\n"
+                    f"👤 Пользователь: {user.get('first_name', 'N/A')} (@{user.get('username', 'N/A')})\n"
+                    f"💎 Текущий тариф: {user.get('tariff', 'mini')}\n\n"
+                    f"Используйте функцию 'Выдать подписку' для нового пользователя.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_subscriptions")]
+                    ])
+                )
+                await state.clear()
+                return
+            
+            await state.set_state(AdminStates.waiting_for_days_selection)
+            
+            expires_text = "Нет подписки"
+            if subscription_info['expires']:
+                expires_text = subscription_info['expires'].strftime('%d.%m.%Y')
+                if subscription_info['expired']:
+                    expires_text += " (истекла)"
+                else:
+                    expires_text += f" (осталось {subscription_info['days_left']} дней)"
+            
+            await message.answer(
+                f"✅ Пользователь найден:\n"
+                f"👤 ID: {target_user_id}\n"
+                f"📛 Имя: {user.get('first_name', 'N/A')}\n"
+                f"👤 Username: @{user.get('username', 'N/A')}\n"
+                f"💎 Текущий тариф: {user.get('tariff', 'mini')}\n"
+                f"📅 Подписка до: {expires_text}\n\n"
+                f"Выберите количество дней для продления:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="7 дней", callback_data="admin_days_7"),
+                        InlineKeyboardButton(text="30 дней", callback_data="admin_days_30")
+                    ],
+                    [
+                        InlineKeyboardButton(text="90 дней", callback_data="admin_days_90"),
+                        InlineKeyboardButton(text="180 дней", callback_data="admin_days_180")
+                    ],
+                    [
+                        InlineKeyboardButton(text="365 дней", callback_data="admin_days_365"),
+                        InlineKeyboardButton(text="📝 Другое", callback_data="admin_days_custom")
+                    ],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_subscriptions")]
+                ])
+            )
+        
+    except ValueError:
+        await message.answer(
+            "❌ ID пользователя должен быть числом!\n\n"
+            "Введите ID пользователя:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_subscriptions")]
+            ])
+        )
+
+@router.callback_query(F.data.startswith("admin_tariff_"))
+async def admin_process_tariff_selection(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора тарифа"""
+    tariff_id = callback.data.split("_")[2]
+    data = await state.get_data()
+    target_user_id = data.get('target_user_id')
+    
+    await state.update_data(tariff_id=tariff_id)
+    
+    # Получаем информацию о пользователе
+    user = await get_user_by_id(target_user_id)
+    
+    await state.set_state(AdminStates.waiting_for_days_selection)
+    
+    await callback.message.edit_text(
+        f"✅ Выбран тариф: {TARIFFS.get(tariff_id, {}).get('name', tariff_id)}\n\n"
+        f"👤 Пользователь: {user.get('first_name', 'N/A')} (@{user.get('username', 'N/A')})\n"
+        f"💎 Текущий тариф: {user.get('tariff', 'mini')}\n\n"
+        f"Выберите количество дней для подписки:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="7 дней", callback_data="admin_days_7"),
+                InlineKeyboardButton(text="30 дней", callback_data="admin_days_30")
+            ],
+            [
+                InlineKeyboardButton(text="90 дней", callback_data="admin_days_90"),
+                InlineKeyboardButton(text="180 дней", callback_data="admin_days_180")
+            ],
+            [
+                InlineKeyboardButton(text="365 дней", callback_data="admin_days_365"),
+                InlineKeyboardButton(text="📝 Другое", callback_data="admin_days_custom")
+            ],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_subscriptions")]
+        ])
+    )
+
+@router.callback_query(F.data.startswith("admin_days_"))
+async def admin_process_days_selection(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора количества дней"""
+    if callback.data == "admin_days_custom":
+        await callback.message.edit_text(
+            "📝 Введите количество дней для подписки (от 1 до 365):\n\n"
+            "Примеры:\n"
+            "• 30 - 1 месяц\n"
+            "• 90 - 3 месяца\n"
+            "• 180 - 6 месяцев\n"
+            "• 365 - 1 год",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_subscriptions")]
+            ])
+        )
+        return
+    
+    try:
+        days = int(callback.data.split("_")[2])
+        await state.update_data(days=days)
+        
+        data = await state.get_data()
+        action = data.get('action')
+        target_user_id = data.get('target_user_id')
+        tariff_id = data.get('tariff_id')
+        
+        user = await get_user_by_id(target_user_id)
+        
+        if action == "grant":
+            tariff_name = TARIFFS.get(tariff_id, {}).get('name', tariff_id)
+            await state.set_state(AdminStates.waiting_for_confirm_grant)
+            
+            await callback.message.edit_text(
+                f"📋 ПОДТВЕРЖДЕНИЕ ВЫДАЧИ ПОДПИСКИ\n\n"
+                f"👤 Пользователь: {user.get('first_name', 'N/A')} (@{user.get('username', 'N/A')})\n"
+                f"🆔 ID: {target_user_id}\n"
+                f"💎 Тариф: {tariff_name}\n"
+                f"📅 Срок: {days} дней\n"
+                f"💰 Стоимость: ${TARIFFS.get(tariff_id, {}).get('price', 0)}/месяц\n\n"
+                f"📍 После подтверждения:\n"
+                f"• Пользователь получит уведомление\n"
+                f"• Подписка будет активирована\n"
+                f"• Тариф будет обновлен\n\n"
+                f"Выдать подписку?",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="✅ Да, выдать", callback_data="admin_confirm_grant"),
+                        InlineKeyboardButton(text="❌ Нет, отмена", callback_data="admin_subscriptions")
+                    ]
+                ])
+            )
+        elif action == "extend":
+            subscription_info = await get_user_subscription_info(target_user_id)
+            current_tariff = user.get('tariff', 'mini')
+            tariff_name = TARIFFS.get(current_tariff, {}).get('name', current_tariff)
+            
+            await state.set_state(AdminStates.waiting_for_confirm_extend)
+            
+            expires_text = "Нет подписки"
+            new_expires = None
+            
+            if subscription_info['expires']:
+                expires_date = subscription_info['expires']
+                if expires_date >= datetime.now(MOSCOW_TZ).date():
+                    new_expires = expires_date + timedelta(days=days)
+                else:
+                    new_expires = datetime.now(MOSCOW_TZ).date() + timedelta(days=days)
+                expires_text = expires_date.strftime('%d.%m.%Y')
+            else:
+                new_expires = datetime.now(MOSCOW_TZ).date() + timedelta(days=days)
+            
+            await callback.message.edit_text(
+                f"📋 ПОДТВЕРЖДЕНИЕ ПРОДЛЕНИЯ ПОДПИСКИ\n\n"
+                f"👤 Пользователь: {user.get('first_name', 'N/A')} (@{user.get('username', 'N/A')})\n"
+                f"🆔 ID: {target_user_id}\n"
+                f"💎 Тариф: {tariff_name}\n"
+                f"📅 Текущая подписка до: {expires_text}\n"
+                f"📅 Новый срок: {days} дней\n"
+                f"📅 Новая дата окончания: {new_expires.strftime('%d.%m.%Y') if new_expires else 'N/A'}\n\n"
+                f"📍 После подтверждения:\n"
+                f"• Пользователь получит уведомление\n"
+                f"• Подписка будет продлена\n"
+                f"• Счетчик дней увеличится\n\n"
+                f"Продлить подписку?",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="✅ Да, продлить", callback_data="admin_confirm_extend"),
+                        InlineKeyboardButton(text="❌ Нет, отмена", callback_data="admin_subscriptions")
+                    ]
+                ])
+            )
+        
+    except ValueError:
+        await callback.answer("❌ Ошибка в количестве дней", show_alert=True)
+
+@router.message(AdminStates.waiting_for_days_selection)
+async def admin_process_custom_days(message: Message, state: FSMContext):
+    """Обработка пользовательского количества дней"""
+    try:
+        days = int(message.text.strip())
+        if days < 1 or days > 365:
+            await message.answer(
+                "❌ Количество дней должно быть от 1 до 365!\n\n"
+                "Введите количество дней еще раз:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_subscriptions")]
+                ])
+            )
+            return
+        
+        await state.update_data(days=days)
+        
+        data = await state.get_data()
+        action = data.get('action')
+        target_user_id = data.get('target_user_id')
+        tariff_id = data.get('tariff_id')
+        
+        user = await get_user_by_id(target_user_id)
+        
+        if action == "grant":
+            tariff_name = TARIFFS.get(tariff_id, {}).get('name', tariff_id)
+            await state.set_state(AdminStates.waiting_for_confirm_grant)
+            
+            await message.answer(
+                f"📋 ПОДТВЕРЖДЕНИЕ ВЫДАЧИ ПОДПИСКИ\n\n"
+                f"👤 Пользователь: {user.get('first_name', 'N/A')} (@{user.get('username', 'N/A')})\n"
+                f"🆔 ID: {target_user_id}\n"
+                f"💎 Тариф: {tariff_name}\n"
+                f"📅 Срок: {days} дней\n"
+                f"💰 Стоимость: ${TARIFFS.get(tariff_id, {}).get('price', 0)}/месяц\n\n"
+                f"📍 После подтверждения:\n"
+                f"• Пользователь получит уведомление\n"
+                f"• Подписка будет активирована\n"
+                f"• Тариф будет обновлен\n\n"
+                f"Выдать подписку?",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="✅ Да, выдать", callback_data="admin_confirm_grant"),
+                        InlineKeyboardButton(text="❌ Нет, отмена", callback_data="admin_subscriptions")
+                    ]
+                ])
+            )
+        elif action == "extend":
+            subscription_info = await get_user_subscription_info(target_user_id)
+            current_tariff = user.get('tariff', 'mini')
+            tariff_name = TARIFFS.get(current_tariff, {}).get('name', current_tariff)
+            
+            await state.set_state(AdminStates.waiting_for_confirm_extend)
+            
+            expires_text = "Нет подписки"
+            new_expires = None
+            
+            if subscription_info['expires']:
+                expires_date = subscription_info['expires']
+                if expires_date >= datetime.now(MOSCOW_TZ).date():
+                    new_expires = expires_date + timedelta(days=days)
+                else:
+                    new_expires = datetime.now(MOSCOW_TZ).date() + timedelta(days=days)
+                expires_text = expires_date.strftime('%d.%m.%Y')
+            else:
+                new_expires = datetime.now(MOSCOW_TZ).date() + timedelta(days=days)
+            
+            await message.answer(
+                f"📋 ПОДТВЕРЖДЕНИЕ ПРОДЛЕНИЯ ПОДПИСКИ\n\n"
+                f"👤 Пользователь: {user.get('first_name', 'N/A')} (@{user.get('username', 'N/A')})\n"
+                f"🆔 ID: {target_user_id}\n"
+                f"💎 Тариф: {tariff_name}\n"
+                f"📅 Текущая подписка до: {expires_text}\n"
+                f"📅 Новый срок: {days} дней\n"
+                f"📅 Новая дата окончания: {new_expires.strftime('%d.%m.%Y') if new_expires else 'N/A'}\n\n"
+                f"📍 После подтверждения:\n"
+                f"• Пользователь получит уведомление\n"
+                f"• Подписка будет продлена\n"
+                f"• Счетчик дней увеличится\n\n"
+                f"Продлить подписку?",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="✅ Да, продлить", callback_data="admin_confirm_extend"),
+                        InlineKeyboardButton(text="❌ Нет, отмена", callback_data="admin_subscriptions")
+                    ]
+                ])
+            )
+        
+    except ValueError:
+        await message.answer(
+            "❌ Введите число!\n\nПример: 30, 90, 180",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_subscriptions")]
+            ])
+        )
+
+@router.callback_query(F.data == "admin_confirm_grant")
+async def admin_confirm_grant(callback: CallbackQuery, state: FSMContext):
+    """Подтверждение выдачи подписки"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    data = await state.get_data()
+    target_user_id = data.get('target_user_id')
+    tariff_id = data.get('tariff_id')
+    days = data.get('days')
+    
+    # Обновляем подписку пользователя
+    success = await update_user_subscription(target_user_id, tariff_id, days)
+    
+    if success:
+        # Получаем информацию о пользователе
+        user = await get_user_by_id(target_user_id)
+        tariff_name = TARIFFS.get(tariff_id, {}).get('name', tariff_id)
+        
+        # Отправляем уведомление пользователю
+        try:
+            await bot.send_message(
+                target_user_id,
+                f"🎉 ВАМ ВЫДАНА ПОДПИСКА!\n\n"
+                f"💎 Тариф: {tariff_name}\n"
+                f"📅 Срок: {days} дней\n"
+                f"🆔 Ваш ID: {target_user_id}\n\n"
+                f"📍 Подписка активна с сегодняшнего дня.\n"
+                f"Вы можете проверить статус в разделе 'Моя статистика'.\n\n"
+                f"Спасибо за использование KOLES-TECH! 🤖"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление пользователю {target_user_id}: {e}")
+        
+        # Создаем запись о заказе
+        await execute_query('''
+            INSERT INTO tariff_orders (user_id, tariff, status, admin_notes)
+            VALUES ($1, $2, 'granted_by_admin', $3)
+        ''', target_user_id, tariff_id, f"Выдано админом {user_id} на {days} дней")
+        
+        await callback.message.edit_text(
+            f"✅ Подписка успешно выдана!\n\n"
+            f"📋 Детали:\n"
+            f"👤 Пользователь: {user.get('first_name', 'N/A')} (@{user.get('username', 'N/A')})\n"
+            f"🆔 ID: {target_user_id}\n"
+            f"💎 Тариф: {tariff_name}\n"
+            f"📅 Срок: {days} дней\n"
+            f"👑 Выдал: админ {user_id}\n"
+            f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Управление подписками", callback_data="admin_subscriptions")],
+                [InlineKeyboardButton(text="⬅️ Админ панель", callback_data="admin_panel")]
+            ])
+        )
+    else:
+        await callback.message.edit_text(
+            "❌ Ошибка при выдаче подписки!\n\n"
+            "Попробуйте позже или обратитесь к разработчику.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Управление подписками", callback_data="admin_subscriptions")],
+                [InlineKeyboardButton(text="⬅️ Админ панель", callback_data="admin_panel")]
+            ])
+        )
+    
+    await state.clear()
+
+@router.callback_query(F.data == "admin_confirm_extend")
+async def admin_confirm_extend(callback: CallbackQuery, state: FSMContext):
+    """Подтверждение продления подписки"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    data = await state.get_data()
+    target_user_id = data.get('target_user_id')
+    days = data.get('days')
+    
+    # Получаем текущий тариф пользователя
+    user = await get_user_by_id(target_user_id)
+    current_tariff = user.get('tariff', 'mini')
+    
+    # Обновляем подписку пользователя
+    success = await update_user_subscription(target_user_id, current_tariff, days)
+    
+    if success:
+        tariff_name = TARIFFS.get(current_tariff, {}).get('name', current_tariff)
+        
+        # Получаем обновленную информацию о подписке
+        subscription_info = await get_user_subscription_info(target_user_id)
+        
+        # Отправляем уведомление пользователю
+        try:
+            await bot.send_message(
+                target_user_id,
+                f"🎉 ВАША ПОДПИСКА ПРОДЛЕНА!\n\n"
+                f"💎 Тариф: {tariff_name}\n"
+                f"📅 Добавлено дней: {days}\n"
+                f"📅 Новая дата окончания: {subscription_info['expires'].strftime('%d.%m.%Y') if subscription_info['expires'] else 'N/A'}\n"
+                f"🆔 Ваш ID: {target_user_id}\n\n"
+                f"📍 Подписка успешно продлена.\n"
+                f"Вы можете проверить статус в разделе 'Моя статистика'.\n\n"
+                f"Спасибо за использование KOLES-TECH! 🤖"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление пользователю {target_user_id}: {e}")
+        
+        # Создаем запись о заказе
+        await execute_query('''
+            INSERT INTO tariff_orders (user_id, tariff, status, admin_notes)
+            VALUES ($1, $2, 'extended_by_admin', $3)
+        ''', target_user_id, current_tariff, f"Продлено админом {user_id} на {days} дней")
+        
+        expires_text = subscription_info['expires'].strftime('%d.%m.%Y') if subscription_info['expires'] else 'N/A'
+        
+        await callback.message.edit_text(
+            f"✅ Подписка успешно продлена!\n\n"
+            f"📋 Детали:\n"
+            f"👤 Пользователь: {user.get('first_name', 'N/A')} (@{user.get('username', 'N/A')})\n"
+            f"🆔 ID: {target_user_id}\n"
+            f"💎 Тариф: {tariff_name}\n"
+            f"📅 Добавлено дней: {days}\n"
+            f"📅 Новая дата окончания: {expires_text}\n"
+            f"👑 Продлил: админ {user_id}\n"
+            f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Управление подписками", callback_data="admin_subscriptions")],
+                [InlineKeyboardButton(text="⬅️ Админ панель", callback_data="admin_panel")]
+            ])
+        )
+    else:
+        await callback.message.edit_text(
+            "❌ Ошибка при продлении подписки!\n\n"
+            "Попробуйте позже или обратитесь к разработчику.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Управление подписками", callback_data="admin_subscriptions")],
+                [InlineKeyboardButton(text="⬅️ Админ панель", callback_data="admin_panel")]
+            ])
+        )
+    
+    await state.clear()
+
+@router.callback_query(F.data == "admin_list_subscriptions")
+async def admin_list_subscriptions(callback: CallbackQuery):
+    """Список активных подписок"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    # Получаем активные подписки
+    subscriptions = await execute_query('''
+        SELECT id, username, first_name, tariff, tariff_expires, subscription_days
+        FROM users 
+        WHERE tariff_expires >= CURRENT_DATE
+        ORDER BY tariff_expires ASC
+    ''')
+    
+    if not subscriptions:
+        await callback.message.edit_text(
+            "📭 Нет активных подписок",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_subscriptions")]
+            ])
+        )
+        return
+    
+    subscriptions_text = "📋 АКТИВНЫЕ ПОДПИСКИ\n\n"
+    
+    for i, sub in enumerate(subscriptions, 1):
+        expires_date = sub['tariff_expires']
+        days_left = (expires_date - datetime.now(MOSCOW_TZ).date()).days
+        tariff_name = TARIFFS.get(sub['tariff'], {}).get('name', sub['tariff'])
+        
+        subscriptions_text += (
+            f"{i}. {sub['first_name']} (@{sub['username'] or 'нет'})\n"
+            f"   🆔 ID: {sub['id']}\n"
+            f"   💎 Тариф: {tariff_name}\n"
+            f"   📅 До: {expires_date.strftime('%d.%m.%Y')}\n"
+            f"   ⏳ Осталось: {days_left} дней\n"
+            f"   📊 Всего дней: {sub['subscription_days']}\n\n"
+        )
+    
+    total_active = len(subscriptions)
+    total_days = sum(sub['subscription_days'] for sub in subscriptions)
+    
+    subscriptions_text += f"📊 Итого: {total_active} активных подписок, {total_days} дней всего"
+    
+    # Разбиваем длинное сообщение
+    if len(subscriptions_text) > 4000:
+        parts = split_message(subscriptions_text)
+        for i, part in enumerate(parts):
+            if i == 0:
+                await callback.message.edit_text(part)
+            else:
+                await callback.message.answer(part)
+    else:
+        await callback.message.edit_text(subscriptions_text)
+    
+    await callback.message.answer(
+        "👇 Выберите действие:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить список", callback_data="admin_list_subscriptions")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_subscriptions")]
         ])
     )
 
@@ -2876,6 +3594,37 @@ async def reset_daily_limits_task():
         
         # Сбрасываем AI лимиты
         ai_manager.reset_daily_limits()
+        
+        # Проверяем истекшие подписки
+        expired_subscriptions = await execute_query('''
+            SELECT id, first_name, username 
+            FROM users 
+            WHERE tariff_expires < CURRENT_DATE AND tariff != 'mini'
+        ''')
+        
+        for user in expired_subscriptions:
+            # Понижаем тариф до минимума
+            await execute_query('''
+                UPDATE users 
+                SET tariff = 'mini' 
+                WHERE id = $1 AND tariff != 'admin'
+            ''', user['id'])
+            
+            # Отправляем уведомление пользователю
+            try:
+                await bot.send_message(
+                    user['id'],
+                    f"⚠️ ВАША ПОДПИСКА ИСТЕКЛА\n\n"
+                    f"📅 Дата окончания подписки наступила.\n"
+                    f"💎 Ваш тариф изменен на Mini.\n\n"
+                    f"📍 Для продления подписки:\n"
+                    f"1. Перейдите в раздел 'Тарифы'\n"
+                    f"2. Выберите нужный тариф\n"
+                    f"3. Свяжитесь с администратором\n\n"
+                    f"💬 Контакт: @{ADMIN_CONTACT.replace('@', '')}"
+                )
+            except Exception:
+                pass
         
         logger.info("✅ Ежедневные лимиты сброшены")
     except Exception as e:
@@ -2977,6 +3726,23 @@ async def send_scheduled_post(channel_id: int, post_data: Dict, post_id: int):
             post_id
         )
         
+        # Получаем пользователя, который запланировал пост
+        post_info = await execute_query(
+            "SELECT user_id FROM scheduled_posts WHERE id = $1",
+            post_id
+        )
+        
+        if post_info and post_info[0]['user_id']:
+            try:
+                await bot.send_message(
+                    post_info[0]['user_id'],
+                    f"✅ Пост #{post_id} успешно опубликован!\n\n"
+                    f"📢 Канал: {channel_id}\n"
+                    f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
+                )
+            except Exception:
+                pass
+        
         logger.info(f"✅ Пост {post_id} отправлен в канал {channel_id}")
     except Exception as e:
         logger.error(f"❌ Ошибка отправки поста {post_id}: {e}")
@@ -2992,9 +3758,13 @@ async def send_scheduled_post(channel_id: int, post_data: Dict, post_id: int):
                 await bot.send_message(
                     post_info[0]['user_id'],
                     f"❌ Ошибка отправки запланированного поста #{post_id}!\n\n"
-                    f"Техническая информация: {str(e)[:200]}"
+                    f"Техническая информация: {str(e)[:200]}\n\n"
+                    f"📍 Проверьте:\n"
+                    f"• Права бота в канале\n"
+                    f"• Корректность контента\n"
+                    f"• Активность канала"
                 )
-            except:
+            except Exception:
                 pass
 
 async def restore_scheduled_posts():
@@ -3025,7 +3795,8 @@ async def restore_scheduled_posts():
                     send_scheduled_post,
                     trigger=DateTrigger(run_date=scheduled_time),
                     args=(post['channel_id'], post_data, post['id']),
-                    id=f"post_{post['id']}"
+                    id=f"post_{post['id']}",
+                    replace_existing=True
                 )
                 restored += 1
             except Exception as e:
@@ -3099,6 +3870,7 @@ async def on_startup():
                     f"🤖 AI сервисы: ВКЛЮЧЕНЫ\n"
                     f"🔑 Gemini ключей: {len(GEMINI_API_KEYS)}\n"
                     f"🔄 Система ротации ключей: АКТИВНА\n"
+                    f"💎 Система подписок: АКТИВНА\n"
                     f"🌐 Порт Railway: {PORT}\n"
                     f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}"
                 )
@@ -3112,6 +3884,7 @@ async def on_startup():
         
     except Exception as e:
         logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ: {e}")
+        traceback.print_exc()
         return False
 
 async def on_shutdown():
