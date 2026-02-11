@@ -59,8 +59,13 @@ async def execute_query(query: str, *args, database_url=None) -> Any:
                 result = await conn.fetch(query, *args)
                 return [dict(row) for row in result] if result else []
             else:
-                result = await conn.execute(query, *args)
-                return result
+                # Для INSERT/UPDATE/DELETE
+                result = await conn.fetch(query, *args)
+                if result:
+                    # Если есть RETURNING, возвращаем список словарей
+                    return [dict(row) for row in result]
+                # Если нет RETURNING, возвращаем строку статуса
+                return "OK"
         except Exception as e:
             logger.error(f"Ошибка запроса: {e}\nЗапрос: {query}")
             raise
@@ -563,7 +568,8 @@ async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, sc
         database_url=database_url
         )
         
-        post_id = result[0]['id'] if result else None
+        # result уже список словарей благодаря исправленному execute_query
+        post_id = result[0]['id'] if result and isinstance(result, list) and len(result) > 0 else None
         
         if post_id and moscow_tz:
             logger.info(f"✅ Пост сохранен в БД с ID: {post_id} на время: {scheduled_time.astimezone(moscow_tz).strftime('%d.%m.%Y %H:%M')} МСК")
