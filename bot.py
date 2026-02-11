@@ -88,7 +88,7 @@ if not GEMINI_API_KEYS:
         "AIzaSyCOY7hZcYBDv7QIuY5AmgDyNH5U4fs_iWo",
         "AIzaSyBLwd-hf6P8hZB5X5rVMccWxj4S3QrM1xM",
         "AIzaSyABkNUcsMT1BjWmh-6zC9-JczrTfz1oBqw",
-        "AIzaSyBlTxfNMdmgj4WsU-l8DPAwKb5KW8eF-JI""
+        "AIzaSyBlTxfNMdmgj4WsU-l8DPAwKb5KW8eF-JI"
     ]
 
 # Убираем пустые ключи
