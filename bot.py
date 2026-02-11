@@ -32,7 +32,7 @@ from database import (
 
 from ai_service import (
     AdvancedAISessionManager, generate_with_gemini_advanced,
-    COPYWRITER_PROMPT, IDEAS_PROMPT, TARIFFS
+    COPYWRITER_PROMPT, IDEAS_PROMPT, TARIFFS, init_ai_manager, get_ai_manager
 )
 
 from publisher import (
@@ -115,8 +115,9 @@ router = Router()
 dp.include_router(router)
 scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
 
-# Инициализируем AI менеджер
-ai_manager = AdvancedAISessionManager(GEMINI_API_KEYS, GEMINI_MODEL, ALTERNATIVE_MODELS, MOSCOW_TZ)
+# ========== ИНИЦИАЛИЗАЦИЯ AI МЕНЕДЖЕРА ==========
+# Создаем и инициализируем глобальный AI менеджер
+ai_manager = init_ai_manager(GEMINI_API_KEYS, GEMINI_MODEL, ALTERNATIVE_MODELS, MOSCOW_TZ)
 
 # ========== STATES ==========
 class AIStates(StatesGroup):
@@ -248,11 +249,11 @@ async def cmd_start(message: Message):
                 first_name = EXCLUDED.first_name,
                 is_admin = EXCLUDED.is_admin,
                 last_seen = NOW()
-        ''', user_id, username, first_name, is_admin, 'admin' if is_admin else 'mini')
+        ''', user_id, username, first_name, is_admin, 'admin' if is_admin else 'mini', database_url=DATABASE_URL)
     except Exception as e:
         logger.error(f"Ошибка регистрации пользователя {user_id}: {e}")
     
-    current_tariff = await get_user_tariff(user_id)
+    current_tariff = await get_user_tariff(user_id, DATABASE_URL)
     tariff_info = TARIFFS.get(current_tariff, TARIFFS['mini'])
     
     welcome_text = (
@@ -306,7 +307,7 @@ async def cmd_help(message: Message):
 async def ai_services_menu(callback: CallbackQuery):
     """Меню AI сервисов"""
     user_id = callback.from_user.id
-    tariff = await get_user_tariff(user_id)
+    tariff = await get_user_tariff(user_id, DATABASE_URL)
     tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
     
     welcome_text = (
@@ -341,11 +342,14 @@ async def start_copywriter(callback: CallbackQuery, state: FSMContext):
     """Запуск AI копирайтера"""
     user_id = callback.from_user.id
     
+    # Получаем AI менеджер
+    ai_manager = get_ai_manager()
+    
     # Проверка лимитов
-    can_use, message, tariff_info = await check_ai_limits(user_id, 'copy')
+    can_use, message_text, tariff_info = await check_ai_limits(user_id, 'copy', DATABASE_URL, ai_manager)
     if not can_use:
         await callback.message.edit_text(
-            message,
+            message_text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ Назад в AI", callback_data="ai_services")]
             ])
@@ -460,6 +464,7 @@ async def process_style(callback: CallbackQuery, state: FSMContext):
     await state.update_data(style=style_name)
     await state.set_state(AIStates.waiting_for_word_count)
     
+    ai_manager = get_ai_manager()
     current_word_count = ai_manager.get_word_count(callback.from_user.id)
     
     await callback.message.edit_text(
@@ -510,6 +515,8 @@ async def process_word_count(callback: CallbackQuery, state: FSMContext):
     try:
         word_count = int(callback.data.split("_")[1])
         user_id = callback.from_user.id
+        
+        ai_manager = get_ai_manager()
         
         # Устанавливаем количество слов
         ai_manager.set_word_count(user_id, word_count)
@@ -583,7 +590,8 @@ async def process_word_count(callback: CallbackQuery, state: FSMContext):
             api_key_index=session.get('current_key_index', 0),
             model_name=ai_manager.get_current_model(),
             prompt_length=len(prompt),
-            response_length=len(generated_text)
+            response_length=len(generated_text),
+            database_url=DATABASE_URL
         )
         
         # Форматируем результат
@@ -600,7 +608,7 @@ async def process_word_count(callback: CallbackQuery, state: FSMContext):
             f"📝 Результат:\n\n"
             f"{generated_text}\n\n"
             f"📈 Статистика:\n"
-            f"• Использовано сегодня: {session['copies_used']}/{TARIFFS.get(await get_user_tariff(user_id), TARIFFS['mini'])['ai_copies_limit']}"
+            f"• Использовано сегодня: {session['copies_used']}/{TARIFFS.get(await get_user_tariff(user_id, DATABASE_URL), TARIFFS['mini'])['ai_copies_limit']}"
         )
         
         # Отправляем результат (разбиваем если нужно)
@@ -656,6 +664,7 @@ async def process_custom_word_count(message: Message, state: FSMContext):
             return
         
         user_id = message.from_user.id
+        ai_manager = get_ai_manager()
         ai_manager.set_word_count(user_id, word_count)
         
         data = await state.get_data()
@@ -721,7 +730,8 @@ async def process_custom_word_count(message: Message, state: FSMContext):
             api_key_index=session.get('current_key_index', 0),
             model_name=ai_manager.get_current_model(),
             prompt_length=len(prompt),
-            response_length=len(generated_text)
+            response_length=len(generated_text),
+            database_url=DATABASE_URL
         )
         
         # Форматируем результат
@@ -738,7 +748,7 @@ async def process_custom_word_count(message: Message, state: FSMContext):
             f"📝 Результат:\n\n"
             f"{generated_text}\n\n"
             f"📈 Статистика:\n"
-            f"• Использовано сегодня: {session['copies_used']}/{TARIFFS.get(await get_user_tariff(user_id), TARIFFS['mini'])['ai_copies_limit']}"
+            f"• Использовано сегодня: {session['copies_used']}/{TARIFFS.get(await get_user_tariff(user_id, DATABASE_URL), TARIFFS['mini'])['ai_copies_limit']}"
         )
         
         # Отправляем результат (разбиваем если нужно)
@@ -784,11 +794,13 @@ async def start_ideas_generator(callback: CallbackQuery, state: FSMContext):
     """Запуск генератора идей"""
     user_id = callback.from_user.id
     
+    ai_manager = get_ai_manager()
+    
     # Проверка лимитов
-    can_use, message, tariff_info = await check_ai_limits(user_id, 'ideas')
+    can_use, message_text, tariff_info = await check_ai_limits(user_id, 'ideas', DATABASE_URL, ai_manager)
     if not can_use:
         await callback.message.edit_text(
-            message,
+            message_text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ Назад в AI", callback_data="ai_services")]
             ])
@@ -863,6 +875,8 @@ async def generate_ideas(callback: CallbackQuery, state: FSMContext):
     if count > 20:
         count = 20
     
+    ai_manager = get_ai_manager()
+    
     # Показываем индикатор
     await callback.message.edit_text(
         f"💡 Генерация {count} идей по теме:\n"
@@ -924,7 +938,8 @@ async def generate_ideas(callback: CallbackQuery, state: FSMContext):
         api_key_index=session.get('current_key_index', 0),
         model_name=ai_manager.get_current_model(),
         prompt_length=len(prompt),
-        response_length=len(generated_ideas)
+        response_length=len(generated_ideas),
+        database_url=DATABASE_URL
     )
     
     result_text = (
@@ -933,7 +948,7 @@ async def generate_ideas(callback: CallbackQuery, state: FSMContext):
         f"💡 Идеи:\n\n" +
         "\n".join(formatted_ideas) +
         f"\n\n📊 Статистика:\n"
-        f"• Использовано сегодня: {session['ideas_used']}/{TARIFFS.get(await get_user_tariff(callback.from_user.id), TARIFFS['mini'])['ai_ideas_limit']}"
+        f"• Использовано сегодня: {session['ideas_used']}/{TARIFFS.get(await get_user_tariff(callback.from_user.id, DATABASE_URL), TARIFFS['mini'])['ai_ideas_limit']}"
     )
     
     # Разбиваем длинные сообщения
@@ -962,9 +977,10 @@ async def generate_ideas(callback: CallbackQuery, state: FSMContext):
 async def show_ai_limits(callback: CallbackQuery):
     """Показывает лимиты AI"""
     user_id = callback.from_user.id
-    tariff = await get_user_tariff(user_id)
+    tariff = await get_user_tariff(user_id, DATABASE_URL)
     tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
     
+    ai_manager = get_ai_manager()
     session = ai_manager.get_session(user_id)
     
     # Рассчитываем оставшееся время до сброса
@@ -1043,6 +1059,7 @@ async def cancel_ai(callback: CallbackQuery, state: FSMContext):
     """Отмена AI операций"""
     await state.clear()
     user_id = callback.from_user.id
+    is_admin = user_id == ADMIN_ID
     
     await callback.message.edit_text(
         "❌ Операция отменена",
@@ -1058,8 +1075,8 @@ async def schedule_post_start(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     
     # Проверяем лимиты постов
-    posts_today = await get_user_posts_today(user_id)
-    channels_limit, posts_limit, _, _ = await get_tariff_limits(user_id)
+    posts_today = await get_user_posts_today(user_id, DATABASE_URL)
+    channels_limit, posts_limit, _, _ = await get_tariff_limits(user_id, DATABASE_URL)
     
     if posts_today >= posts_limit:
         now = datetime.now(MOSCOW_TZ)
@@ -1073,7 +1090,7 @@ async def schedule_post_start(callback: CallbackQuery, state: FSMContext):
             f"❌ Достигнут дневной лимит постов!\n\n"
             f"📊 Статистика:\n"
             f"• Отправлено сегодня: {posts_today}/{posts_limit}\n"
-            f"• Доступно каналов: {await get_user_channels_count(user_id)}/{channels_limit}\n\n"
+            f"• Доступно каналов: {await get_user_channels_count(user_id, DATABASE_URL)}/{channels_limit}\n\n"
             f"⏳ Обновление через: {hours}ч {minutes}м",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
@@ -1082,7 +1099,7 @@ async def schedule_post_start(callback: CallbackQuery, state: FSMContext):
         return
     
     # Получаем каналы пользователя
-    channels = await get_user_channels(user_id)
+    channels = await get_user_channels(user_id, DATABASE_URL)
     
     if not channels:
         await callback.message.edit_text(
@@ -1116,7 +1133,7 @@ async def select_channel(callback: CallbackQuery, state: FSMContext):
     channel_id = int(callback.data.split("_")[1])
     
     # Получаем название канала
-    channels = await get_user_channels(callback.from_user.id)
+    channels = await get_user_channels(callback.from_user.id, DATABASE_URL)
     channel_name = "Неизвестный канал"
     for channel in channels:
         if channel['channel_id'] == channel_id:
@@ -1419,7 +1436,7 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
     scheduled_datetime = data.get('scheduled_datetime')
     
     # Сохраняем пост в базу данных
-    post_id = await save_scheduled_post(user_id, channel_id, post_data, scheduled_datetime, MOSCOW_TZ)
+    post_id = await save_scheduled_post(user_id, channel_id, post_data, scheduled_datetime, MOSCOW_TZ, DATABASE_URL)
     
     if not post_id:
         await callback.message.edit_text(
@@ -1433,7 +1450,7 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
         return
     
     # Добавляем задачу в планировщик
-    scheduled_success = await schedule_post_in_scheduler(post_id, scheduled_datetime, scheduler, bot, send_scheduled_post, MOSCOW_TZ)
+    scheduled_success = await schedule_post_in_scheduler(post_id, scheduled_datetime, scheduler, bot, send_scheduled_post, MOSCOW_TZ, DATABASE_URL)
     
     if not scheduled_success:
         await callback.message.edit_text(
@@ -1448,7 +1465,7 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
         return
     
     # Увеличиваем счетчик постов пользователя
-    await increment_user_posts(user_id)
+    await increment_user_posts(user_id, DATABASE_URL)
     
     await callback.message.edit_text(
         f"✅ Пост успешно запланирован!\n\n"
@@ -1483,7 +1500,8 @@ async def cancel_post(callback: CallbackQuery, state: FSMContext):
 async def show_my_stats(callback: CallbackQuery):
     """Показывает статистику пользователя"""
     user_id = callback.from_user.id
-    stats = await get_user_stats(user_id)
+    ai_manager = get_ai_manager()
+    stats = await get_user_stats(user_id, DATABASE_URL, ai_manager)
     
     system_stats = ai_manager.get_system_stats()
     available_keys = system_stats['available_keys']
@@ -1491,9 +1509,9 @@ async def show_my_stats(callback: CallbackQuery):
     
     # Форматируем дату окончания подписки
     expires_info = ""
-    if stats['subscription_expires']:
+    if stats.get('subscription_expires'):
         expires_date = stats['subscription_expires']
-        if stats['subscription_expired']:
+        if stats.get('subscription_expired'):
             expires_info = f"❌ Подписка истекла: {expires_date.strftime('%d.%m.%Y')}"
         else:
             expires_info = f"✅ Подписка активна до: {expires_date.strftime('%d.%m.%Y')} (осталось {stats['subscription_days_left']} дней)"
@@ -1502,17 +1520,17 @@ async def show_my_stats(callback: CallbackQuery):
     
     stats_text = (
         f"📊 Ваша статистика:\n\n"
-        f"💎 Тариф: {stats['tariff']}\n"
+        f"💎 Тариф: {stats.get('tariff', 'Mini')}\n"
         f"{expires_info}\n\n"
         f"📅 Посты сегодня:\n"
-        f"• Отправлено: {stats['posts_today']}/{stats['posts_limit']}\n"
-        f"• Запланировано: {stats['scheduled_posts']}\n\n"
+        f"• Отправлено: {stats.get('posts_today', 0)}/{stats.get('posts_limit', 2)}\n"
+        f"• Запланировано: {stats.get('scheduled_posts', 0)}\n\n"
         f"📢 Каналы:\n"
-        f"• Подключено: {stats['channels_count']}/{stats['channels_limit']}\n\n"
+        f"• Подключено: {stats.get('channels_count', 0)}/{stats.get('channels_limit', 1)}\n\n"
         f"🤖 AI-сервисы:\n"
-        f"• Копирайтинг: {stats['ai_copies_used']}/{stats['ai_copies_limit']}\n"
-        f"• Идеи: {stats['ai_ideas_used']}/{stats['ai_ideas_limit']}\n"
-        f"• Всего AI запросов: {stats['total_ai_requests']}\n\n"
+        f"• Копирайтинг: {stats.get('ai_copies_used', 0)}/{stats.get('ai_copies_limit', 1)}\n"
+        f"• Идеи: {stats.get('ai_ideas_used', 0)}/{stats.get('ai_ideas_limit', 10)}\n"
+        f"• Всего AI запросов: {stats.get('total_ai_requests', 0)}\n\n"
         f"🔑 Система ключей:\n"
         f"• Доступных ключей: {available_keys} из {total_keys}\n\n"
         f"📍 Время по Москве: {datetime.now(MOSCOW_TZ).strftime('%H:%M')}"
@@ -1528,9 +1546,9 @@ async def show_my_stats(callback: CallbackQuery):
 async def show_my_channels(callback: CallbackQuery):
     """Показывает каналы пользователя"""
     user_id = callback.from_user.id
-    channels = await get_user_channels(user_id)
+    channels = await get_user_channels(user_id, DATABASE_URL)
     channels_count = len(channels)
-    channels_limit, _, _, _ = await get_tariff_limits(user_id)
+    channels_limit, _, _, _ = await get_tariff_limits(user_id, DATABASE_URL)
     
     if not channels:
         channels_text = "📭 У вас нет подключенных каналов"
@@ -1559,7 +1577,7 @@ async def show_my_channels(callback: CallbackQuery):
         ])
     )
 
-@router.message(F.forward_from_chat | F.forward_from_chat)
+@router.message(F.forward_from_chat)
 async def handle_forwarded_channel_message(message: Message):
     """Обработка пересланных сообщений из канала для добавления канала"""
     user_id = message.from_user.id
@@ -1569,8 +1587,8 @@ async def handle_forwarded_channel_message(message: Message):
         channel = message.forward_from_chat
         
         # Проверяем лимит каналов
-        channels_count = await get_user_channels_count(user_id)
-        channels_limit, _, _, _ = await get_tariff_limits(user_id)
+        channels_count = await get_user_channels_count(user_id, DATABASE_URL)
+        channels_limit, _, _, _ = await get_tariff_limits(user_id, DATABASE_URL)
         
         if channels_count >= channels_limit:
             await message.answer(
@@ -1587,7 +1605,7 @@ async def handle_forwarded_channel_message(message: Message):
             return
         
         # Добавляем канал
-        success = await add_user_channel(user_id, channel.id, channel.title or f"Канал {channel.id}")
+        success = await add_user_channel(user_id, channel.id, channel.title or f"Канал {channel.id}", DATABASE_URL)
         
         if success:
             await message.answer(
@@ -1622,7 +1640,7 @@ async def handle_forwarded_channel_message(message: Message):
 async def show_tariffs(callback: CallbackQuery):
     """Показывает тарифы"""
     user_id = callback.from_user.id
-    user_tariff = await get_user_tariff(user_id)
+    user_tariff = await get_user_tariff(user_id, DATABASE_URL)
     
     tariffs_text = "💎 ТАРИФЫ KOLES-TECH\n\n"
     
@@ -1662,7 +1680,7 @@ async def select_tariff(callback: CallbackQuery):
     """Выбор тарифа"""
     tariff_id = callback.data.split("_")[1]
     user_id = callback.from_user.id
-    user_tariff = await get_user_tariff(user_id)
+    user_tariff = await get_user_tariff(user_id, DATABASE_URL)
     
     if tariff_id == user_tariff:
         await callback.answer("❌ Это ваш текущий тариф!", show_alert=True)
@@ -1674,7 +1692,7 @@ async def select_tariff(callback: CallbackQuery):
         return
     
     # Создаем заказ
-    success = await create_tariff_order(user_id, tariff_id)
+    success = await create_tariff_order(user_id, tariff_id, DATABASE_URL)
     
     if success:
         await callback.message.edit_text(
@@ -1739,18 +1757,19 @@ async def admin_panel(callback: CallbackQuery):
         return
     
     # Получаем статистику
-    total_users = await execute_query("SELECT COUNT(*) as count FROM users")
+    total_users = await execute_query("SELECT COUNT(*) as count FROM users", database_url=DATABASE_URL)
     total_users = total_users[0]['count'] if total_users else 0
     
-    active_users = await execute_query("SELECT COUNT(*) as count FROM users WHERE last_seen > NOW() - INTERVAL '7 days'")
+    active_users = await execute_query("SELECT COUNT(*) as count FROM users WHERE last_seen > NOW() - INTERVAL '7 days'", database_url=DATABASE_URL)
     active_users = active_users[0]['count'] if active_users else 0
     
-    pending_orders = await execute_query("SELECT COUNT(*) as count FROM tariff_orders WHERE status = 'pending'")
+    pending_orders = await execute_query("SELECT COUNT(*) as count FROM tariff_orders WHERE status = 'pending'", database_url=DATABASE_URL)
     pending_orders = pending_orders[0]['count'] if pending_orders else 0
     
-    active_subscriptions = await execute_query("SELECT COUNT(*) as count FROM users WHERE tariff_expires >= CURRENT_DATE")
+    active_subscriptions = await execute_query("SELECT COUNT(*) as count FROM users WHERE tariff_expires >= CURRENT_DATE", database_url=DATABASE_URL)
     active_subscriptions = active_subscriptions[0]['count'] if active_subscriptions else 0
     
+    ai_manager = get_ai_manager()
     system_stats = ai_manager.get_system_stats()
     
     stats_text = (
@@ -1851,7 +1870,7 @@ async def admin_process_user_id(message: Message, state: FSMContext):
         action = data.get('action')
         
         # Проверяем существование пользователя
-        user = await get_user_by_id(target_user_id)
+        user = await get_user_by_id(target_user_id, DATABASE_URL)
         if not user:
             await message.answer(
                 "❌ Пользователь с таким ID не найден!\n\n"
@@ -1883,9 +1902,9 @@ async def admin_process_user_id(message: Message, state: FSMContext):
             )
         elif action == "extend":
             # Получаем информацию о текущей подписке
-            subscription_info = await get_user_subscription_info(target_user_id)
+            subscription_info = await get_user_subscription_info(target_user_id, DATABASE_URL)
             
-            if subscription_info['expired'] and not subscription_info['expires']:
+            if subscription_info.get('expired') and not subscription_info.get('expires'):
                 await message.answer(
                     f"❌ У пользователя нет активной подписки!\n\n"
                     f"👤 Пользователь: {user.get('first_name', 'N/A')} (@{user.get('username', 'N/A')})\n"
@@ -1901,12 +1920,13 @@ async def admin_process_user_id(message: Message, state: FSMContext):
             await state.set_state(AdminStates.waiting_for_days_selection)
             
             expires_text = "Нет подписки"
-            if subscription_info['expires']:
-                expires_text = subscription_info['expires'].strftime('%d.%m.%Y')
-                if subscription_info['expired']:
+            if subscription_info.get('expires'):
+                expires_date = subscription_info['expires']
+                expires_text = expires_date.strftime('%d.%m.%Y')
+                if subscription_info.get('expired'):
                     expires_text += " (истекла)"
                 else:
-                    expires_text += f" (осталось {subscription_info['days_left']} дней)"
+                    expires_text += f" (осталось {subscription_info.get('days_left', 0)} дней)"
             
             await message.answer(
                 f"✅ Пользователь найден:\n"
@@ -1952,7 +1972,7 @@ async def admin_process_tariff_selection(callback: CallbackQuery, state: FSMCont
     await state.update_data(tariff_id=tariff_id)
     
     # Получаем информацию о пользователе
-    user = await get_user_by_id(target_user_id)
+    user = await get_user_by_id(target_user_id, DATABASE_URL)
     
     await state.set_state(AdminStates.waiting_for_days_selection)
     
@@ -2004,7 +2024,7 @@ async def admin_process_days_selection(callback: CallbackQuery, state: FSMContex
         target_user_id = data.get('target_user_id')
         tariff_id = data.get('tariff_id')
         
-        user = await get_user_by_id(target_user_id)
+        user = await get_user_by_id(target_user_id, DATABASE_URL)
         
         if action == "grant":
             tariff_name = TARIFFS.get(tariff_id, {}).get('name', tariff_id)
@@ -2030,7 +2050,7 @@ async def admin_process_days_selection(callback: CallbackQuery, state: FSMContex
                 ])
             )
         elif action == "extend":
-            subscription_info = await get_user_subscription_info(target_user_id)
+            subscription_info = await get_user_subscription_info(target_user_id, DATABASE_URL)
             current_tariff = user.get('tariff', 'mini')
             tariff_name = TARIFFS.get(current_tariff, {}).get('name', current_tariff)
             
@@ -2039,7 +2059,7 @@ async def admin_process_days_selection(callback: CallbackQuery, state: FSMContex
             expires_text = "Нет подписки"
             new_expires = None
             
-            if subscription_info['expires']:
+            if subscription_info.get('expires'):
                 expires_date = subscription_info['expires']
                 if expires_date >= datetime.now(MOSCOW_TZ).date():
                     new_expires = expires_date + timedelta(days=days)
@@ -2095,7 +2115,7 @@ async def admin_process_custom_days(message: Message, state: FSMContext):
         target_user_id = data.get('target_user_id')
         tariff_id = data.get('tariff_id')
         
-        user = await get_user_by_id(target_user_id)
+        user = await get_user_by_id(target_user_id, DATABASE_URL)
         
         if action == "grant":
             tariff_name = TARIFFS.get(tariff_id, {}).get('name', tariff_id)
@@ -2121,7 +2141,7 @@ async def admin_process_custom_days(message: Message, state: FSMContext):
                 ])
             )
         elif action == "extend":
-            subscription_info = await get_user_subscription_info(target_user_id)
+            subscription_info = await get_user_subscription_info(target_user_id, DATABASE_URL)
             current_tariff = user.get('tariff', 'mini')
             tariff_name = TARIFFS.get(current_tariff, {}).get('name', current_tariff)
             
@@ -2130,7 +2150,7 @@ async def admin_process_custom_days(message: Message, state: FSMContext):
             expires_text = "Нет подписки"
             new_expires = None
             
-            if subscription_info['expires']:
+            if subscription_info.get('expires'):
                 expires_date = subscription_info['expires']
                 if expires_date >= datetime.now(MOSCOW_TZ).date():
                     new_expires = expires_date + timedelta(days=days)
@@ -2184,11 +2204,11 @@ async def admin_confirm_grant(callback: CallbackQuery, state: FSMContext):
     days = data.get('days')
     
     # Обновляем подписку пользователя
-    success = await update_user_subscription(target_user_id, tariff_id, days)
+    success = await update_user_subscription(target_user_id, tariff_id, days, DATABASE_URL)
     
     if success:
         # Получаем информацию о пользователе
-        user = await get_user_by_id(target_user_id)
+        user = await get_user_by_id(target_user_id, DATABASE_URL)
         tariff_name = TARIFFS.get(tariff_id, {}).get('name', tariff_id)
         
         # Отправляем уведомление пользователю
@@ -2210,7 +2230,7 @@ async def admin_confirm_grant(callback: CallbackQuery, state: FSMContext):
         await execute_query('''
             INSERT INTO tariff_orders (user_id, tariff, status, admin_notes)
             VALUES ($1, $2, 'granted_by_admin', $3)
-        ''', target_user_id, tariff_id, f"Выдано админом {user_id} на {days} дней")
+        ''', target_user_id, tariff_id, f"Выдано админом {user_id} на {days} дней", database_url=DATABASE_URL)
         
         await callback.message.edit_text(
             f"✅ Подписка успешно выдана!\n\n"
@@ -2252,17 +2272,17 @@ async def admin_confirm_extend(callback: CallbackQuery, state: FSMContext):
     days = data.get('days')
     
     # Получаем текущий тариф пользователя
-    user = await get_user_by_id(target_user_id)
+    user = await get_user_by_id(target_user_id, DATABASE_URL)
     current_tariff = user.get('tariff', 'mini')
     
     # Обновляем подписку пользователя
-    success = await update_user_subscription(target_user_id, current_tariff, days)
+    success = await update_user_subscription(target_user_id, current_tariff, days, DATABASE_URL)
     
     if success:
         tariff_name = TARIFFS.get(current_tariff, {}).get('name', current_tariff)
         
         # Получаем обновленную информацию о подписке
-        subscription_info = await get_user_subscription_info(target_user_id)
+        subscription_info = await get_user_subscription_info(target_user_id, DATABASE_URL)
         
         # Отправляем уведомление пользователю
         try:
@@ -2271,7 +2291,7 @@ async def admin_confirm_extend(callback: CallbackQuery, state: FSMContext):
                 f"🎉 ВАША ПОДПИСКА ПРОДЛЕНА!\n\n"
                 f"💎 Тариф: {tariff_name}\n"
                 f"📅 Добавлено дней: {days}\n"
-                f"📅 Новая дата окончания: {subscription_info['expires'].strftime('%d.%m.%Y') if subscription_info['expires'] else 'N/A'}\n"
+                f"📅 Новая дата окончания: {subscription_info['expires'].strftime('%d.%m.%Y') if subscription_info.get('expires') else 'N/A'}\n"
                 f"🆔 Ваш ID: {target_user_id}\n\n"
                 f"📍 Подписка успешно продлена.\n"
                 f"Вы можете проверить статус в разделе 'Моя статистика'.\n\n"
@@ -2284,9 +2304,9 @@ async def admin_confirm_extend(callback: CallbackQuery, state: FSMContext):
         await execute_query('''
             INSERT INTO tariff_orders (user_id, tariff, status, admin_notes)
             VALUES ($1, $2, 'extended_by_admin', $3)
-        ''', target_user_id, current_tariff, f"Продлено админом {user_id} на {days} дней")
+        ''', target_user_id, current_tariff, f"Продлено админом {user_id} на {days} дней", database_url=DATABASE_URL)
         
-        expires_text = subscription_info['expires'].strftime('%d.%m.%Y') if subscription_info['expires'] else 'N/A'
+        expires_text = subscription_info['expires'].strftime('%d.%m.%Y') if subscription_info.get('expires') else 'N/A'
         
         await callback.message.edit_text(
             f"✅ Подписка успешно продлена!\n\n"
@@ -2330,7 +2350,7 @@ async def admin_list_subscriptions(callback: CallbackQuery):
         FROM users 
         WHERE tariff_expires >= CURRENT_DATE
         ORDER BY tariff_expires ASC
-    ''')
+    ''', database_url=DATABASE_URL)
     
     if not subscriptions:
         await callback.message.edit_text(
@@ -2421,8 +2441,11 @@ async def on_startup():
         await init_database(DATABASE_URL)
         await migrate_database(DATABASE_URL)
         
-        # Инициализация AI менеджера с ключами
-        ai_manager.init_keys(GEMINI_API_KEYS)
+        # Получаем AI менеджер
+        ai_manager = get_ai_manager()
+        if ai_manager:
+            ai_manager.init_keys(GEMINI_API_KEYS)
+            logger.info("✅ AI менеджер инициализирован с ключами")
         
         # Запуск планировщика
         scheduler.start()
@@ -2456,7 +2479,7 @@ async def on_startup():
         )
         
         # Восстановление запланированных постов
-        await restore_scheduled_posts(scheduler, send_scheduled_post, bot, logger, MOSCOW_TZ)
+        await restore_scheduled_posts(scheduler, send_scheduled_post, bot, logger, MOSCOW_TZ, DATABASE_URL)
         
         # Проверка планировщика каждые 30 минут
         scheduler.add_job(
@@ -2514,7 +2537,6 @@ async def on_shutdown():
 async def reset_daily_limits_task():
     """Ежедневный сброс лимитов"""
     from database import execute_query
-    from ai_service import ai_manager
     
     try:
         # Сбрасываем счетчики постов
@@ -2522,17 +2544,19 @@ async def reset_daily_limits_task():
             UPDATE users 
             SET posts_today = 0, posts_reset_date = CURRENT_DATE 
             WHERE posts_reset_date < CURRENT_DATE
-        ''')
+        ''', database_url=DATABASE_URL)
         
         # Сбрасываем AI лимиты
-        ai_manager.reset_daily_limits()
+        ai_manager = get_ai_manager()
+        if ai_manager:
+            ai_manager.reset_daily_limits()
         
         # Проверяем истекшие подписки
         expired_subscriptions = await execute_query('''
             SELECT id, first_name, username 
             FROM users 
             WHERE tariff_expires < CURRENT_DATE AND tariff != 'mini'
-        ''')
+        ''', database_url=DATABASE_URL)
         
         for user in expired_subscriptions:
             # Понижаем тариф до минимума
@@ -2540,7 +2564,7 @@ async def reset_daily_limits_task():
                 UPDATE users 
                 SET tariff = 'mini' 
                 WHERE id = $1 AND tariff != 'admin'
-            ''', user['id'])
+            ''', user['id'], database_url=DATABASE_URL)
             
             # Отправляем уведомление пользователю
             try:
@@ -2564,9 +2588,13 @@ async def reset_daily_limits_task():
 
 async def cleanup_old_sessions_task():
     """Очистка старых сессий"""
-    from ai_service import ai_manager
+    from ai_service import get_ai_manager
     
     try:
+        ai_manager = get_ai_manager()
+        if not ai_manager:
+            return
+            
         week_ago = datetime.now(MOSCOW_TZ) - timedelta(days=7)
         users_to_remove = []
         
@@ -2574,11 +2602,12 @@ async def cleanup_old_sessions_task():
             if session['total_requests'] == 0:
                 last_activity = await execute_query(
                     "SELECT last_seen FROM users WHERE id = $1",
-                    user_id
+                    user_id,
+                    database_url=DATABASE_URL
                 )
                 if last_activity:
                     last_seen = last_activity[0].get('last_seen')
-                    if last_seen and last_seen < week_ago:
+                    if last_seen and last_seen.replace(tzinfo=pytz.UTC).astimezone(MOSCOW_TZ) < week_ago:
                         users_to_remove.append(user_id)
         
         for user_id in users_to_remove:
@@ -2592,11 +2621,13 @@ async def cleanup_old_sessions_task():
 
 async def auto_rotate_keys_task():
     """Автоматическая ротация ключей"""
-    from ai_service import ai_manager
+    from ai_service import get_ai_manager
     
     try:
-        ai_manager.check_and_rotate_keys()
-        logger.info("✅ Автоматическая ротация ключей выполнена")
+        ai_manager = get_ai_manager()
+        if ai_manager:
+            ai_manager.check_and_rotate_keys()
+            logger.info("✅ Автоматическая ротация ключей выполнена")
     except Exception as e:
         logger.error(f"Ошибка автоматической ротации ключей: {e}")
 
@@ -2605,7 +2636,8 @@ async def check_scheduler_status():
     try:
         jobs = scheduler.get_jobs()
         scheduled_posts = await execute_query(
-            "SELECT COUNT(*) as count FROM scheduled_posts WHERE is_sent = FALSE"
+            "SELECT COUNT(*) as count FROM scheduled_posts WHERE is_sent = FALSE",
+            database_url=DATABASE_URL
         )
         scheduled_count = scheduled_posts[0]['count'] if scheduled_posts else 0
         
