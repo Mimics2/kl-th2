@@ -572,3 +572,22 @@ async def generate_with_gemini_advanced(prompt: str, user_id: int, ai_manager_in
 
 # Для обратной совместимости
 import asyncio
+
+# Добавьте в самый конец файла ai_service.py
+# Это обеспечит правильную работу глобального экземпляра
+
+# Глобальный экземпляр AI менеджера
+ai_manager = None
+
+def init_ai_manager(api_keys, model="gemini-2.5-flash", alternative_models=None, moscow_tz=None):
+    """Инициализация глобального AI менеджера"""
+    global ai_manager
+    ai_manager = AdvancedAISessionManager(api_keys, model, alternative_models, moscow_tz)
+    if api_keys:
+        ai_manager.init_keys(api_keys)
+    return ai_manager
+
+def get_ai_manager():
+    """Получение глобального AI менеджера"""
+    global ai_manager
+    return ai_manager
