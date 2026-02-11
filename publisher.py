@@ -118,7 +118,7 @@ async def send_scheduled_post(post_id: int, bot, database_url=None, moscow_tz=No
             database_url=database_url
         )
         
-        if not post_data:
+        if not post_data or not isinstance(post_data, list) or len(post_data) == 0:
             logger.error(f"❌ Пост {post_id} не найден в базе данных")
             return
         
@@ -262,6 +262,10 @@ async def restore_scheduled_posts(scheduler, send_post_func, bot, logger, moscow
             ORDER BY scheduled_time ASC
         ''', database_url=database_url)
         
+        if not posts or not isinstance(posts, list):
+            logger.info("📭 Нет запланированных постов для восстановления")
+            return
+        
         restored = 0
         now = datetime.now(pytz.UTC)
         
@@ -308,7 +312,7 @@ async def restore_scheduled_posts(scheduler, send_post_func, bot, logger, moscow
                         logger.info(f"✅ Восстановлен пост {post_id} на {scheduled_moscow.strftime('%d.%m.%Y %H:%M')} МСК (через {hours_until:.1f} часов)")
                 
             except Exception as e:
-                logger.error(f"Ошибка восстановления поста {post['id']}: {e}")
+                logger.error(f"Ошибка восстановления поста {post.get('id', 'unknown')}: {e}")
         
         logger.info(f"✅ Восстановлено {restored} запланированных постов")
         
