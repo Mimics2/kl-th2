@@ -74,15 +74,21 @@ else:
 # Если ключи не указаны в переменных окружения
 if not GEMINI_API_KEYS:
     GEMINI_API_KEYS = [
-        "AIzaSyANdn61NlmIsibgohrNI8dNVbLNr-jv9_c",
-        "AIzaSyAQWjtmj0czZ1NtU3tydH6d-ncz4hzy0zo",
-        "AIzaSyCfdW8PSsY7bCzlBtuJuQXiVGuRQOPO7XA",
-        "AIzaSyCf-95v3QI06jI6p40hffZ7XPBvqeDwZXE",
-        "AIzaSyDHEGSl0soW0ei25bebXJnAV3JAsgM0xxQ",
-        "AIzaSyBHbtCii0kasYAtonJjCb9BQ6t1tLGAFL4",
-        "AIzaSyCHfiXQ3-6tGD-eNPKn9USEtNL7G92gPNk",
-        "AIzaSyDESq3Lcey3jQAKVgkzLB0ilnrG9qL8t04",
-        "AIzaSyC0lOzADIx-_lbUk1wtcxGBRi6UgIjPQM4"
+        "AIzaSyAGVcbSi0-EEBTJWJU8oc989AadsWzeilY",
+        "AIzaSyBihajPnKjaJELQpQ7WnMFZm9SUPMe8Msw",
+        "AIzaSyB7jaCPHmQvqVaZV9g3jEJYKFc6y4_NFXk",
+        "AIzaSyC_Wq7F3qQyITUsN9THk5zZyMKXEN1YgA4",
+        "AIzaSyChO_8oLyW_2e4iN7PIOIDW_WuC_xiIwJs",
+        "AIzaSyAMf3qefoEXwYE7b_wN7IkfIpKl_TsZ_R4",
+        "AIzaSyBeQIegKdG-XpTkUYcBOMIuXAjjGYU6aB4",
+        "AIzaSyDeCtWXLkg0HIBrNq8Q2ctkTELS27PEHl8",
+        "AIzaSyDbv5Y2Hu19lzdMr-uMqt8Si65v9RKYpJ4",
+        "AIzaSyBl75uONFu_GAF62AEalb2KAYkgOTFYzvo",
+        "AIzaSyA4gmL7YCOYgpPFN0dhF0mgnPKtrdNiYUE",
+        "AIzaSyCOY7hZcYBDv7QIuY5AmgDyNH5U4fs_iWo",
+        "AIzaSyBLwd-hf6P8hZB5X5rVMccWxj4S3QrM1xM",
+        "AIzaSyABkNUcsMT1BjWmh-6zC9-JczrTfz1oBqw",
+        "AIzaSyBlTxfNMdmgj4WsU-l8DPAwKb5KW8eF-JI""
     ]
 
 # Убираем пустые ключи
