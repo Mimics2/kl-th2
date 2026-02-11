@@ -256,10 +256,10 @@ async def restore_scheduled_posts(scheduler, send_post_func, bot, logger, moscow
     """Восстановление запланированных постов при запуске"""
     try:
         posts = await execute_query('''
-            SELECT id, scheduled_time
-            FROM scheduled_posts
-            WHERE is_sent = FALSE
-            ORDER BY scheduled_time ASC
+        SELECT id, scheduled_time
+        FROM scheduled_posts
+        WHERE is_sent = FALSE
+        ORDER BY scheduled_time ASC
         ''', database_url=database_url)
         
         if not posts or not isinstance(posts, list):
