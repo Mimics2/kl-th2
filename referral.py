@@ -42,7 +42,6 @@ async def init_referral_tables(database_url=None):
         )
         ''',
         
-        # Индексы для referral_codes
         '''
         CREATE INDEX IF NOT EXISTS idx_ref_code ON referral_codes(code)
         ''',
@@ -67,7 +66,6 @@ async def init_referral_tables(database_url=None):
         )
         ''',
         
-        # Индексы для referrals
         '''
         CREATE INDEX IF NOT EXISTS idx_ref_referrer ON referrals(referrer_id)
         ''',
@@ -89,7 +87,6 @@ async def init_referral_tables(database_url=None):
         )
         ''',
         
-        # Индекс для user_balances
         '''
         CREATE INDEX IF NOT EXISTS idx_balance_user ON user_balances(user_id)
         ''',
@@ -108,7 +105,6 @@ async def init_referral_tables(database_url=None):
         )
         ''',
         
-        # Индексы для withdrawal_requests
         '''
         CREATE INDEX IF NOT EXISTS idx_withdrawal_user ON withdrawal_requests(user_id)
         ''',
@@ -129,7 +125,6 @@ async def init_referral_tables(database_url=None):
 async def get_or_create_referral_code(user_id: int, database_url=None) -> str:
     """Получает существующий или создает новый реферальный код для пользователя"""
     try:
-        # Проверяем, есть ли уже код
         result = await execute_query(
             "SELECT code FROM referral_codes WHERE user_id = $1",
             user_id,
@@ -139,8 +134,7 @@ async def get_or_create_referral_code(user_id: int, database_url=None) -> str:
         if result and len(result) > 0:
             return result[0]['code']
         
-        # Генерируем новый уникальный код
-        for _ in range(10):  # Пробуем до 10 раз
+        for _ in range(10):
             code = generate_referral_code()
             try:
                 await execute_query('''
@@ -150,18 +144,15 @@ async def get_or_create_referral_code(user_id: int, database_url=None) -> str:
                 logger.info(f"✅ Создан реферальный код {code} для пользователя {user_id}")
                 return code
             except Exception as e:
-                # Если код уже существует, пробуем другой
                 if "duplicate key" in str(e).lower():
                     continue
                 else:
                     raise
         
-        # Если не удалось создать уникальный код
         raise Exception("Не удалось создать уникальный реферальный код")
     
     except Exception as e:
         logger.error(f"Ошибка получения/создания реферального кода для {user_id}: {e}")
-        # Возвращаем заглушку в случае ошибки
         return f"user_{user_id}"
 
 async def get_referrer_by_code(code: str, database_url=None) -> Optional[int]:
@@ -184,7 +175,6 @@ async def register_referral(referrer_id: int, referred_id: int, referred_usernam
                            referred_first_name: str = None, database_url=None) -> bool:
     """Регистрирует нового реферала"""
     try:
-        # Проверяем, не зарегистрирован ли уже этот пользователь
         existing = await execute_query(
             "SELECT id FROM referrals WHERE referred_id = $1",
             referred_id,
@@ -195,7 +185,6 @@ async def register_referral(referrer_id: int, referred_id: int, referred_usernam
             logger.info(f"Пользователь {referred_id} уже зарегистрирован как реферал")
             return False
         
-        # Регистрируем нового реферала
         await execute_query('''
             INSERT INTO referrals 
             (referrer_id, referred_id, referred_username, referred_first_name, status)
@@ -203,7 +192,6 @@ async def register_referral(referrer_id: int, referred_id: int, referred_usernam
         ''', referrer_id, referred_id, referred_username, referred_first_name, 
         database_url=database_url)
         
-        # Обновляем счетчик рефералов у реферера
         await execute_query('''
             UPDATE referral_codes 
             SET total_referrals = total_referrals + 1
@@ -220,7 +208,6 @@ async def register_referral(referrer_id: int, referred_id: int, referred_usernam
 async def check_referral_upgrade(referred_id: int, new_tariff: str, database_url=None) -> Tuple[bool, float]:
     """Проверяет, нужно ли начислить бонус за апгрейд реферала"""
     try:
-        # Находим запись о реферале
         referral = await execute_query('''
             SELECT id, referrer_id, status 
             FROM referrals 
@@ -234,7 +221,6 @@ async def check_referral_upgrade(referred_id: int, new_tariff: str, database_url
         current_status = referral_data['status']
         referrer_id = referral_data['referrer_id']
         
-        # Определяем размер бонуса
         bonus_amount = 0.0
         new_status = current_status
         
@@ -247,7 +233,6 @@ async def check_referral_upgrade(referred_id: int, new_tariff: str, database_url
         else:
             return False, 0.0
         
-        # Обновляем статус реферала
         from datetime import datetime
         import pytz
         
@@ -265,11 +250,9 @@ async def check_referral_upgrade(referred_id: int, new_tariff: str, database_url
         ''', new_status, datetime.now(moscow_tz), bonus_amount, referral_data['id'],
         database_url=database_url)
         
-        # Начисляем бонус на баланс реферера
         if bonus_amount > 0:
             await add_to_balance(referrer_id, bonus_amount, f"Бонус за реферала (тариф {new_tariff})", database_url)
             
-            # Обновляем общий заработок реферера
             await execute_query('''
                 UPDATE referral_codes 
                 SET total_earnings = total_earnings + $1
@@ -299,7 +282,6 @@ async def get_user_balance(user_id: int, database_url=None) -> Dict[str, float]:
                 'total_withdrawn': float(result[0]['total_withdrawn'] or 0)
             }
         
-        # Если записи нет, создаем с нулевым балансом
         await execute_query('''
             INSERT INTO user_balances (user_id, balance, total_earned, total_withdrawn)
             VALUES ($1, 0, 0, 0)
@@ -315,7 +297,6 @@ async def get_user_balance(user_id: int, database_url=None) -> Dict[str, float]:
 async def add_to_balance(user_id: int, amount: float, reason: str = None, database_url=None) -> bool:
     """Добавляет средства на баланс пользователя"""
     try:
-        # Обновляем баланс
         await execute_query('''
             INSERT INTO user_balances (user_id, balance, total_earned, updated_at)
             VALUES ($1, $2, $2, NOW())
@@ -335,7 +316,6 @@ async def add_to_balance(user_id: int, amount: float, reason: str = None, databa
 async def withdraw_from_balance(user_id: int, amount: float, admin_id: int = None, database_url=None) -> bool:
     """Списывает средства с баланса пользователя (при выводе)"""
     try:
-        # Проверяем текущий баланс
         balance_info = await get_user_balance(user_id, database_url)
         current_balance = balance_info['balance']
         
@@ -343,7 +323,6 @@ async def withdraw_from_balance(user_id: int, amount: float, admin_id: int = Non
             logger.warning(f"Недостаточно средств для вывода у {user_id}: {current_balance} < {amount}")
             return False
         
-        # Обновляем баланс
         await execute_query('''
             UPDATE user_balances 
             SET balance = balance - $1,
@@ -362,12 +341,10 @@ async def withdraw_from_balance(user_id: int, amount: float, admin_id: int = Non
 async def create_withdrawal_request(user_id: int, amount: float, database_url=None) -> Optional[int]:
     """Создает запрос на вывод средств"""
     try:
-        # Проверяем баланс
         balance_info = await get_user_balance(user_id, database_url)
         if balance_info['balance'] < amount:
             return None
         
-        # Создаем запрос
         result = await execute_query('''
             INSERT INTO withdrawal_requests (user_id, amount, status)
             VALUES ($1, $2, 'pending')
@@ -403,7 +380,6 @@ async def process_withdrawal_request(request_id: int, admin_id: int, approve: bo
                                      admin_notes: str = None, database_url=None) -> Tuple[bool, str]:
     """Обрабатывает запрос на вывод средств"""
     try:
-        # Получаем информацию о запросе
         requests = await execute_query('''
             SELECT * FROM withdrawal_requests WHERE id = $1
         ''', request_id, database_url=database_url)
@@ -421,8 +397,6 @@ async def process_withdrawal_request(request_id: int, admin_id: int, approve: bo
         moscow_tz = pytz.timezone('Europe/Moscow')
         
         if approve:
-            # Подтверждаем вывод
-            # Списываем средства с баланса
             success = await withdraw_from_balance(
                 request['user_id'], 
                 float(request['amount']), 
@@ -433,7 +407,6 @@ async def process_withdrawal_request(request_id: int, admin_id: int, approve: bo
             if not success:
                 return False, "Недостаточно средств на балансе пользователя"
             
-            # Обновляем статус запроса
             await execute_query('''
                 UPDATE withdrawal_requests 
                 SET status = 'completed', 
@@ -447,7 +420,6 @@ async def process_withdrawal_request(request_id: int, admin_id: int, approve: bo
             return True, f"Запрос #{request_id} подтвержден, средства списаны"
         
         else:
-            # Отклоняем запрос
             await execute_query('''
                 UPDATE withdrawal_requests 
                 SET status = 'cancelled', 
@@ -467,14 +439,12 @@ async def process_withdrawal_request(request_id: int, admin_id: int, approve: bo
 async def reset_user_balance(user_id: int, admin_id: int, database_url=None) -> Tuple[bool, str]:
     """Обнуляет баланс пользователя (админ-функция)"""
     try:
-        # Получаем текущий баланс
         balance_info = await get_user_balance(user_id, database_url)
         current_balance = balance_info['balance']
         
         if current_balance <= 0:
             return False, f"Баланс пользователя {user_id} уже нулевой"
         
-        # Обнуляем баланс
         await execute_query('''
             UPDATE user_balances 
             SET balance = 0,
@@ -483,7 +453,6 @@ async def reset_user_balance(user_id: int, admin_id: int, database_url=None) -> 
             WHERE user_id = $2
         ''', current_balance, user_id, database_url=database_url)
         
-        # Создаем запись об обнулении
         await execute_query('''
             INSERT INTO withdrawal_requests 
             (user_id, amount, status, admin_notes, processed_at, processed_by)
@@ -502,14 +471,12 @@ async def reset_user_balance(user_id: int, admin_id: int, database_url=None) -> 
 async def get_referral_stats(user_id: int, database_url=None) -> Dict:
     """Получает статистику реферальной программы для пользователя"""
     try:
-        # Получаем информацию о реферальном коде
         code_info = await execute_query('''
             SELECT code, total_referrals, total_earnings
             FROM referral_codes 
             WHERE user_id = $1
         ''', user_id, database_url=database_url)
         
-        # Получаем список рефералов
         referrals = await execute_query('''
             SELECT referred_id, referred_username, referred_first_name, status, 
                    bonus_amount, created_at, upgraded_at
@@ -518,10 +485,8 @@ async def get_referral_stats(user_id: int, database_url=None) -> Dict:
             ORDER BY created_at DESC
         ''', user_id, database_url=database_url)
         
-        # Получаем баланс
         balance_info = await get_user_balance(user_id, database_url)
         
-        # Статистика по статусам
         status_stats = {
             'pending': 0,
             'standard': 0,
@@ -548,8 +513,7 @@ async def get_referral_stats(user_id: int, database_url=None) -> Dict:
             'balance': balance_info['balance'],
             'total_withdrawn': balance_info['total_withdrawn'],
             'referrals': referrals or [],
-            'stats': status_stats,
-            'referral_link': f"https://t.me/{(await get_bot_username())}?start=ref_{code}"
+            'stats': status_stats
         }
     
     except Exception as e:
@@ -565,12 +529,6 @@ async def get_referral_stats(user_id: int, database_url=None) -> Dict:
         }
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-async def get_bot_username() -> str:
-    """Получает username бота (заглушка, будет заменена при запуске)"""
-    # Эта функция будет переопределена при запуске бота
-    return "koles_tech_bot"
-
-# Глобальная переменная для хранения username бота
 BOT_USERNAME = "koles_tech_bot"
 
 def set_bot_username(username: str):
@@ -603,11 +561,11 @@ def get_withdrawal_keyboard() -> InlineKeyboardMarkup:
 def get_admin_withdrawal_keyboard(requests: List[Dict]) -> InlineKeyboardMarkup:
     """Клавиатура для обработки запросов на вывод"""
     buttons = []
-    for req in requests[:5]:  # Показываем только первые 5
+    for req in requests[:5]:
         if req.get('status') == 'pending':
             buttons.append([
                 InlineKeyboardButton(
-                    text=f"💰 Запрос #{req['id']} - ${req['amount']}",
+                    text=f"💰 Запрос #{req['id']} - ${float(req['amount']):.2f}",
                     callback_data=f"admin_withdrawal_{req['id']}"
                 )
             ])
@@ -634,6 +592,3 @@ def get_admin_referral_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📊 Статистика партнеров", callback_data="admin_ref_stats")],
         [InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin_panel")]
     ])
-
-# ========== ОБРАБОТЧИКИ (БУДУТ ДОБАВЛЕНЫ В ОСНОВНОЙ ФАЙЛ) ==========
-# Эти функции будут импортированы и использованы в bot.py
