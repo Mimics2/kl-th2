@@ -111,9 +111,23 @@ async def init_database(database_url=None):
             channel_id BIGINT NOT NULL,
             channel_name TEXT NOT NULL,
             is_active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            UNIQUE(user_id, channel_id)
+            created_at TIMESTAMPTZ DEFAULT NOW()
         )
+        ''',
+        
+        # Добавляем уникальное ограничение для ON CONFLICT
+        '''
+        DO $$ 
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint 
+                WHERE conname = 'channels_user_id_channel_id_key'
+            ) THEN
+                ALTER TABLE channels 
+                ADD CONSTRAINT channels_user_id_channel_id_key 
+                UNIQUE (user_id, channel_id);
+            END IF;
+        END $$;
         ''',
         
         # Индексы для таблицы channels
@@ -235,6 +249,25 @@ async def migrate_database(database_url=None):
             logger.info("✅ Добавлена колонка retry_count в таблицу scheduled_posts")
         except Exception as e:
             logger.warning(f"Ошибка добавления колонки retry_count: {e}")
+        
+        # Добавляем уникальное ограничение для таблицы channels если его нет
+        try:
+            await execute_query('''
+                DO $$ 
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint 
+                        WHERE conname = 'channels_user_id_channel_id_key'
+                    ) THEN
+                        ALTER TABLE channels 
+                        ADD CONSTRAINT channels_user_id_channel_id_key 
+                        UNIQUE (user_id, channel_id);
+                    END IF;
+                END $$;
+            ''', database_url=database_url)
+            logger.info("✅ Добавлено уникальное ограничение для channels (user_id, channel_id)")
+        except Exception as e:
+            logger.warning(f"Ошибка добавления уникального ограничения для channels: {e}")
         
         logger.info("✅ Миграции завершены")
     except Exception as e:
@@ -432,7 +465,7 @@ async def check_ai_limits(user_id: int, service_type: str, database_url=None, ai
 async def get_user_channels(user_id: int, database_url=None) -> List[Dict]:
     """Получает каналы пользователя"""
     return await execute_query(
-        "SELECT channel_id, channel_name FROM channels WHERE user_id = $1 AND is_active = TRUE",
+        "SELECT channel_id, channel_name FROM channels WHERE user_id = $1 AND is_active = TRUE ORDER BY created_at DESC",
         user_id,
         database_url=database_url
     )
@@ -440,13 +473,27 @@ async def get_user_channels(user_id: int, database_url=None) -> List[Dict]:
 async def add_user_channel(user_id: int, channel_id: int, channel_name: str, database_url=None) -> bool:
     """Добавляет канал пользователя"""
     try:
-        await execute_query('''
-            INSERT INTO channels (user_id, channel_id, channel_name, is_active)
-            VALUES ($1, $2, $3, TRUE)
-            ON CONFLICT (user_id, channel_id) DO UPDATE SET
-            channel_name = EXCLUDED.channel_name,
-            is_active = TRUE
-        ''', user_id, channel_id, channel_name, database_url=database_url)
+        # Сначала проверяем, существует ли канал
+        existing = await execute_query(
+            "SELECT id FROM channels WHERE user_id = $1 AND channel_id = $2",
+            user_id, channel_id,
+            database_url=database_url
+        )
+        
+        if existing:
+            # Обновляем существующий канал
+            await execute_query('''
+                UPDATE channels 
+                SET channel_name = $1, is_active = TRUE 
+                WHERE user_id = $2 AND channel_id = $3
+            ''', channel_name, user_id, channel_id, database_url=database_url)
+        else:
+            # Добавляем новый канал
+            await execute_query('''
+                INSERT INTO channels (user_id, channel_id, channel_name, is_active)
+                VALUES ($1, $2, $3, TRUE)
+            ''', user_id, channel_id, channel_name, database_url=database_url)
+        
         return True
     except Exception as e:
         logger.error(f"Ошибка добавления канала: {e}")
