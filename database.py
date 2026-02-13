@@ -59,12 +59,9 @@ async def execute_query(query: str, *args, database_url=None) -> Any:
                 result = await conn.fetch(query, *args)
                 return [dict(row) for row in result] if result else []
             else:
-                # Для INSERT/UPDATE/DELETE
                 result = await conn.fetch(query, *args)
                 if result:
-                    # Если есть RETURNING, возвращаем список словарей
                     return [dict(row) for row in result]
-                # Если нет RETURNING, возвращаем строку статуса
                 return "OK"
         except Exception as e:
             logger.error(f"Ошибка запроса: {e}\nЗапрос: {query}")
@@ -95,7 +92,6 @@ async def init_database(database_url=None):
         )
         ''',
         
-        # Индексы для таблицы users
         '''
         CREATE INDEX IF NOT EXISTS idx_users_tariff ON users(tariff)
         ''',
@@ -115,7 +111,6 @@ async def init_database(database_url=None):
         )
         ''',
         
-        # Добавляем уникальное ограничение для ON CONFLICT
         '''
         DO $$ 
         BEGIN
@@ -130,7 +125,6 @@ async def init_database(database_url=None):
         END $$;
         ''',
         
-        # Индексы для таблицы channels
         '''
         CREATE INDEX IF NOT EXISTS idx_channels_user ON channels(user_id)
         ''',
@@ -157,7 +151,6 @@ async def init_database(database_url=None):
         )
         ''',
         
-        # Индексы для таблицы scheduled_posts
         '''
         CREATE INDEX IF NOT EXISTS idx_scheduled_time ON scheduled_posts(scheduled_time)
         ''',
@@ -181,7 +174,6 @@ async def init_database(database_url=None):
         )
         ''',
         
-        # Индексы для таблицы tariff_orders
         '''
         CREATE INDEX IF NOT EXISTS idx_orders_status ON tariff_orders(status)
         ''',
@@ -208,7 +200,6 @@ async def init_database(database_url=None):
         )
         ''',
         
-        # Индексы для таблицы ai_request_logs
         '''
         CREATE INDEX IF NOT EXISTS idx_logs_user_date ON ai_request_logs(user_id, created_at)
         ''',
@@ -231,7 +222,6 @@ async def init_database(database_url=None):
 async def migrate_database(database_url=None):
     """Миграция базы данных"""
     try:
-        # Добавляем колонки если их нет
         try:
             await execute_query('''
                 ALTER TABLE scheduled_posts 
@@ -250,7 +240,6 @@ async def migrate_database(database_url=None):
         except Exception as e:
             logger.warning(f"Ошибка добавления колонки retry_count: {e}")
         
-        # Добавляем уникальное ограничение для таблицы channels если его нет
         try:
             await execute_query('''
                 DO $$ 
@@ -308,10 +297,8 @@ async def get_user_tariff(user_id: int, database_url=None) -> str:
     if user[0].get('is_admin'):
         return 'admin'
     
-    # Проверяем срок действия тарифа
     tariff_expires = user[0].get('tariff_expires')
     if tariff_expires and tariff_expires < datetime.now(moscow_tz).date():
-        # Тариф истек, возвращаем к минимуму
         await execute_query(
             "UPDATE users SET tariff = 'mini', tariff_expires = NULL, subscription_days = 0 WHERE id = $1",
             user_id,
@@ -330,7 +317,6 @@ async def update_user_subscription(user_id: int, tariff: str, days: int, databas
         moscow_tz = pytz.timezone('Europe/Moscow')
         today = datetime.now(moscow_tz).date()
         
-        # Получаем текущую дату окончания
         user = await execute_query(
             "SELECT tariff_expires FROM users WHERE id = $1",
             user_id,
@@ -338,16 +324,12 @@ async def update_user_subscription(user_id: int, tariff: str, days: int, databas
         )
         
         if user and user[0]['tariff_expires']:
-            # Продлеваем существующую подписку
             expires_date = user[0]['tariff_expires']
             if expires_date >= today:
-                # Продлеваем с текущей даты окончания
                 new_expires = expires_date + timedelta(days=days)
             else:
-                # Начинаем с сегодня
                 new_expires = today + timedelta(days=days)
         else:
-            # Новая подписка
             new_expires = today + timedelta(days=days)
         
         await execute_query('''
@@ -473,7 +455,6 @@ async def get_user_channels(user_id: int, database_url=None) -> List[Dict]:
 async def add_user_channel(user_id: int, channel_id: int, channel_name: str, database_url=None) -> bool:
     """Добавляет канал пользователя"""
     try:
-        # Сначала проверяем, существует ли канал
         existing = await execute_query(
             "SELECT id FROM channels WHERE user_id = $1 AND channel_id = $2",
             user_id, channel_id,
@@ -481,14 +462,12 @@ async def add_user_channel(user_id: int, channel_id: int, channel_name: str, dat
         )
         
         if existing:
-            # Обновляем существующий канал
             await execute_query('''
                 UPDATE channels 
                 SET channel_name = $1, is_active = TRUE 
                 WHERE user_id = $2 AND channel_id = $3
             ''', channel_name, user_id, channel_id, database_url=database_url)
         else:
-            # Добавляем новый канал
             await execute_query('''
                 INSERT INTO channels (user_id, channel_id, channel_name, is_active)
                 VALUES ($1, $2, $3, TRUE)
@@ -583,13 +562,11 @@ async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, sc
             scheduled_time = moscow_tz.localize(scheduled_time)
         scheduled_time_utc = scheduled_time.astimezone(pytz.UTC)
         
-        # Правильная обработка post_data
         message_type = post_data.get('message_type', 'text')
         message_text = post_data.get('message_text', '')
         media_file_id = post_data.get('media_file_id', '')
         media_caption = post_data.get('media_caption', '')
         
-        # Проверяем корректность данных
         if message_type == 'text' and not message_text:
             logger.error("Текст поста пустой")
             return None
@@ -598,7 +575,6 @@ async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, sc
             logger.error("Медиа файл не указан")
             return None
         
-        # Используем параметризованный запрос для избежания SQL инъекций
         result = await execute_query('''
             INSERT INTO scheduled_posts 
             (user_id, channel_id, message_type, message_text, media_file_id, media_caption, scheduled_time)
@@ -615,7 +591,6 @@ async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, sc
         database_url=database_url
         )
         
-        # result уже список словарей благодаря исправленному execute_query
         post_id = result[0]['id'] if result and isinstance(result, list) and len(result) > 0 else None
         
         if post_id and moscow_tz:
@@ -631,11 +606,9 @@ async def save_scheduled_post(user_id: int, channel_id: int, post_data: Dict, sc
 async def get_user_stats(user_id: int, database_url=None, ai_manager=None) -> Dict:
     """Получает статистику пользователя"""
     try:
-        # Базовая статистика
         tariff = await get_user_tariff(user_id, database_url)
         tariff_info = TARIFFS.get(tariff, TARIFFS['mini'])
         
-        # AI статистика
         ai_stats = {}
         if ai_manager:
             ai_stats = ai_manager.get_user_stats(user_id)
@@ -646,13 +619,10 @@ async def get_user_stats(user_id: int, database_url=None, ai_manager=None) -> Di
                 'total_requests': 0
             }
         
-        # Посты
         posts_today = await get_user_posts_today(user_id, database_url)
         
-        # Каналы
         channels_count = await get_user_channels_count(user_id, database_url)
         
-        # Запланированные посты
         scheduled_posts = await execute_query(
             "SELECT COUNT(*) as count FROM scheduled_posts WHERE user_id = $1 AND is_sent = FALSE",
             user_id,
@@ -660,7 +630,6 @@ async def get_user_stats(user_id: int, database_url=None, ai_manager=None) -> Di
         )
         scheduled_posts = scheduled_posts[0]['count'] if scheduled_posts else 0
         
-        # Информация о подписке
         subscription_info = await get_user_subscription_info(user_id, database_url)
         
         return {
