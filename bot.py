@@ -1630,13 +1630,21 @@ async def show_my_channels(callback: CallbackQuery):
         f"3. Канал будет автоматически добавлен"
     )
     
-    await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить список", callback_data="my_channels")],
-            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
-        ])
-    )
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить список", callback_data="my_channels")],
+                [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+            ])
+        )
+    except Exception as e:
+        # Если сообщение не изменилось, игнорируем ошибку
+        if "message is not modified" in str(e):
+            await callback.answer("Список каналов не изменился")
+        else:
+            logger.error(f"Ошибка при показе каналов: {e}")
+            await callback.answer("❌ Произошла ошибка", show_alert=True)
 
 @router.message(F.forward_from_chat)
 async def handle_forwarded_channel_message(message: Message):
@@ -1669,11 +1677,14 @@ async def handle_forwarded_channel_message(message: Message):
         success = await add_user_channel(user_id, channel.id, channel.title or f"Канал {channel.id}", DATABASE_URL)
         
         if success:
+            # Получаем обновленное количество каналов
+            new_count = await get_user_channels_count(user_id, DATABASE_URL)
+            
             await message.answer(
                 f"✅ Канал успешно добавлен!\n\n"
                 f"📢 {channel.title}\n"
                 f"🆔 ID: {channel.id}\n\n"
-                f"📊 Каналов подключено: {channels_count + 1}/{channels_limit}",
+                f"📊 Каналов подключено: {new_count}/{channels_limit}",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="📅 Запланировать пост", callback_data="schedule_post")],
                     [InlineKeyboardButton(text="📢 Мои каналы", callback_data="my_channels")],
@@ -1683,8 +1694,13 @@ async def handle_forwarded_channel_message(message: Message):
         else:
             await message.answer(
                 "❌ Ошибка при добавлении канала!\n\n"
-                "Убедитесь, что бот добавлен в администраторы канала и попробуйте еще раз.",
+                "Убедитесь, что бот добавлен в администраторы канала и попробуйте еще раз.\n\n"
+                "Возможные причины:\n"
+                "• Бот не является администратором канала\n"
+                "• Канал уже добавлен другим пользователем\n"
+                "• Техническая ошибка",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="my_channels")],
                     [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
                 ])
             )
