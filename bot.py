@@ -40,6 +40,17 @@ from publisher import (
     restore_scheduled_posts, PostStates
 )
 
+# Импортируем модуль партнерской программы
+from referral import (
+    init_referral_tables, get_or_create_referral_code, get_referrer_by_code,
+    register_referral, check_referral_upgrade, get_user_balance,
+    add_to_balance, withdraw_from_balance, create_withdrawal_request,
+    get_withdrawal_requests, process_withdrawal_request, reset_user_balance,
+    get_referral_stats, set_bot_username,
+    get_referral_keyboard, get_withdrawal_keyboard, get_admin_withdrawal_keyboard,
+    get_withdrawal_process_keyboard, get_admin_referral_keyboard
+)
+
 # ========== CONFIGURATION ==========
 API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
@@ -122,7 +133,6 @@ dp.include_router(router)
 scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
 
 # ========== ИНИЦИАЛИЗАЦИЯ AI МЕНЕДЖЕРА ==========
-# Создаем и инициализируем глобальный AI менеджер
 ai_manager = init_ai_manager(GEMINI_API_KEYS, GEMINI_MODEL, ALTERNATIVE_MODELS, MOSCOW_TZ)
 
 # ========== STATES ==========
@@ -141,9 +151,15 @@ class AdminStates(StatesGroup):
     waiting_for_days_selection = State()
     waiting_for_confirm_grant = State()
     waiting_for_confirm_extend = State()
-    waiting_for_force_user_id = State()  # Для принудительного обновления тарифа
-    waiting_for_force_tariff = State()    # Для выбора тарифа при принудительном обновлении
-    waiting_for_order_id = State()        # Для обработки заказов
+    waiting_for_force_user_id = State()
+    waiting_for_force_tariff = State()
+    waiting_for_order_id = State()
+    waiting_for_withdrawal_amount = State()
+    waiting_for_reset_balance_user_id = State()
+    waiting_for_withdrawal_reason = State()
+
+class ReferralStates(StatesGroup):
+    waiting_for_withdrawal_amount = State()
 
 # ========== KEYBOARDS ==========
 def get_main_menu(user_id: int, is_admin: bool = False) -> InlineKeyboardMarkup:
@@ -153,7 +169,8 @@ def get_main_menu(user_id: int, is_admin: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📅 Запланировать пост", callback_data="schedule_post")],
         [InlineKeyboardButton(text="📊 Моя статистика", callback_data="my_stats")],
         [InlineKeyboardButton(text="📢 Мои каналы", callback_data="my_channels")],
-        [InlineKeyboardButton(text="💎 Тарифы", callback_data="tariffs")]
+        [InlineKeyboardButton(text="💎 Тарифы", callback_data="tariffs")],
+        [InlineKeyboardButton(text="🤝 Партнерская программа", callback_data="referral_program")]
     ]
     
     if SUPPORT_BOT_USERNAME and SUPPORT_BOT_USERNAME != "support_bot":
@@ -218,6 +235,7 @@ def get_admin_panel_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="💎 Управление подписками", callback_data="admin_subscriptions")],
         [InlineKeyboardButton(text="🔄 Принудительное обновление тарифа", callback_data="admin_force_tariff")],
+        [InlineKeyboardButton(text="💰 Управление партнерской программой", callback_data="admin_referral")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
     ])
 
@@ -237,7 +255,7 @@ def get_admin_subscription_keyboard() -> InlineKeyboardMarkup:
 def get_admin_orders_keyboard(orders: List[Dict]) -> InlineKeyboardMarkup:
     """Клавиатура для заказов тарифов"""
     buttons = []
-    for order in orders[:5]:  # Показываем только первые 5 заказов
+    for order in orders[:5]:
         if order.get('status') == 'pending':
             tariff_name = TARIFFS.get(order.get('tariff'), {}).get('name', order.get('tariff'))
             buttons.append([
@@ -295,13 +313,25 @@ def split_message(text: str, max_length: int = 4000) -> List[str]:
 # ========== BASIC HANDLERS ==========
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    """Обработчик команды /start"""
+    """Обработчик команды /start с поддержкой реферальных ссылок"""
     user_id = message.from_user.id
     username = message.from_user.username or ""
     first_name = message.from_user.first_name or "Пользователь"
     is_admin = user_id == ADMIN_ID
     
+    # Проверяем, есть ли реферальный код в команде
+    args = message.text.split()
+    referrer_id = None
+    
+    if len(args) > 1 and args[1].startswith('ref_'):
+        ref_code = args[1][4:]  # Убираем 'ref_' из начала
+        referrer_id = await get_referrer_by_code(ref_code, DATABASE_URL)
+        
+        if referrer_id and referrer_id != user_id:
+            logger.info(f"Пользователь {user_id} перешел по реферальной ссылке от {referrer_id}")
+    
     try:
+        # Регистрируем или обновляем пользователя
         await execute_query('''
             INSERT INTO users (id, username, first_name, is_admin, tariff, last_seen)
             VALUES ($1, $2, $3, $4, $5, NOW())
@@ -311,6 +341,32 @@ async def cmd_start(message: Message):
                 is_admin = EXCLUDED.is_admin,
                 last_seen = NOW()
         ''', user_id, username, first_name, is_admin, 'admin' if is_admin else 'mini', database_url=DATABASE_URL)
+        
+        # Регистрируем реферала, если есть реферер
+        if referrer_id:
+            await register_referral(
+                referrer_id, 
+                user_id, 
+                username, 
+                first_name,
+                DATABASE_URL
+            )
+            
+            # Отправляем уведомление рефереру
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"🎉 По вашей реферальной ссылке зарегистрировался новый пользователь!\n\n"
+                    f"👤 Имя: {first_name}\n"
+                    f"🆔 ID: {user_id}\n\n"
+                    f"💡 Когда он оформит подписку Standard или VIP, вы получите бонус на счет!"
+                )
+            except Exception as e:
+                logger.error(f"Не удалось уведомить реферера {referrer_id}: {e}")
+        
+        # Создаем или получаем реферальный код для пользователя
+        await get_or_create_referral_code(user_id, DATABASE_URL)
+        
     except Exception as e:
         logger.error(f"Ошибка регистрации пользователя {user_id}: {e}")
     
@@ -327,10 +383,14 @@ async def cmd_start(message: Message):
         f"• 📊 Детальная статистика\n"
         f"• 📢 Управление каналов\n"
         f"• ⏰ Автопубликация в нужное время\n"
+        f"• 🤝 Партнерская программа с выплатами\n"
         f"• 🆘 Техподдержка всегда на связи\n\n"
         f"📍 Время указывается по Москве\n\n"
         f"👇 Выберите действия:"
     )
+    
+    if referrer_id:
+        welcome_text = f"🎉 Вы перешли по реферальной ссылке!\n\n" + welcome_text
     
     await message.answer(welcome_text, reply_markup=get_main_menu(user_id, is_admin), parse_mode="HTML")
 
@@ -352,6 +412,12 @@ async def cmd_help(message: Message):
         "4. Укажите дату и время\n"
         "5. Подтвердите публикацию\n\n"
         
+        "🤝 Партнерская программа:\n"
+        "• Получите свою реферальную ссылку\n"
+        "• Приводите друзей в бота\n"
+        "• Получайте $1 за Standard и $2 за VIP подписку друга\n"
+        "• Выводите деньги через администратора\n\n"
+        
         "💎 Тарифы:\n"
         "• Mini - 1 копирайт, 10 идей, 1 канал, 2 постов\n"
         "• Standard ($4) - 3 копирайта, 30 идей, 2 канала, 6 постов\n"
@@ -362,6 +428,1048 @@ async def cmd_help(message: Message):
     )
     
     await message.answer(help_text)
+
+# ========== REFERRAL HANDLERS ==========
+@router.callback_query(F.data == "referral_program")
+async def referral_program_menu(callback: CallbackQuery):
+    """Меню партнерской программы"""
+    user_id = callback.from_user.id
+    
+    # Получаем статистику
+    stats = await get_referral_stats(user_id, DATABASE_URL)
+    
+    # Получаем баланс
+    balance_info = await get_user_balance(user_id, DATABASE_URL)
+    
+    text = (
+        f"🤝 ПАРТНЕРСКАЯ ПРОГРАММА\n\n"
+        f"💰 Ваш баланс: ${balance_info['balance']:.2f}\n"
+        f"📊 Всего заработано: ${stats['total_earnings']:.2f}\n"
+        f"👥 Приведено друзей: {stats['total_referrals']}\n\n"
+        
+        f"📊 Статистика по друзьям:\n"
+        f"• Ожидают подписки: {stats['stats']['pending']}\n"
+        f"• С подпиской Standard: {stats['stats']['standard']}\n"
+        f"• С подпиской VIP: {stats['stats']['vip']}\n\n"
+        
+        f"💎 Бонусы:\n"
+        f"• За Standard подписку друга: +$1\n"
+        f"• За VIP подписку друга: +$2\n\n"
+        
+        f"📍 Как это работает:\n"
+        f"1. Получите свою реферальную ссылку\n"
+        f"2. Делитесь ссылкой с друзьями\n"
+        f"3. Когда друг оформит платную подписку, вы получите бонус\n"
+        f"4. Выводите деньги через администратора\n\n"
+        
+        f"🔗 Ваша ссылка: https://t.me/{(await get_bot_username())}?start=ref_{stats['code']}"
+    )
+    
+    await callback.message.edit_text(
+        text,
+        reply_markup=get_referral_keyboard(),
+        disable_web_page_preview=True
+    )
+
+@router.callback_query(F.data == "ref_my_link")
+async def referral_my_link(callback: CallbackQuery):
+    """Показывает реферальную ссылку"""
+    user_id = callback.from_user.id
+    
+    code = await get_or_create_referral_code(user_id, DATABASE_URL)
+    bot_username = await get_bot_username()
+    link = f"https://t.me/{bot_username}?start=ref_{code}"
+    
+    await callback.message.edit_text(
+        f"🔗 ВАША РЕФЕРАЛЬНАЯ ССЫЛКА\n\n"
+        f"{link}\n\n"
+        f"📊 Статистика:\n"
+        f"• Переходов по ссылке: будет отслеживаться\n"
+        f"• Регистраций: будет доступно в статистике\n\n"
+        f"💡 Делитесь ссылкой в соцсетях, чатах и с друзьями!\n"
+        f"За каждого приведенного друга с платной подпиской вы получите бонус.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Копировать ссылку", callback_data="ref_copy_link")],
+            [InlineKeyboardButton(text="📊 Моя статистика", callback_data="ref_my_stats")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="referral_program")]
+        ]),
+        disable_web_page_preview=True
+    )
+
+@router.callback_query(F.data == "ref_copy_link")
+async def referral_copy_link(callback: CallbackQuery):
+    """Подсказка для копирования ссылки"""
+    await callback.answer("Ссылка скопирована! (нажмите и выделите текст выше)", show_alert=False)
+
+@router.callback_query(F.data == "ref_my_stats")
+async def referral_my_stats(callback: CallbackQuery):
+    """Детальная статистика рефералов"""
+    user_id = callback.from_user.id
+    
+    stats = await get_referral_stats(user_id, DATABASE_URL)
+    
+    if not stats['referrals']:
+        text = (
+            f"📊 ВАША СТАТИСТИКА\n\n"
+            f"У вас пока нет приведенных друзей.\n\n"
+            f"💡 Получите реферальную ссылку в меню и приглашайте друзей!\n"
+            f"За каждого друга с платной подпиской вы получите бонус."
+        )
+    else:
+        text = f"📊 ВАША СТАТИСТИКА\n\n"
+        text += f"👥 Всего друзей: {stats['total_referrals']}\n"
+        text += f"💰 На балансе: ${stats['balance']:.2f}\n"
+        text += f"📈 Заработано всего: ${stats['total_earnings']:.2f}\n"
+        text += f"💸 Выведено: ${stats['total_withdrawn']:.2f}\n\n"
+        
+        text += "📋 СПИСОК ДРУЗЕЙ:\n\n"
+        
+        for i, ref in enumerate(stats['references'][:10], 1):
+            name = ref.get('referred_first_name') or f"ID: {ref['referred_id']}"
+            status_emoji = {
+                'pending': '⏳',
+                'standard': '⭐',
+                'vip': '👑',
+                'completed': '✅'
+            }.get(ref.get('status', 'pending'), '⏳')
+            
+            status_text = {
+                'pending': 'Ожидает подписки',
+                'standard': 'Standard (+$1)',
+                'vip': 'VIP (+$2)',
+                'completed': 'Завершено'
+            }.get(ref.get('status', 'pending'), 'Ожидает')
+            
+            created = ref.get('created_at').astimezone(MOSCOW_TZ).strftime('%d.%m.%Y') if ref.get('created_at') else 'N/A'
+            
+            text += f"{i}. {status_emoji} {name}\n"
+            text += f"   📅 Зарегистрирован: {created}\n"
+            text += f"   📊 Статус: {status_text}\n"
+            
+            if ref.get('bonus_amount') and float(ref['bonus_amount']) > 0:
+                text += f"   💰 Бонус: +${float(ref['bonus_amount']):.2f}\n"
+            
+            if ref.get('upgraded_at'):
+                upgraded = ref['upgraded_at'].astimezone(MOSCOW_TZ).strftime('%d.%m.%Y')
+                text += f"   ⭐ Подписка оформлена: {upgraded}\n"
+            
+            text += "\n"
+        
+        if len(stats['referrals']) > 10:
+            text += f"... и еще {len(stats['referrals']) - 10} друзей\n\n"
+    
+    if len(text) > 4000:
+        parts = split_message(text)
+        for i, part in enumerate(parts):
+            if i == 0:
+                await callback.message.edit_text(part)
+            else:
+                await callback.message.answer(part)
+    else:
+        await callback.message.edit_text(text)
+    
+    await callback.message.answer(
+        "👇 Выберите действие:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💰 Вывести средства", callback_data="ref_withdraw")],
+            [InlineKeyboardButton(text="🔗 Моя ссылка", callback_data="ref_my_link")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="referral_program")]
+        ])
+    )
+
+@router.callback_query(F.data == "ref_withdraw")
+async def referral_withdraw_menu(callback: CallbackQuery):
+    """Меню вывода средств"""
+    user_id = callback.from_user.id
+    
+    balance_info = await get_user_balance(user_id, DATABASE_URL)
+    
+    text = (
+        f"💰 ВЫВОД СРЕДСТВ\n\n"
+        f"Ваш текущий баланс: ${balance_info['balance']:.2f}\n\n"
+        f"📍 Правила вывода:\n"
+        f"• Минимальная сумма вывода: $1\n"
+        f"• Вывод осуществляется вручную администратором\n"
+        f"• После запроса администратор свяжется с вами\n"
+        f"• Деньги будут отправлены в Telegram или на карту\n\n"
+        f"💬 Контакт администратора: @{ADMIN_CONTACT.replace('@', '')}"
+    )
+    
+    if balance_info['balance'] >= 1:
+        await callback.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💰 Запросить вывод", callback_data="ref_request_withdraw")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="referral_program")]
+            ])
+        )
+    else:
+        await callback.message.edit_text(
+            text + "\n\n❌ Недостаточно средств для вывода (минимум $1)",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="referral_program")]
+            ])
+        )
+
+@router.callback_query(F.data == "ref_request_withdraw")
+async def referral_request_withdraw(callback: CallbackQuery, state: FSMContext):
+    """Запрос на вывод средств"""
+    user_id = callback.from_user.id
+    
+    balance_info = await get_user_balance(user_id, DATABASE_URL)
+    
+    if balance_info['balance'] < 1:
+        await callback.answer("❌ Минимальная сумма вывода $1", show_alert=True)
+        return
+    
+    await state.set_state(ReferralStates.waiting_for_withdrawal_amount)
+    
+    await callback.message.edit_text(
+        f"💰 ЗАПРОС НА ВЫВОД\n\n"
+        f"Ваш баланс: ${balance_info['balance']:.2f}\n"
+        f"Минимальная сумма: $1\n\n"
+        f"Введите сумму для вывода (число):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="referral_program")]
+        ])
+    )
+
+@router.message(ReferralStates.waiting_for_withdrawal_amount)
+async def process_withdrawal_amount(message: Message, state: FSMContext):
+    """Обработка суммы вывода"""
+    user_id = message.from_user.id
+    
+    try:
+        amount = float(message.text.strip())
+        
+        if amount <= 0:
+            await message.answer(
+                "❌ Сумма должна быть больше 0!\n\n"
+                "Введите сумму еще раз:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="referral_program")]
+                ])
+            )
+            return
+        
+        balance_info = await get_user_balance(user_id, DATABASE_URL)
+        
+        if amount > balance_info['balance']:
+            await message.answer(
+                f"❌ Недостаточно средств!\n"
+                f"Ваш баланс: ${balance_info['balance']:.2f}\n"
+                f"Запрошено: ${amount:.2f}\n\n"
+                f"Введите сумму еще раз:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="referral_program")]
+                ])
+            )
+            return
+        
+        if amount < 1:
+            await message.answer(
+                "❌ Минимальная сумма вывода $1!\n\n"
+                "Введите сумму еще раз:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="referral_program")]
+                ])
+            )
+            return
+        
+        # Создаем запрос на вывод
+        request_id = await create_withdrawal_request(user_id, amount, DATABASE_URL)
+        
+        if request_id:
+            # Отправляем уведомление админу
+            try:
+                user_info = await get_user_by_id(user_id, DATABASE_URL)
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"💰 НОВЫЙ ЗАПРОС НА ВЫВОД #{request_id}\n\n"
+                    f"👤 Пользователь: {user_info.get('first_name', 'N/A')} (@{user_info.get('username', 'N/A')})\n"
+                    f"🆔 ID: {user_id}\n"
+                    f"💰 Сумма: ${amount:.2f}\n"
+                    f"📅 Дата: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M')}\n\n"
+                    f"📍 Для обработки зайдите в админ-панель → Партнерская программа"
+                )
+            except Exception as e:
+                logger.error(f"Не удалось уведомить админа о запросе на вывод: {e}")
+            
+            await message.answer(
+                f"✅ Запрос на вывод #{request_id} создан!\n\n"
+                f"💰 Сумма: ${amount:.2f}\n\n"
+                f"📍 Администратор свяжется с вами в ближайшее время.\n"
+                f"Статус запроса можно уточнить в поддержке.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🤝 Партнерская программа", callback_data="referral_program")],
+                    [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+                ])
+            )
+        else:
+            await message.answer(
+                "❌ Ошибка при создании запроса на вывод!\n\n"
+                "Попробуйте позже или обратитесь в поддержку.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🤝 Партнерская программа", callback_data="referral_program")]
+                ])
+            )
+        
+        await state.clear()
+        
+    except ValueError:
+        await message.answer(
+            "❌ Введите число!\n\n"
+            "Примеры: 1, 2.5, 10",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="referral_program")]
+            ])
+        )
+
+@router.callback_query(F.data == "ref_rules")
+async def referral_rules(callback: CallbackQuery):
+    """Правила партнерской программы"""
+    text = (
+        "📋 ПРАВИЛА ПАРТНЕРСКОЙ ПРОГРАММЫ\n\n"
+        
+        "1️⃣ Как это работает:\n"
+        "• Вы получаете уникальную реферальную ссылку\n"
+        "• Делитесь ссылкой с друзьями\n"
+        "• Когда друг переходит по ссылке и регистрируется в боте, он становится вашим рефералом\n"
+        "• Если друг оформляет платную подписку, вы получаете бонус\n\n"
+        
+        "2️⃣ Бонусы:\n"
+        "• За подписку Standard: +$1 на баланс\n"
+        "• За подписку VIP: +$2 на баланс\n"
+        "• Бонус начисляется автоматически при оформлении подписки\n\n"
+        
+        "3️⃣ Вывод средств:\n"
+        "• Минимальная сумма вывода: $1\n"
+        "• Для вывода создайте запрос в разделе 'Вывести средства'\n"
+        "• Администратор свяжется с вами для отправки денег\n"
+        "• Вывод осуществляется в Telegram или на карту\n\n"
+        
+        "4️⃣ Важно:\n"
+        "• Не используйте спам и накрутки\n"
+        "• Один пользователь может быть рефералом только один раз\n"
+        "• Бонус начисляется только за реальных пользователей\n"
+        "• Администратор оставляет за собой право заблокировать накрученные бонусы\n\n"
+        
+        f"💬 По вопросам выплат: @{ADMIN_CONTACT.replace('@', '')}"
+    )
+    
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="referral_program")]
+        ])
+    )
+
+# ========== ADMIN REFERRAL HANDLERS ==========
+@router.callback_query(F.data == "admin_referral")
+async def admin_referral_menu(callback: CallbackQuery):
+    """Меню управления партнерской программой для админа"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    # Получаем статистику
+    pending_requests = await get_withdrawal_requests('pending', DATABASE_URL)
+    total_pending = len(pending_requests) if pending_requests else 0
+    
+    # Общая статистика
+    all_users = await get_all_users(DATABASE_URL)
+    users_with_balance = 0
+    total_balance = 0.0
+    
+    for user in all_users:
+        balance_info = await get_user_balance(user['id'], DATABASE_URL)
+        if balance_info['balance'] > 0:
+            users_with_balance += 1
+            total_balance += balance_info['balance']
+    
+    text = (
+        f"💰 УПРАВЛЕНИЕ ПАРТНЕРСКОЙ ПРОГРАММОЙ\n\n"
+        f"📊 Статистика:\n"
+        f"• Ожидающих запросов на вывод: {total_pending}\n"
+        f"• Пользователей с балансом: {users_with_balance}\n"
+        f"• Общая сумма балансов: ${total_balance:.2f}\n\n"
+        f"📍 Выберите действие:"
+    )
+    
+    await callback.message.edit_text(
+        text,
+        reply_markup=get_admin_referral_keyboard()
+    )
+
+@router.callback_query(F.data == "admin_withdrawals")
+async def admin_withdrawals(callback: CallbackQuery):
+    """Список запросов на вывод"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    pending_requests = await get_withdrawal_requests('pending', DATABASE_URL)
+    
+    if not pending_requests:
+        # Показываем последние завершенные
+        all_requests = await get_withdrawal_requests(None, DATABASE_URL)
+        all_requests = all_requests[:10] if all_requests else []
+        
+        if not all_requests:
+            await callback.message.edit_text(
+                "💰 Нет запросов на вывод",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_referral")]
+                ])
+            )
+            return
+        
+        text = "💰 ПОСЛЕДНИЕ ЗАПРОСЫ\n\n"
+        
+        for i, req in enumerate(all_requests, 1):
+            status_emoji = {
+                'pending': '⏳',
+                'completed': '✅',
+                'cancelled': '❌'
+            }.get(req.get('status'), '📋')
+            
+            user_info = await get_user_by_id(req['user_id'], DATABASE_URL)
+            username = user_info.get('username', 'N/A') if user_info else 'N/A'
+            
+            text += (
+                f"{i}. {status_emoji} Запрос #{req['id']}\n"
+                f"   👤 Пользователь: {req['user_id']} (@{username})\n"
+                f"   💰 Сумма: ${float(req['amount']):.2f}\n"
+                f"   📅 Дата: {req['created_at'].astimezone(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M')}\n"
+                f"   📊 Статус: {req['status']}\n\n"
+            )
+        
+        await callback.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_withdrawals")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_referral")]
+            ])
+        )
+        return
+    
+    await callback.message.edit_text(
+        f"💰 ОЖИДАЮЩИЕ ЗАПРОСЫ НА ВЫВОД ({len(pending_requests)})\n\n"
+        f"Выберите запрос для обработки:",
+        reply_markup=get_admin_withdrawal_keyboard(pending_requests)
+    )
+
+@router.callback_query(F.data.startswith("admin_withdrawal_") and not F.data.startswith("admin_withdrawal_approve_") and not F.data.startswith("admin_withdrawal_reject_"))
+async def admin_withdrawal_detail(callback: CallbackQuery, state: FSMContext):
+    """Детали запроса на вывод"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    try:
+        request_id = int(callback.data.split("_")[2])
+        
+        # Получаем информацию о запросе
+        requests = await execute_query(
+            "SELECT * FROM withdrawal_requests WHERE id = $1",
+            request_id,
+            database_url=DATABASE_URL
+        )
+        
+        if not requests or len(requests) == 0:
+            await callback.answer("❌ Запрос не найден!", show_alert=True)
+            return
+        
+        request = requests[0]
+        
+        # Получаем информацию о пользователе
+        user_info = await get_user_by_id(request['user_id'], DATABASE_URL)
+        
+        # Получаем баланс пользователя
+        balance_info = await get_user_balance(request['user_id'], DATABASE_URL)
+        
+        await state.update_data(request_id=request_id)
+        
+        text = (
+            f"💰 ЗАПРОС НА ВЫВОД #{request_id}\n\n"
+            f"👤 Пользователь:\n"
+            f"  • Имя: {user_info.get('first_name', 'N/A')}\n"
+            f"  • Username: @{user_info.get('username', 'N/A')}\n"
+            f"  • ID: {request['user_id']}\n\n"
+            f"💰 Детали запроса:\n"
+            f"  • Сумма: ${float(request['amount']):.2f}\n"
+            f"  • Дата: {request['created_at'].astimezone(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M')}\n"
+            f"  • Статус: {request['status']}\n\n"
+            f"📊 Баланс пользователя:\n"
+            f"  • Текущий баланс: ${balance_info['balance']:.2f}\n"
+            f"  • Всего заработано: ${balance_info['total_earned']:.2f}\n"
+            f"  • Выведено: ${balance_info['total_withdrawn']:.2f}\n\n"
+            f"📍 Действия:\n"
+            f"• Подтвердите вывод после отправки денег пользователю\n"
+            f"• Отклоните запрос, если есть проблемы\n"
+            f"• Можно добавить комментарий к обработке"
+        )
+        
+        await callback.message.edit_text(
+            text,
+            reply_markup=get_withdrawal_process_keyboard(request_id)
+        )
+        
+    except ValueError:
+        await callback.answer("❌ Ошибка!", show_alert=True)
+
+@router.callback_query(F.data.startswith("admin_withdrawal_approve_"))
+async def admin_withdrawal_approve(callback: CallbackQuery, state: FSMContext):
+    """Подтверждение вывода"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    try:
+        request_id = int(callback.data.split("_")[3])
+        
+        # Обрабатываем запрос
+        success, message_text = await process_withdrawal_request(
+            request_id, 
+            user_id, 
+            approve=True, 
+            admin_notes="Выплачено администратором",
+            database_url=DATABASE_URL
+        )
+        
+        if success:
+            # Получаем информацию о запросе
+            requests = await execute_query(
+                "SELECT * FROM withdrawal_requests WHERE id = $1",
+                request_id,
+                database_url=DATABASE_URL
+            )
+            
+            if requests and len(requests) > 0:
+                request = requests[0]
+                
+                # Отправляем уведомление пользователю
+                try:
+                    await bot.send_message(
+                        request['user_id'],
+                        f"✅ ВАШ ЗАПРОС НА ВЫВОД #{request_id} ВЫПОЛНЕН!\n\n"
+                        f"💰 Сумма: ${float(request['amount']):.2f}\n\n"
+                        f"📍 Администратор отправил вам деньги.\n"
+                        f"Если вы не получили выплату, свяжитесь с поддержкой.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🤝 Партнерская программа", callback_data="referral_program")]
+                        ])
+                    )
+                except Exception as e:
+                    logger.error(f"Не удалось уведомить пользователя {request['user_id']}: {e}")
+            
+            await callback.message.edit_text(
+                f"✅ Запрос #{request_id} подтвержден!\n\n"
+                f"Средства списаны с баланса пользователя.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💰 К запросам", callback_data="admin_withdrawals")],
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_referral")]
+                ])
+            )
+        else:
+            await callback.message.edit_text(
+                f"❌ Ошибка: {message_text}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💰 К запросам", callback_data="admin_withdrawals")],
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_referral")]
+                ])
+            )
+        
+        await state.clear()
+        
+    except ValueError:
+        await callback.answer("❌ Ошибка!", show_alert=True)
+
+@router.callback_query(F.data.startswith("admin_withdrawal_reject_"))
+async def admin_withdrawal_reject(callback: CallbackQuery, state: FSMContext):
+    """Отклонение вывода"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    try:
+        request_id = int(callback.data.split("_")[3])
+        
+        # Запрашиваем причину отклонения
+        await state.update_data(request_id=request_id)
+        await state.set_state(AdminStates.waiting_for_withdrawal_reason)
+        
+        await callback.message.edit_text(
+            f"❌ ОТКЛОНЕНИЕ ЗАПРОСА #{request_id}\n\n"
+            f"Введите причину отклонения (будет отправлена пользователю):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_withdrawals")]
+            ])
+        )
+        
+    except ValueError:
+        await callback.answer("❌ Ошибка!", show_alert=True)
+
+@router.message(AdminStates.waiting_for_withdrawal_reason)
+async def admin_withdrawal_reject_reason(message: Message, state: FSMContext):
+    """Обработка причины отклонения вывода"""
+    user_id = message.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await message.answer("❌ У вас нет прав администратора!")
+        await state.clear()
+        return
+    
+    data = await state.get_data()
+    request_id = data.get('request_id')
+    reason = message.text
+    
+    # Отклоняем запрос
+    success, _ = await process_withdrawal_request(
+        request_id, 
+        user_id, 
+        approve=False, 
+        admin_notes=reason,
+        database_url=DATABASE_URL
+    )
+    
+    if success:
+        # Получаем информацию о запросе
+        requests = await execute_query(
+            "SELECT * FROM withdrawal_requests WHERE id = $1",
+            request_id,
+            database_url=DATABASE_URL
+        )
+        
+        if requests and len(requests) > 0:
+            request = requests[0]
+            
+            # Отправляем уведомление пользователю
+            try:
+                await bot.send_message(
+                    request['user_id'],
+                    f"❌ ВАШ ЗАПРОС НА ВЫВОД #{request_id} ОТКЛОНЕН\n\n"
+                    f"💰 Сумма: ${float(request['amount']):.2f}\n"
+                    f"📝 Причина: {reason}\n\n"
+                    f"📍 Средства остались на вашем балансе.\n"
+                    f"Вы можете создать новый запрос или обратиться в поддержку.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🤝 Партнерская программа", callback_data="referral_program")]
+                    ])
+                )
+            except Exception as e:
+                logger.error(f"Не удалось уведомить пользователя {request['user_id']}: {e}")
+        
+        await message.answer(
+            f"✅ Запрос #{request_id} отклонен!\n\n"
+            f"Причина отправлена пользователю.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💰 К запросам", callback_data="admin_withdrawals")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_referral")]
+            ])
+        )
+    else:
+        await message.answer(
+            "❌ Ошибка при отклонении запроса!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💰 К запросам", callback_data="admin_withdrawals")]
+            ])
+        )
+    
+    await state.clear()
+
+@router.callback_query(F.data == "admin_reset_balance")
+async def admin_reset_balance_start(callback: CallbackQuery, state: FSMContext):
+    """Начало обнуления баланса пользователя"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.waiting_for_reset_balance_user_id)
+    
+    await callback.message.edit_text(
+        "🔄 ОБНУЛЕНИЕ БАЛАНСА ПОЛЬЗОВАТЕЛЯ\n\n"
+        "Введите ID пользователя для обнуления баланса:\n\n"
+        "📍 Эта операция спишет ВСЕ средства с баланса пользователя.\n"
+        "Используйте только в крайних случаях!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_referral")]
+        ])
+    )
+
+@router.message(AdminStates.waiting_for_reset_balance_user_id)
+async def admin_reset_balance_user_id(message: Message, state: FSMContext):
+    """Обработка ID пользователя для обнуления баланса"""
+    try:
+        target_user_id = int(message.text.strip())
+        
+        # Проверяем существование пользователя
+        user = await get_user_by_id(target_user_id, DATABASE_URL)
+        if not user:
+            await message.answer(
+                "❌ Пользователь с таким ID не найден!\n\n"
+                "Проверьте ID и попробуйте снова:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_referral")]
+                ])
+            )
+            return
+        
+        # Получаем баланс
+        balance_info = await get_user_balance(target_user_id, DATABASE_URL)
+        
+        if balance_info['balance'] <= 0:
+            await message.answer(
+                f"❌ Баланс пользователя {target_user_id} уже нулевой!",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_referral")]
+                ])
+            )
+            await state.clear()
+            return
+        
+        # Обнуляем баланс
+        success, result_message = await reset_user_balance(target_user_id, message.from_user.id, DATABASE_URL)
+        
+        if success:
+            await message.answer(
+                f"✅ Баланс пользователя {target_user_id} обнулен!\n\n"
+                f"Списано: ${balance_info['balance']:.2f}\n"
+                f"Пользователь уведомлен.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💰 Управление партнерской программой", callback_data="admin_referral")]
+                ])
+            )
+            
+            # Уведомляем пользователя
+            try:
+                await bot.send_message(
+                    target_user_id,
+                    f"⚠️ ВАШ БАЛАНС БЫЛ ОБНУЛЕН АДМИНИСТРАТОРОМ\n\n"
+                    f"💰 Сумма: ${balance_info['balance']:.2f}\n\n"
+                    f"📍 Если у вас есть вопросы, обратитесь в поддержку: @{ADMIN_CONTACT.replace('@', '')}"
+                )
+            except Exception as e:
+                logger.error(f"Не удалось уведомить пользователя {target_user_id}: {e}")
+        else:
+            await message.answer(
+                f"❌ {result_message}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_referral")]
+                ])
+            )
+        
+        await state.clear()
+        
+    except ValueError:
+        await message.answer(
+            "❌ ID пользователя должен быть числом!\n\n"
+            "Введите ID пользователя:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_referral")]
+            ])
+        )
+
+@router.callback_query(F.data == "admin_ref_stats")
+async def admin_ref_stats(callback: CallbackQuery):
+    """Статистика партнерской программы для админа"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    # Получаем всех пользователей
+    all_users = await get_all_users(DATABASE_URL)
+    
+    # Собираем статистику
+    total_users = len(all_users)
+    users_with_balance = 0
+    total_balance = 0.0
+    total_earned_all = 0.0
+    total_withdrawn_all = 0.0
+    
+    # Статистика по рефералам
+    total_referrals = 0
+    referrals_by_status = {'pending': 0, 'standard': 0, 'vip': 0, 'completed': 0}
+    
+    for user in all_users:
+        balance_info = await get_user_balance(user['id'], DATABASE_URL)
+        if balance_info['balance'] > 0:
+            users_with_balance += 1
+        total_balance += balance_info['balance']
+        total_earned_all += balance_info['total_earned']
+        total_withdrawn_all += balance_info['total_withdrawn']
+        
+        # Статистика по рефералам этого пользователя
+        ref_stats = await execute_query('''
+            SELECT status, COUNT(*) as count 
+            FROM referrals 
+            WHERE referrer_id = $1 
+            GROUP BY status
+        ''', user['id'], database_url=DATABASE_URL)
+        
+        for stat in ref_stats or []:
+            status = stat['status']
+            count = stat['count']
+            if status in referrals_by_status:
+                referrals_by_status[status] += count
+                total_referrals += count
+    
+    text = (
+        f"📊 СТАТИСТИКА ПАРТНЕРСКОЙ ПРОГРАММЫ\n\n"
+        f"👥 Пользователи:\n"
+        f"• Всего пользователей: {total_users}\n"
+        f"• С положительным балансом: {users_with_balance}\n\n"
+        f"💰 Финансы:\n"
+        f"• Общий баланс: ${total_balance:.2f}\n"
+        f"• Всего заработано: ${total_earned_all:.2f}\n"
+        f"• Всего выведено: ${total_withdrawn_all:.2f}\n\n"
+        f"👥 Рефералы:\n"
+        f"• Всего рефералов: {total_referrals}\n"
+        f"• Ожидают подписки: {referrals_by_status['pending']}\n"
+        f"• С подпиской Standard: {referrals_by_status['standard']}\n"
+        f"• С подпиской VIP: {referrals_by_status['vip']}\n"
+        f"• Завершено: {referrals_by_status['completed']}\n\n"
+        f"📍 Топ партнеров (по балансу):\n"
+    )
+    
+    # Получаем топ партнеров
+    balances = await execute_query('''
+        SELECT user_id, balance 
+        FROM user_balances 
+        WHERE balance > 0 
+        ORDER BY balance DESC 
+        LIMIT 5
+    ''', database_url=DATABASE_URL)
+    
+    for i, bal in enumerate(balances or [], 1):
+        user_info = await get_user_by_id(bal['user_id'], DATABASE_URL)
+        name = user_info.get('first_name', 'N/A') if user_info else 'N/A'
+        username = user_info.get('username', 'N/A') if user_info else 'N/A'
+        text += f"{i}. {name} (@{username}) - ${float(bal['balance']):.2f}\n"
+    
+    if len(text) > 4000:
+        parts = split_message(text)
+        for i, part in enumerate(parts):
+            if i == 0:
+                await callback.message.edit_text(part)
+            else:
+                await callback.message.answer(part)
+    else:
+        await callback.message.edit_text(text)
+    
+    await callback.message.answer(
+        "👇 Выберите действие:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💰 Запросы на вывод", callback_data="admin_withdrawals")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_referral")]
+        ])
+    )
+
+# ========== INTEGRATION WITH TARIFF SYSTEM ==========
+# Добавляем обработку апгрейда тарифа для начисления бонусов
+@router.callback_query(F.data.startswith("tariff_"))
+async def select_tariff(callback: CallbackQuery):
+    """Выбор тарифа с начислением бонусов рефереру"""
+    tariff_id = callback.data.split("_")[1]
+    user_id = callback.from_user.id
+    user_tariff = await get_user_tariff(user_id, DATABASE_URL)
+    
+    if tariff_id == user_tariff:
+        await callback.answer("❌ Это ваш текущий тариф!", show_alert=True)
+        return
+    
+    tariff_info = TARIFFS.get(tariff_id)
+    if not tariff_info:
+        await callback.answer("❌ Тариф не найден!", show_alert=True)
+        return
+    
+    # Создаем заказ
+    success = await create_tariff_order(user_id, tariff_id, DATABASE_URL)
+    
+    if success:
+        await callback.message.edit_text(
+            f"🛒 Запрос на смену тарифа отправлен!\n\n"
+            f"📋 Детали:\n"
+            f"• Новый тариф: {tariff_info['name']}\n"
+            f"• Стоимость: {tariff_info['price']} {tariff_info['currency']}/месяц\n"
+            f"• Ваш ID: {user_id}\n\n"
+            f"📍 Дальнейшие действия:\n"
+            f"1. Свяжитесь с администратором для оплаты\n"
+            f"2. После оплаты подписка будет активирована\n"
+            f"3. Вы получите уведомление\n\n"
+            f"💬 Контакт: @{ADMIN_CONTACT.replace('@', '')}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ К тарифам", callback_data="tariffs")],
+                [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+            ])
+        )
+    else:
+        await callback.message.edit_text(
+            "❌ Ошибка при создании заказа!\n\n"
+            "Попробуйте позже или обратитесь в поддержку.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ К тарифам", callback_data="tariffs")],
+                [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
+            ])
+        )
+
+# Модифицируем обработчик подтверждения заказа для начисления бонусов
+@router.callback_query(F.data.startswith("admin_process_order_"))
+async def admin_process_order(callback: CallbackQuery, state: FSMContext):
+    """Обработка заказа с учетом реферальных бонусов"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    order_id = int(callback.data.split("_")[3])
+    
+    # Получаем информацию о заказе
+    orders = await execute_query(
+        "SELECT * FROM tariff_orders WHERE id = $1",
+        order_id,
+        database_url=DATABASE_URL
+    )
+    
+    if not orders:
+        await callback.answer("❌ Заказ не найден!", show_alert=True)
+        return
+    
+    order = orders[0]
+    await state.update_data(order_id=order_id, target_user_id=order['user_id'], tariff_id=order['tariff'])
+    
+    # Получаем информацию о пользователе
+    user = await get_user_by_id(order['user_id'], DATABASE_URL)
+    tariff_name = TARIFFS.get(order['tariff'], {}).get('name', order['tariff'])
+    
+    await state.set_state(AdminStates.waiting_for_days_selection)
+    
+    await callback.message.edit_text(
+        f"🛒 ОБРАБОТКА ЗАКАЗА #{order_id}\n\n"
+        f"👤 Пользователь: {user.get('first_name', 'N/A')} (@{user.get('username', 'N/A')})\n"
+        f"🆔 ID: {order['user_id']}\n"
+        f"💎 Запрошенный тариф: {tariff_name}\n"
+        f"📅 Дата заказа: {order['order_date'].astimezone(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"Выберите количество дней для подписки:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="7 дней", callback_data="admin_days_7"),
+                InlineKeyboardButton(text="30 дней", callback_data="admin_days_30")
+            ],
+            [
+                InlineKeyboardButton(text="90 дней", callback_data="admin_days_90"),
+                InlineKeyboardButton(text="180 дней", callback_data="admin_days_180")
+            ],
+            [
+                InlineKeyboardButton(text="365 дней", callback_data="admin_days_365"),
+                InlineKeyboardButton(text="📝 Другое", callback_data="admin_days_custom")
+            ],
+            [
+                InlineKeyboardButton(text="❌ Отменить заказ", callback_data="admin_cancel_order"),
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_orders")
+            ]
+        ])
+    )
+
+@router.callback_query(F.data == "admin_confirm_grant")
+async def admin_confirm_grant(callback: CallbackQuery, state: FSMContext):
+    """Подтверждение выдачи подписки с начислением бонусов рефереру"""
+    user_id = callback.from_user.id
+    
+    if user_id != ADMIN_ID:
+        await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
+        return
+    
+    data = await state.get_data()
+    target_user_id = data.get('target_user_id')
+    tariff_id = data.get('tariff_id')
+    days = data.get('days')
+    
+    # Обновляем подписку пользователя
+    success = await update_user_subscription(target_user_id, tariff_id, days, DATABASE_URL)
+    
+    if success:
+        # Начисляем бонус рефереру, если есть
+        bonus_earned, bonus_amount = await check_referral_upgrade(target_user_id, tariff_id, DATABASE_URL)
+        
+        # Получаем информацию о пользователе
+        user = await get_user_by_id(target_user_id, DATABASE_URL)
+        tariff_name = TARIFFS.get(tariff_id, {}).get('name', tariff_id)
+        
+        # Отправляем уведомление пользователю
+        try:
+            await bot.send_message(
+                target_user_id,
+                f"🎉 ВАМ ВЫДАНА ПОДПИСКА!\n\n"
+                f"💎 Тариф: {tariff_name}\n"
+                f"📅 Срок: {days} дней\n"
+                f"🆔 Ваш ID: {target_user_id}\n\n"
+                f"📍 Подписка активна с сегодняшнего дня.\n"
+                f"Вы можете проверить статус в разделе 'Моя статистика'.\n\n"
+                f"Спасибо за использование KOLES-TECH! 🤖"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление пользователю {target_user_id}: {e}")
+        
+        # Обновляем статус заказа, если он был
+        order_id = data.get('order_id')
+        if order_id:
+            await update_order_status(order_id, 'completed', f"Выдано админом {user_id} на {days} дней", DATABASE_URL)
+        else:
+            # Создаем запись о заказе
+            await execute_query('''
+                INSERT INTO tariff_orders (user_id, tariff, status, admin_notes)
+                VALUES ($1, $2, 'granted_by_admin', $3)
+            ''', target_user_id, tariff_id, f"Выдано админом {user_id} на {days} дней", database_url=DATABASE_URL)
+        
+        # Формируем результат
+        result_text = (
+            f"✅ Подписка успешно выдана!\n\n"
+            f"📋 Детали:\n"
+            f"👤 Пользователь: {user.get('first_name', 'N/A')} (@{user.get('username', 'N/A')})\n"
+            f"🆔 ID: {target_user_id}\n"
+            f"💎 Тариф: {tariff_name}\n"
+            f"📅 Срок: {days} дней\n"
+            f"👑 Выдал: админ {user_id}\n"
+            f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
+        )
+        
+        if bonus_earned:
+            result_text += f"\n\n💰 Реферальный бонус: +${bonus_amount:.2f} начислен рефереру!"
+        
+        await callback.message.edit_text(
+            result_text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Управление подписками", callback_data="admin_subscriptions")],
+                [InlineKeyboardButton(text="⬅️ Админ панель", callback_data="admin_panel")]
+            ])
+        )
+    else:
+        await callback.message.edit_text(
+            "❌ Ошибка при выдаче подписки!\n\n"
+            "Попробуйте позже или обратитесь к разработчику.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Управление подписками", callback_data="admin_subscriptions")],
+                [InlineKeyboardButton(text="⬅️ Админ панель", callback_data="admin_panel")]
+            ])
+        )
+    
+    await state.clear()
 
 # ========== AI HANDLERS ==========
 @router.callback_query(F.data == "ai_services")
@@ -403,10 +1511,8 @@ async def start_copywriter(callback: CallbackQuery, state: FSMContext):
     """Запуск AI копирайтера"""
     user_id = callback.from_user.id
     
-    # Получаем AI менеджер
     ai_manager = get_ai_manager()
     
-    # Проверка лимитов
     can_use, message_text, tariff_info = await check_ai_limits(user_id, 'copy', DATABASE_URL, ai_manager)
     if not can_use:
         await callback.message.edit_text(
@@ -417,7 +1523,6 @@ async def start_copywriter(callback: CallbackQuery, state: FSMContext):
         )
         return
     
-    # Проверка времени между запросами
     can_request, wait_message = ai_manager.can_user_request(user_id)
     if not can_request:
         await callback.answer(wait_message, show_alert=True)
@@ -578,14 +1683,10 @@ async def process_word_count(callback: CallbackQuery, state: FSMContext):
         user_id = callback.from_user.id
         
         ai_manager = get_ai_manager()
-        
-        # Устанавливаем количество слов
         ai_manager.set_word_count(user_id, word_count)
         
-        # Получаем данные из состояния
         data = await state.get_data()
         
-        # Показываем превью запроса
         preview_text = (
             f"📋 Ваш запрос:\n\n"
             f"📌 Тема: {data['topic']}\n"
@@ -597,7 +1698,6 @@ async def process_word_count(callback: CallbackQuery, state: FSMContext):
         
         await callback.message.edit_text(preview_text)
         
-        # Создаем промпт
         current_date = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
         prompt = COPYWRITER_PROMPT.format(
             topic=data['topic'],
@@ -607,15 +1707,12 @@ async def process_word_count(callback: CallbackQuery, state: FSMContext):
             current_date=current_date
         )
         
-        # Индикатор прогресса
         progress_msg = await callback.message.answer("🔄 Пробую ключ #1...")
         
-        # Генерируем текст
         generated_text = await generate_with_gemini_advanced(prompt, user_id, ai_manager, max_retries=8)
         
         await progress_msg.delete()
         
-        # Обработка результата
         if not generated_text:
             system_stats = ai_manager.get_system_stats()
             available_keys = system_stats['available_keys']
@@ -624,13 +1721,8 @@ async def process_word_count(callback: CallbackQuery, state: FSMContext):
             await callback.message.edit_text(
                 f"❌ Не удалось сгенерировать текст после 8 попыток!\n\n"
                 f"📊 Статистика системы:\n"
-                f"• Доступных ключей: {available_keys} из {total_keys}\n"
-                f"• Все ключи могут быть временно недоступны\n\n"
-                f"📌 Что можно сделать:\n"
-                f"1. Попробовать позже (через 5-10 минут)\n"
-                f"2. Проверить доступность новых ключей API\n"
-                f"3. Обратиться в поддержку: {SUPPORT_URL}\n\n"
-                f"⚠️ Система автоматически попробует другие ключи при следующем запросе.",
+                f"• Доступных ключей: {available_keys} из {total_keys}\n\n"
+                f"Попробуйте позже или обратитесь в поддержку.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="🔄 Попробовать еще раз", callback_data="ai_copywriter")],
                     [InlineKeyboardButton(text="⬅️ В меню AI", callback_data="ai_services")]
@@ -639,11 +1731,9 @@ async def process_word_count(callback: CallbackQuery, state: FSMContext):
             await state.clear()
             return
         
-        # Обновляем статистику
         session = ai_manager.get_session(user_id)
         session['copies_used'] += 1
         
-        # Логируем успешный запрос
         await update_ai_usage_log(
             user_id=user_id,
             service_type='copy',
@@ -655,7 +1745,6 @@ async def process_word_count(callback: CallbackQuery, state: FSMContext):
             database_url=DATABASE_URL
         )
         
-        # Форматируем результат
         actual_word_count = len(generated_text.split())
         attempts = session['current_attempts'] or 1
         
@@ -664,15 +1753,13 @@ async def process_word_count(callback: CallbackQuery, state: FSMContext):
             f"📊 Детали:\n"
             f"• Запрошено слов: {word_count}\n"
             f"• Получено слов: {actual_word_count}\n"
-            f"• Символов: {len(generated_text)}\n"
-            f"• Время генерации: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}\n\n"
+            f"• Символов: {len(generated_text)}\n\n"
             f"📝 Результат:\n\n"
             f"{generated_text}\n\n"
             f"📈 Статистика:\n"
             f"• Использовано сегодня: {session['copies_used']}/{TARIFFS.get(await get_user_tariff(user_id, DATABASE_URL), TARIFFS['mini'])['ai_copies_limit']}"
         )
         
-        # Отправляем результат (разбиваем если нужно)
         if len(result_text) > 4000:
             parts = split_message(result_text)
             for i, part in enumerate(parts):
@@ -683,7 +1770,6 @@ async def process_word_count(callback: CallbackQuery, state: FSMContext):
         else:
             await callback.message.edit_text(result_text)
         
-        # Клавиатура действий с текстом
         action_keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="📱 Отправить в чат", callback_data="send_to_chat"),
@@ -698,7 +1784,6 @@ async def process_word_count(callback: CallbackQuery, state: FSMContext):
             ]
         ])
         
-        # Сохраняем сгенерированный текст в состоянии
         await state.update_data(generated_text=generated_text)
         
         await callback.message.answer(
@@ -730,7 +1815,6 @@ async def process_custom_word_count(message: Message, state: FSMContext):
         
         data = await state.get_data()
         
-        # Показываем превью запроса
         preview_text = (
             f"📋 Ваш запрос:\n\n"
             f"📌 Тема: {data['topic']}\n"
@@ -742,7 +1826,6 @@ async def process_custom_word_count(message: Message, state: FSMContext):
         
         await message.answer(preview_text)
         
-        # Создаем промпт
         current_date = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
         prompt = COPYWRITER_PROMPT.format(
             topic=data['topic'],
@@ -752,15 +1835,12 @@ async def process_custom_word_count(message: Message, state: FSMContext):
             current_date=current_date
         )
         
-        # Индикатор прогресса
         progress_msg = await message.answer("🔄 Пробую ключ #1...")
         
-        # Генерируем текст
         generated_text = await generate_with_gemini_advanced(prompt, user_id, ai_manager, max_retries=8)
         
         await progress_msg.delete()
         
-        # Обработка результата
         if not generated_text:
             system_stats = ai_manager.get_system_stats()
             available_keys = system_stats['available_keys']
@@ -769,8 +1849,7 @@ async def process_custom_word_count(message: Message, state: FSMContext):
             await message.answer(
                 f"❌ Не удалось сгенерировать текст после 8 попыток!\n\n"
                 f"📊 Статистика системы:\n"
-                f"• Доступных ключей: {available_keys} из {total_keys}\n"
-                f"• Все ключи могут быть временно недоступны\n\n"
+                f"• Доступных ключей: {available_keys} из {total_keys}\n\n"
                 f"Попробуйте позже или обратитесь в поддержку.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="🔄 Попробовать еще раз", callback_data="ai_copywriter")],
@@ -779,11 +1858,9 @@ async def process_custom_word_count(message: Message, state: FSMContext):
             )
             return
         
-        # Обновляем статистику
         session = ai_manager.get_session(user_id)
         session['copies_used'] += 1
         
-        # Логируем успешный запрос
         await update_ai_usage_log(
             user_id=user_id,
             service_type='copy',
@@ -795,7 +1872,6 @@ async def process_custom_word_count(message: Message, state: FSMContext):
             database_url=DATABASE_URL
         )
         
-        # Форматируем результат
         actual_word_count = len(generated_text.split())
         attempts = session['current_attempts'] or 1
         
@@ -804,15 +1880,13 @@ async def process_custom_word_count(message: Message, state: FSMContext):
             f"📊 Детали:\n"
             f"• Запрошено слов: {word_count}\n"
             f"• Получено слов: {actual_word_count}\n"
-            f"• Символов: {len(generated_text)}\n"
-            f"• Время генерации: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}\n\n"
+            f"• Символов: {len(generated_text)}\n\n"
             f"📝 Результат:\n\n"
             f"{generated_text}\n\n"
             f"📈 Статистика:\n"
             f"• Использовано сегодня: {session['copies_used']}/{TARIFFS.get(await get_user_tariff(user_id, DATABASE_URL), TARIFFS['mini'])['ai_copies_limit']}"
         )
         
-        # Отправляем результат (разбиваем если нужно)
         if len(result_text) > 4000:
             parts = split_message(result_text)
             for i, part in enumerate(parts):
@@ -820,7 +1894,6 @@ async def process_custom_word_count(message: Message, state: FSMContext):
         else:
             await message.answer(result_text)
         
-        # Клавиатура действий с текстом
         action_keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="📱 Отправить в чат", callback_data="send_to_chat"),
@@ -857,7 +1930,6 @@ async def start_ideas_generator(callback: CallbackQuery, state: FSMContext):
     
     ai_manager = get_ai_manager()
     
-    # Проверка лимитов
     can_use, message_text, tariff_info = await check_ai_limits(user_id, 'ideas', DATABASE_URL, ai_manager)
     if not can_use:
         await callback.message.edit_text(
@@ -868,7 +1940,6 @@ async def start_ideas_generator(callback: CallbackQuery, state: FSMContext):
         )
         return
     
-    # Проверка времени между запросами
     can_request, wait_message = ai_manager.can_user_request(user_id)
     if not can_request:
         await callback.answer(wait_message, show_alert=True)
@@ -938,14 +2009,12 @@ async def generate_ideas(callback: CallbackQuery, state: FSMContext):
     
     ai_manager = get_ai_manager()
     
-    # Показываем индикатор
     await callback.message.edit_text(
         f"💡 Генерация {count} идей по теме:\n"
         f"📌 '{data['topic']}'\n\n"
         f"⏳ Это займет 10-30 секунд..."
     )
     
-    # Генерация идей
     current_date = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
     prompt = IDEAS_PROMPT.format(
         count=count,
@@ -959,7 +2028,6 @@ async def generate_ideas(callback: CallbackQuery, state: FSMContext):
     
     await loading_msg.delete()
     
-    # Обработка результата
     if not generated_ideas:
         system_stats = ai_manager.get_system_stats()
         available_keys = system_stats['available_keys']
@@ -968,8 +2036,7 @@ async def generate_ideas(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(
             f"❌ Не удалось сгенерировать идеи после 8 попыток!\n\n"
             f"📊 Статистика системы:\n"
-            f"• Доступных ключей: {available_keys} из {total_keys}\n"
-            f"• Все ключи могут быть временно недоступны\n\n"
+            f"• Доступных ключей: {available_keys} из {total_keys}\n\n"
             f"Попробуйте позже или обратитесь в поддержку.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔄 Попробовать еще раз", callback_data="ai_ideas")],
@@ -979,7 +2046,6 @@ async def generate_ideas(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         return
     
-    # Форматируем результат
     ideas_list = generated_ideas.split('\n')
     formatted_ideas = []
     
@@ -987,11 +2053,9 @@ async def generate_ideas(callback: CallbackQuery, state: FSMContext):
         if idea.strip():
             formatted_ideas.append(f"{i}. {idea.strip()}")
     
-    # Обновляем статистику
     session = ai_manager.get_session(callback.from_user.id)
     session['ideas_used'] += 1
     
-    # Логируем успешный запрос
     await update_ai_usage_log(
         user_id=callback.from_user.id,
         service_type='ideas',
@@ -1012,7 +2076,6 @@ async def generate_ideas(callback: CallbackQuery, state: FSMContext):
         f"• Использовано сегодня: {session['ideas_used']}/{TARIFFS.get(await get_user_tariff(callback.from_user.id, DATABASE_URL), TARIFFS['mini'])['ai_ideas_limit']}"
     )
     
-    # Разбиваем длинные сообщения
     if len(result_text) > 4000:
         parts = split_message(result_text)
         for i, part in enumerate(parts):
@@ -1044,7 +2107,6 @@ async def show_ai_limits(callback: CallbackQuery):
     ai_manager = get_ai_manager()
     session = ai_manager.get_session(user_id)
     
-    # Рассчитываем оставшееся время до сброса
     today = datetime.now(MOSCOW_TZ).date()
     reset_time = datetime.combine(today + timedelta(days=1), datetime.min.time())
     reset_time = MOSCOW_TZ.localize(reset_time)
@@ -1129,13 +2191,12 @@ async def cancel_ai(callback: CallbackQuery, state: FSMContext):
         ])
     )
 
-# ========== ИСПРАВЛЕННЫЕ HANDLERS ПЛАНИРОВАНИЯ ПОСТОВ ==========
+# ========== SCHEDULED POSTS HANDLERS ==========
 @router.callback_query(F.data == "schedule_post")
 async def schedule_post_start(callback: CallbackQuery, state: FSMContext):
     """Начало планирования поста"""
     user_id = callback.from_user.id
     
-    # Проверяем лимиты постов
     posts_today = await get_user_posts_today(user_id, DATABASE_URL)
     channels_limit, posts_limit, _, _ = await get_tariff_limits(user_id, DATABASE_URL)
     
@@ -1159,7 +2220,6 @@ async def schedule_post_start(callback: CallbackQuery, state: FSMContext):
         )
         return
     
-    # Получаем каналы пользователя
     channels = await get_user_channels(user_id, DATABASE_URL)
     
     if not channels:
@@ -1193,7 +2253,6 @@ async def select_channel(callback: CallbackQuery, state: FSMContext):
     """Выбор канала"""
     channel_id = int(callback.data.split("_")[1])
     
-    # Получаем название канала
     channels = await get_user_channels(callback.from_user.id, DATABASE_URL)
     channel_name = "Неизвестный канал"
     for channel in channels:
@@ -1329,7 +2388,6 @@ async def process_content(message: Message, state: FSMContext):
 async def process_date(message: Message, state: FSMContext):
     """Обработка даты"""
     try:
-        # Пробуем разные форматы дат
         date_formats = ["%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"]
         date_obj = None
         
@@ -1354,7 +2412,6 @@ async def process_date(message: Message, state: FSMContext):
             )
             return
         
-        # Проверяем что дата в будущем
         now = datetime.now(MOSCOW_TZ)
         input_date = MOSCOW_TZ.localize(datetime.combine(date_obj.date(), datetime.min.time()))
         
@@ -1409,7 +2466,6 @@ async def process_time(message: Message, state: FSMContext):
         data = await state.get_data()
         date_str = data.get('date_str')
         
-        # Парсим полную дату и время
         scheduled_datetime = parse_datetime(date_str, message.text.strip(), MOSCOW_TZ)
         
         if not scheduled_datetime:
@@ -1425,7 +2481,6 @@ async def process_time(message: Message, state: FSMContext):
             )
             return
         
-        # Проверяем что время в будущем
         now = datetime.now(MOSCOW_TZ)
         if scheduled_datetime <= now:
             await message.answer(
@@ -1442,7 +2497,6 @@ async def process_time(message: Message, state: FSMContext):
         await state.update_data(scheduled_datetime=scheduled_datetime)
         await state.set_state(PostStates.waiting_for_confirmation)
         
-        # Форматируем информацию для подтверждения
         channel_name = data.get('channel_name', 'Неизвестный канал')
         post_data = data.get('post_data', {})
         
@@ -1496,7 +2550,6 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
     post_data = data.get('post_data', {})
     scheduled_datetime = data.get('scheduled_datetime')
     
-    # Сохраняем пост в базу данных
     post_id = await save_scheduled_post(user_id, channel_id, post_data, scheduled_datetime, MOSCOW_TZ, DATABASE_URL)
     
     if not post_id:
@@ -1510,7 +2563,6 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         return
     
-    # Добавляем задачу в планировщик
     scheduled_success = await schedule_post_in_scheduler(post_id, scheduled_datetime, scheduler, bot, send_scheduled_post, MOSCOW_TZ, DATABASE_URL)
     
     if not scheduled_success:
@@ -1525,7 +2577,6 @@ async def confirm_post(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         return
     
-    # Увеличиваем счетчик постов пользователя
     await increment_user_posts(user_id, DATABASE_URL)
     
     await callback.message.edit_text(
@@ -1564,11 +2615,13 @@ async def show_my_stats(callback: CallbackQuery):
     ai_manager = get_ai_manager()
     stats = await get_user_stats(user_id, DATABASE_URL, ai_manager)
     
+    # Добавляем информацию о реферальном балансе
+    balance_info = await get_user_balance(user_id, DATABASE_URL)
+    
     system_stats = ai_manager.get_system_stats()
     available_keys = system_stats['available_keys']
     total_keys = system_stats['total_keys']
     
-    # Форматируем дату окончания подписки
     expires_info = ""
     if stats.get('subscription_expires'):
         expires_date = stats['subscription_expires']
@@ -1592,6 +2645,10 @@ async def show_my_stats(callback: CallbackQuery):
         f"• Копирайтинг: {stats.get('ai_copies_used', 0)}/{stats.get('ai_copies_limit', 1)}\n"
         f"• Идеи: {stats.get('ai_ideas_used', 0)}/{stats.get('ai_ideas_limit', 10)}\n"
         f"• Всего AI запросов: {stats.get('total_ai_requests', 0)}\n\n"
+        f"💰 Партнерская программа:\n"
+        f"• Баланс: ${balance_info['balance']:.2f}\n"
+        f"• Всего заработано: ${balance_info['total_earned']:.2f}\n"
+        f"• Выведено: ${balance_info['total_withdrawn']:.2f}\n\n"
         f"🔑 Система ключей:\n"
         f"• Доступных ключей: {available_keys} из {total_keys}\n\n"
         f"📍 Время по Москве: {datetime.now(MOSCOW_TZ).strftime('%H:%M')}"
@@ -1639,7 +2696,6 @@ async def show_my_channels(callback: CallbackQuery):
             ])
         )
     except Exception as e:
-        # Если сообщение не изменилось, игнорируем ошибку
         if "message is not modified" in str(e):
             await callback.answer("Список каналов не изменился")
         else:
@@ -1651,11 +2707,9 @@ async def handle_forwarded_channel_message(message: Message):
     """Обработка пересланных сообщений из канала для добавления канала"""
     user_id = message.from_user.id
     
-    # Проверяем, является ли сообщение из канала
     if message.forward_from_chat:
         channel = message.forward_from_chat
         
-        # Проверяем лимит каналов
         channels_count = await get_user_channels_count(user_id, DATABASE_URL)
         channels_limit, _, _, _ = await get_tariff_limits(user_id, DATABASE_URL)
         
@@ -1673,11 +2727,9 @@ async def handle_forwarded_channel_message(message: Message):
             )
             return
         
-        # Добавляем канал
         success = await add_user_channel(user_id, channel.id, channel.title or f"Канал {channel.id}", DATABASE_URL)
         
         if success:
-            # Получаем обновленное количество каналов
             new_count = await get_user_channels_count(user_id, DATABASE_URL)
             
             await message.answer(
@@ -1752,52 +2804,6 @@ async def show_tariffs(callback: CallbackQuery):
         reply_markup=get_tariffs_keyboard(user_tariff)
     )
 
-@router.callback_query(F.data.startswith("tariff_"))
-async def select_tariff(callback: CallbackQuery):
-    """Выбор тарифа"""
-    tariff_id = callback.data.split("_")[1]
-    user_id = callback.from_user.id
-    user_tariff = await get_user_tariff(user_id, DATABASE_URL)
-    
-    if tariff_id == user_tariff:
-        await callback.answer("❌ Это ваш текущий тариф!", show_alert=True)
-        return
-    
-    tariff_info = TARIFFS.get(tariff_id)
-    if not tariff_info:
-        await callback.answer("❌ Тариф не найден!", show_alert=True)
-        return
-    
-    # Создаем заказ
-    success = await create_tariff_order(user_id, tariff_id, DATABASE_URL)
-    
-    if success:
-        await callback.message.edit_text(
-            f"🛒 Запрос на смену тарифа отправлен!\n\n"
-            f"📋 Детали:\n"
-            f"• Новый тариф: {tariff_info['name']}\n"
-            f"• Стоимость: {tariff_info['price']} {tariff_info['currency']}/месяц\n"
-            f"• Ваш ID: {user_id}\n\n"
-            f"📍 Дальнейшие действия:\n"
-            f"1. Свяжитесь с администратором для оплаты\n"
-            f"2. После оплаты подписка будет активирована\n"
-            f"3. Вы получите уведомление\n\n"
-            f"💬 Контакт: @{ADMIN_CONTACT.replace('@', '')}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ К тарифам", callback_data="tariffs")],
-                [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
-            ])
-        )
-    else:
-        await callback.message.edit_text(
-            "❌ Ошибка при создании заказа!\n\n"
-            "Попробуйте позже или обратитесь в поддержку.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ К тарифам", callback_data="tariffs")],
-                [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_to_main")]
-            ])
-        )
-
 # ========== BACK HANDLERS ==========
 @router.callback_query(F.data == "back_to_main")
 async def back_to_main(callback: CallbackQuery, state: FSMContext):
@@ -1823,7 +2829,7 @@ async def cancel_action(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_main_menu(user_id, is_admin)
     )
 
-# ========== ИСПРАВЛЕННЫЕ ADMIN HANDLERS ==========
+# ========== ADMIN PANEL HANDLERS ==========
 @router.callback_query(F.data == "admin_panel")
 async def admin_panel(callback: CallbackQuery):
     """Админ панель"""
@@ -1833,7 +2839,6 @@ async def admin_panel(callback: CallbackQuery):
         await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
         return
     
-    # Получаем статистику
     total_users = await execute_query("SELECT COUNT(*) as count FROM users", database_url=DATABASE_URL)
     total_users = total_users[0]['count'] if total_users else 0
     
@@ -1846,6 +2851,10 @@ async def admin_panel(callback: CallbackQuery):
     active_subscriptions = await execute_query("SELECT COUNT(*) as count FROM users WHERE tariff_expires >= CURRENT_DATE", database_url=DATABASE_URL)
     active_subscriptions = active_subscriptions[0]['count'] if active_subscriptions else 0
     
+    # Статистика партнерской программы
+    pending_withdrawals = await execute_query("SELECT COUNT(*) as count FROM withdrawal_requests WHERE status = 'pending'", database_url=DATABASE_URL)
+    pending_withdrawals = pending_withdrawals[0]['count'] if pending_withdrawals else 0
+    
     ai_manager = get_ai_manager()
     system_stats = ai_manager.get_system_stats() if ai_manager else {'total_keys': 0, 'available_keys': 0, 'total_requests': 0}
     
@@ -1856,6 +2865,8 @@ async def admin_panel(callback: CallbackQuery):
         f"• Активных (7 дней): {active_users}\n"
         f"• Активных подписок: {active_subscriptions}\n"
         f"• Ожидающих заказов: {pending_orders}\n\n"
+        f"💰 Партнерская программа:\n"
+        f"• Ожидающих выводов: {pending_withdrawals}\n\n"
         f"🤖 AI система:\n"
         f"• Всего ключей: {system_stats['total_keys']}\n"
         f"• Доступных ключей: {system_stats['available_keys']}\n"
@@ -1906,7 +2917,7 @@ async def admin_all_users(callback: CallbackQuery):
     
     users_text = "📋 ВСЕ ПОЛЬЗОВАТЕЛИ\n\n"
     
-    for i, user in enumerate(users[:20], 1):  # Показываем первые 20
+    for i, user in enumerate(users[:20], 1):
         tariff_name = TARIFFS.get(user.get('tariff', 'mini'), {}).get('name', user.get('tariff'))
         created_date = user.get('created_at').strftime('%d.%m.%Y') if user.get('created_at') else 'N/A'
         
@@ -2062,7 +3073,6 @@ async def admin_orders(callback: CallbackQuery):
     orders = await get_tariff_orders(status='pending', database_url=DATABASE_URL)
     
     if not orders:
-        # Показываем последние завершенные заказы
         orders = await get_tariff_orders(database_url=DATABASE_URL)
         orders = orders[:10] if orders else []
         
@@ -2122,7 +3132,6 @@ async def admin_process_order(callback: CallbackQuery, state: FSMContext):
     
     order_id = int(callback.data.split("_")[3])
     
-    # Получаем информацию о заказе
     orders = await execute_query(
         "SELECT * FROM tariff_orders WHERE id = $1",
         order_id,
@@ -2136,7 +3145,6 @@ async def admin_process_order(callback: CallbackQuery, state: FSMContext):
     order = orders[0]
     await state.update_data(order_id=order_id, target_user_id=order['user_id'], tariff_id=order['tariff'])
     
-    # Получаем информацию о пользователе
     user = await get_user_by_id(order['user_id'], DATABASE_URL)
     tariff_name = TARIFFS.get(order['tariff'], {}).get('name', order['tariff'])
     
@@ -2216,7 +3224,6 @@ async def admin_ai_stats(callback: CallbackQuery):
     
     system_stats = ai_manager.get_system_stats()
     
-    # Получаем статистику из логов
     ai_logs = await execute_query('''
         SELECT 
             COUNT(*) as total,
@@ -2241,7 +3248,6 @@ async def admin_ai_stats(callback: CallbackQuery):
         f"📈 Использование моделей:\n"
     )
     
-    # Статистика по моделям
     model_stats = {}
     for log in ai_logs:
         model_name = log.get('model_name', 'unknown')
@@ -2295,7 +3301,6 @@ async def admin_ai_detailed(callback: CallbackQuery):
         await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
         return
     
-    # Получаем топ пользователей по AI запросам
     top_users = await execute_query('''
         SELECT 
             user_id,
@@ -2322,7 +3327,6 @@ async def admin_ai_detailed(callback: CallbackQuery):
             f"   • Токенов: {user['total_prompt'] + user['total_response']}\n\n"
         )
     
-    # Получаем статистику по дням
     daily_stats = await execute_query('''
         SELECT 
             DATE(created_at AT TIME ZONE 'Europe/Moscow') as date,
@@ -2392,7 +3396,6 @@ async def admin_broadcast_process(message: Message, state: FSMContext):
     
     broadcast_text = message.text
     
-    # Получаем всех пользователей
     users = await get_all_users(DATABASE_URL)
     
     if not users:
@@ -2417,7 +3420,6 @@ async def admin_broadcast_process(message: Message, state: FSMContext):
             fail_count += 1
             logger.error(f"Ошибка отправки рассылки пользователю {user['id']}: {e}")
         
-        # Обновляем статус каждые 10 пользователей
         if (i + 1) % 10 == 0:
             await status_msg.edit_text(f"📤 Рассылка: {i + 1}/{len(users)}...")
     
@@ -2459,7 +3461,6 @@ async def admin_force_tariff_user_id(message: Message, state: FSMContext):
     try:
         target_user_id = int(message.text.strip())
         
-        # Проверяем существование пользователя
         user = await get_user_by_id(target_user_id, DATABASE_URL)
         if not user:
             await message.answer(
@@ -2505,11 +3506,9 @@ async def admin_force_tariff_select(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     target_user_id = data.get('target_user_id')
     
-    # Принудительно обновляем тариф
     success, message_text = await force_update_user_tariff(target_user_id, tariff_id, user_id, DATABASE_URL)
     
     if success:
-        # Отправляем уведомление пользователю
         try:
             tariff_name = TARIFFS.get(tariff_id, {}).get('name', tariff_id)
             await bot.send_message(
@@ -2598,7 +3597,6 @@ async def admin_process_user_id(message: Message, state: FSMContext):
         data = await state.get_data()
         action = data.get('action')
         
-        # Проверяем существование пользователя
         user = await get_user_by_id(target_user_id, DATABASE_URL)
         if not user:
             await message.answer(
@@ -2630,7 +3628,6 @@ async def admin_process_user_id(message: Message, state: FSMContext):
                 ])
             )
         elif action == "extend":
-            # Получаем информацию о текущей подписке
             subscription_info = await get_user_subscription_info(target_user_id, DATABASE_URL)
             
             if subscription_info.get('expired') and not subscription_info.get('expires'):
@@ -2704,7 +3701,6 @@ async def admin_process_tariff_selection(callback: CallbackQuery, state: FSMCont
     data = await state.get_data()
     target_user_id = data.get('target_user_id')
     
-    # Преобразуем ID тарифа
     tariff_map = {
         'standard': 'standard',
         'vip': 'vip'
@@ -2713,7 +3709,6 @@ async def admin_process_tariff_selection(callback: CallbackQuery, state: FSMCont
     
     await state.update_data(tariff_id=tariff_id)
     
-    # Получаем информацию о пользователе
     user = await get_user_by_id(target_user_id, DATABASE_URL)
     
     await state.set_state(AdminStates.waiting_for_days_selection)
@@ -2939,7 +3934,7 @@ async def admin_process_custom_days(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "admin_confirm_grant")
 async def admin_confirm_grant(callback: CallbackQuery, state: FSMContext):
-    """Подтверждение выдачи подписки"""
+    """Подтверждение выдачи подписки с начислением бонусов рефереру"""
     user_id = callback.from_user.id
     
     if user_id != ADMIN_ID:
@@ -2951,15 +3946,15 @@ async def admin_confirm_grant(callback: CallbackQuery, state: FSMContext):
     tariff_id = data.get('tariff_id')
     days = data.get('days')
     
-    # Обновляем подписку пользователя
     success = await update_user_subscription(target_user_id, tariff_id, days, DATABASE_URL)
     
     if success:
-        # Получаем информацию о пользователе
+        # Начисляем бонус рефереру, если есть
+        bonus_earned, bonus_amount = await check_referral_upgrade(target_user_id, tariff_id, DATABASE_URL)
+        
         user = await get_user_by_id(target_user_id, DATABASE_URL)
         tariff_name = TARIFFS.get(tariff_id, {}).get('name', tariff_id)
         
-        # Отправляем уведомление пользователю
         try:
             await bot.send_message(
                 target_user_id,
@@ -2974,18 +3969,16 @@ async def admin_confirm_grant(callback: CallbackQuery, state: FSMContext):
         except Exception as e:
             logger.error(f"Не удалось отправить уведомление пользователю {target_user_id}: {e}")
         
-        # Обновляем статус заказа, если он был
         order_id = data.get('order_id')
         if order_id:
             await update_order_status(order_id, 'completed', f"Выдано админом {user_id} на {days} дней", DATABASE_URL)
         else:
-            # Создаем запись о заказе
             await execute_query('''
                 INSERT INTO tariff_orders (user_id, tariff, status, admin_notes)
                 VALUES ($1, $2, 'granted_by_admin', $3)
             ''', target_user_id, tariff_id, f"Выдано админом {user_id} на {days} дней", database_url=DATABASE_URL)
         
-        await callback.message.edit_text(
+        result_text = (
             f"✅ Подписка успешно выдана!\n\n"
             f"📋 Детали:\n"
             f"👤 Пользователь: {user.get('first_name', 'N/A')} (@{user.get('username', 'N/A')})\n"
@@ -2993,7 +3986,14 @@ async def admin_confirm_grant(callback: CallbackQuery, state: FSMContext):
             f"💎 Тариф: {tariff_name}\n"
             f"📅 Срок: {days} дней\n"
             f"👑 Выдал: админ {user_id}\n"
-            f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}",
+            f"🕐 Время: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
+        )
+        
+        if bonus_earned:
+            result_text += f"\n\n💰 Реферальный бонус: +${bonus_amount:.2f} начислен рефереру!"
+        
+        await callback.message.edit_text(
+            result_text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="💎 Управление подписками", callback_data="admin_subscriptions")],
                 [InlineKeyboardButton(text="⬅️ Админ панель", callback_data="admin_panel")]
@@ -3024,20 +4024,16 @@ async def admin_confirm_extend(callback: CallbackQuery, state: FSMContext):
     target_user_id = data.get('target_user_id')
     days = data.get('days')
     
-    # Получаем текущий тариф пользователя
     user = await get_user_by_id(target_user_id, DATABASE_URL)
     current_tariff = user.get('tariff', 'mini')
     
-    # Обновляем подписку пользователя
     success = await update_user_subscription(target_user_id, current_tariff, days, DATABASE_URL)
     
     if success:
         tariff_name = TARIFFS.get(current_tariff, {}).get('name', current_tariff)
         
-        # Получаем обновленную информацию о подписке
         subscription_info = await get_user_subscription_info(target_user_id, DATABASE_URL)
         
-        # Отправляем уведомление пользователю
         try:
             await bot.send_message(
                 target_user_id,
@@ -3053,12 +4049,10 @@ async def admin_confirm_extend(callback: CallbackQuery, state: FSMContext):
         except Exception as e:
             logger.error(f"Не удалось отправить уведомление пользователю {target_user_id}: {e}")
         
-        # Обновляем статус заказа, если он был
         order_id = data.get('order_id')
         if order_id:
             await update_order_status(order_id, 'completed', f"Продлено админом {user_id} на {days} дней", DATABASE_URL)
         else:
-            # Создаем запись о заказе
             await execute_query('''
                 INSERT INTO tariff_orders (user_id, tariff, status, admin_notes)
                 VALUES ($1, $2, 'extended_by_admin', $3)
@@ -3102,7 +4096,6 @@ async def admin_list_subscriptions(callback: CallbackQuery):
         await callback.answer("❌ У вас нет прав администратора!", show_alert=True)
         return
     
-    # Получаем активные подписки
     subscriptions = await execute_query('''
         SELECT id, username, first_name, tariff, tariff_expires, subscription_days
         FROM users 
@@ -3140,7 +4133,6 @@ async def admin_list_subscriptions(callback: CallbackQuery):
     
     subscriptions_text += f"📊 Итого: {total_active} активных подписок, {total_days} дней всего"
     
-    # Разбиваем длинное сообщение
     if len(subscriptions_text) > 4000:
         parts = split_message(subscriptions_text)
         for i, part in enumerate(parts):
@@ -3186,11 +4178,12 @@ async def start_web_server():
 async def on_startup():
     """Запуск бота"""
     logger.info("=" * 60)
-    logger.info(f"🚀 ЗАПУСК БОТА KOLES-TECH v3.0 (МОДУЛЬНАЯ ВЕРСИЯ)")
+    logger.info(f"🚀 ЗАПУСК БОТА KOLES-TECH v4.0 (С ПАРТНЕРСКОЙ ПРОГРАММОЙ)")
     logger.info(f"🤖 AI сервисы: ВКЛЮЧЕНЫ")
     logger.info(f"🔑 Gemini ключей: {len(GEMINI_API_KEYS)}")
     logger.info(f"👑 Admin ID: {ADMIN_ID}")
     logger.info(f"🆘 Поддержка: {SUPPORT_BOT_USERNAME or SUPPORT_URL}")
+    logger.info(f"💰 Партнерская программа: ВКЛЮЧЕНА")
     logger.info(f"🌐 Порт Railway: {PORT}")
     logger.info("=" * 60)
     
@@ -3199,11 +4192,19 @@ async def on_startup():
         await init_database(DATABASE_URL)
         await migrate_database(DATABASE_URL)
         
+        # Инициализация таблиц партнерской программы
+        await init_referral_tables(DATABASE_URL)
+        
         # Получаем AI менеджер
         ai_manager = get_ai_manager()
         if ai_manager:
             ai_manager.init_keys(GEMINI_API_KEYS)
             logger.info("✅ AI менеджер инициализирован с ключами")
+        
+        # Устанавливаем username бота
+        me = await bot.get_me()
+        set_bot_username(me.username)
+        logger.info(f"✅ Username бота: @{me.username}")
         
         # Запуск планировщика
         scheduler.start()
@@ -3218,7 +4219,6 @@ async def on_startup():
             id='reset_daily_limits'
         )
         
-        # Очистка сессий раз в день
         scheduler.add_job(
             cleanup_old_sessions_task,
             trigger='cron',
@@ -3228,7 +4228,6 @@ async def on_startup():
             id='cleanup_sessions'
         )
         
-        # Автоматическая ротация ключей каждые 15 минут
         scheduler.add_job(
             auto_rotate_keys_task,
             trigger='interval',
@@ -3236,10 +4235,8 @@ async def on_startup():
             id='auto_rotate_keys'
         )
         
-        # Восстановление запланированных постов
         await restore_scheduled_posts(scheduler, send_scheduled_post, bot, logger, MOSCOW_TZ, DATABASE_URL)
         
-        # Проверка планировщика каждые 30 минут
         scheduler.add_job(
             check_scheduler_status,
             trigger='interval',
@@ -3247,11 +4244,8 @@ async def on_startup():
             id='check_scheduler'
         )
         
-        # Получаем информацию о боте
-        me = await bot.get_me()
         logger.info(f"✅ Бот @{me.username} запущен (ID: {me.id})")
         
-        # Уведомление админа
         if ADMIN_ID:
             try:
                 await bot.send_message(
@@ -3260,6 +4254,7 @@ async def on_startup():
                     f"🆔 ID: {me.id}\n"
                     f"🤖 AI сервисы: ВКЛЮЧЕНЫ\n"
                     f"🔑 Gemini ключей: {len(GEMINI_API_KEYS)}\n"
+                    f"💰 Партнерская программа: ВКЛЮЧЕНА\n"
                     f"🔄 Система ротации ключей: АКТИВНА\n"
                     f"💎 Система подписок: АКТИВНА\n"
                     f"📅 Система планирования постов: АКТИВНА\n"
@@ -3270,7 +4265,7 @@ async def on_startup():
                 logger.error(f"Не удалось уведомить админа: {e}")
         
         logger.info("=" * 60)
-        logger.info("🎉 БОТ УСПЕШНО ЗАПУЩЕН С МОДУЛЬНОЙ АРХИТЕКТУРОЙ!")
+        logger.info("🎉 БОТ УСПЕШНО ЗАПУЩЕН С ПАРТНЕРСКОЙ ПРОГРАММОЙ!")
         logger.info("=" * 60)
         return True
         
@@ -3283,11 +4278,9 @@ async def on_shutdown():
     """Выключение бота"""
     logger.info("🛑 Выключение бота...")
     
-    # Останавливаем планировщик
     if scheduler.running:
         scheduler.shutdown()
     
-    # Закрываем пул соединений
     await DatabasePool.close_pool()
     
     logger.info("👋 Бот выключен")
@@ -3297,19 +4290,16 @@ async def reset_daily_limits_task():
     from database import execute_query
     
     try:
-        # Сбрасываем счетчики постов
         await execute_query('''
             UPDATE users 
             SET posts_today = 0, posts_reset_date = CURRENT_DATE 
             WHERE posts_reset_date < CURRENT_DATE
         ''', database_url=DATABASE_URL)
         
-        # Сбрасываем AI лимиты
         ai_manager = get_ai_manager()
         if ai_manager:
             ai_manager.reset_daily_limits()
         
-        # Проверяем истекшие подписки
         expired_subscriptions = await execute_query('''
             SELECT id, first_name, username 
             FROM users 
@@ -3317,14 +4307,12 @@ async def reset_daily_limits_task():
         ''', database_url=DATABASE_URL)
         
         for user in expired_subscriptions:
-            # Понижаем тариф до минимума
             await execute_query('''
                 UPDATE users 
                 SET tariff = 'mini' 
                 WHERE id = $1 AND tariff != 'admin'
             ''', user['id'], database_url=DATABASE_URL)
             
-            # Отправляем уведомление пользователю
             try:
                 await bot.send_message(
                     user['id'],
@@ -3418,11 +4406,9 @@ async def main():
         logger.error("❌ Не удалось запустить бота")
         return
     
-    # Запускаем веб-сервер для Railway
     web_runner = await start_web_server()
     
     try:
-        # Запускаем поллинг бота
         await dp.start_polling(bot, skip_updates=True)
     except KeyboardInterrupt:
         logger.info("⚠️ Получен сигнал прерывания")
@@ -3430,7 +4416,6 @@ async def main():
         logger.error(f"💥 КРИТИЧЕСКАЯ ОШИБКА: {e}")
         logger.error(traceback.format_exc())
     finally:
-        # Останавливаем веб-сервер
         if web_runner:
             await web_runner.cleanup()
         await on_shutdown()
