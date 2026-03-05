@@ -320,6 +320,7 @@ async def cmd_start(message: Message):
     welcome_text = (
         f"👋 Привет, {first_name}!\n\n"
         f"🤖 Я — бот KOLES-TECH для планирования постов и AI-контента.\n\n"
+        f"🌸С 8 марта! скидки 20% для каждого!\n\n"
         f"💎 Ваш текущий тариф: {tariff_info['name']}\n\n"
         f"✨ Возможности:\n"
         f"• 🤖 AI-копирайтер и генератор идей\n"
